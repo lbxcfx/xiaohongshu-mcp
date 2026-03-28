@@ -10,7 +10,11 @@ type ApiEnvelope<T> = {
 };
 
 export type XhsLoginStatus = {
-  status?: "unknown" | "waiting_verification" | "secondary_required" | "logged_in";
+  status?:
+    | "unknown"
+    | "waiting_verification"
+    | "secondary_required"
+    | "logged_in";
   is_logged_in: boolean;
   needs_secondary_verification?: boolean;
   username?: string;
@@ -89,6 +93,20 @@ export type XhsSearchFilters = {
   location?: string;
 };
 
+export type XhsUserProfile = {
+  userBasicInfo?: {
+    nickname?: string;
+    redId?: string;
+    desc?: string;
+  };
+  interactions?: Array<{
+    type?: string;
+    name?: string;
+    count?: string;
+  }>;
+  feeds: XhsFeed[];
+};
+
 async function requestXhsApi<T>(
   path: string,
   init: RequestInit = {}
@@ -151,7 +169,9 @@ export async function startXhsPhoneLogin(): Promise<XhsPhoneLoginStart> {
   });
 }
 
-export async function sendXhsPhoneLoginCode(phone: string): Promise<XhsPhoneLoginAction> {
+export async function sendXhsPhoneLoginCode(
+  phone: string
+): Promise<XhsPhoneLoginAction> {
   return requestXhsApi<XhsPhoneLoginAction>("/api/v1/login/phone/send_code", {
     method: "POST",
     headers: {
@@ -161,7 +181,9 @@ export async function sendXhsPhoneLoginCode(phone: string): Promise<XhsPhoneLogi
   });
 }
 
-export async function verifyXhsPhoneLoginCode(code: string): Promise<XhsPhoneLoginAction> {
+export async function verifyXhsPhoneLoginCode(
+  code: string
+): Promise<XhsPhoneLoginAction> {
   return requestXhsApi<XhsPhoneLoginAction>("/api/v1/login/phone/verify", {
     method: "POST",
     headers: {
@@ -185,4 +207,11 @@ export async function searchXhsFeeds(
       filters,
     }),
   });
+}
+
+export async function getXhsMyProfile(): Promise<XhsUserProfile> {
+  const result = await requestXhsApi<{ data?: XhsUserProfile }>(
+    "/api/v1/user/me"
+  );
+  return result.data ?? { feeds: [] };
 }

@@ -44,9 +44,11 @@ import {
   deleteXhsCookies,
   getXhsLoginQrcode,
   getXhsLoginStatus,
+  getXhsMyProfile,
+  type XhsFeed,
   searchXhsFeeds,
-  type XhsSearchFilters,
   type XhsLoginStatus,
+  type XhsSearchFilters,
 } from "./_core/xhsApi";
 
 // Guest user ID – all data is stored under this shared ID since auth is disabled
@@ -71,6 +73,151 @@ function buildXhsSearchKeyword(industry: string, checklist?: string) {
     .filter(Boolean);
 
   return [industry.trim(), ...checklistTerms].join(" ").trim();
+}
+
+function splitKeywordTerms(keyword: string) {
+  return keyword
+    .split(/[\s,，、\n]+/)
+    .map(term => term.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+function splitAuthorKeywords(value?: string) {
+  return (value ?? "")
+    .split(/[\n,，、\s]+/)
+    .map(term => term.trim().replace(/^@+/, "").toLowerCase())
+    .filter(Boolean);
+}
+
+function includesAnyKeyword(text: string, terms: string[]) {
+  if (terms.length === 0) return true;
+  const normalized = text.toLowerCase();
+  return terms.some(term => normalized.includes(term));
+}
+
+function matchesAuthor(feed: XhsFeed, authorKeywords: string[]) {
+  if (authorKeywords.length === 0) return true;
+
+  const candidates = [
+    feed.noteCard?.user?.nickname,
+    feed.noteCard?.user?.nickName,
+    feed.noteCard?.user?.userId,
+  ]
+    .filter(Boolean)
+    .map(value => String(value).trim().replace(/^@+/, "").toLowerCase());
+
+  return authorKeywords.some(keyword =>
+    candidates.some(candidate => candidate.includes(keyword))
+  );
+}
+
+function selectTopVideoFeeds(
+  feeds: XhsFeed[],
+  options?: {
+    keywordTerms?: string[];
+    authorKeywords?: string[];
+    limit?: number;
+  }
+) {
+  const keywordTerms = options?.keywordTerms ?? [];
+  const authorKeywords = options?.authorKeywords ?? [];
+  const limit = options?.limit ?? 3;
+
+  return feeds
+    .filter(
+      feed => feed.noteCard?.type === "video" || Boolean(feed.noteCard?.video)
+    )
+    .filter(feed =>
+      includesAnyKeyword(
+        feed.noteCard?.displayTitle?.trim() ?? "",
+        keywordTerms
+      )
+    )
+    .filter(feed => matchesAuthor(feed, authorKeywords))
+    .map(feed => {
+      const likedCount = parseEngagementCount(
+        feed.noteCard?.interactInfo?.likedCount
+      );
+      const commentCount = parseEngagementCount(
+        feed.noteCard?.interactInfo?.commentCount
+      );
+      const sharedCount = parseEngagementCount(
+        feed.noteCard?.interactInfo?.sharedCount
+      );
+      const score = likedCount * 3 + commentCount * 2 + sharedCount;
+
+      return {
+        feed,
+        likedCount,
+        commentCount,
+        sharedCount,
+        score,
+      };
+    })
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit);
+}
+
+async function saveTopicHubVideoItem(params: {
+  projectId: number;
+  industry: string;
+  checklist?: string;
+  targetPlatform: "xiaohongshu" | "youtube" | "douyin";
+  feed: XhsFeed;
+  likedCount: number;
+  commentCount: number;
+  sharedCount: number;
+  score: number;
+  filters?: XhsSearchFilters;
+  searchMode: "keyword" | "mine" | "authors";
+  authorKeywords?: string[];
+  sourceLabel: string;
+}) {
+  const noteId = params.feed.id;
+  const xsecToken = params.feed.xsecToken;
+  const coverUrl =
+    params.feed.noteCard?.cover?.urlDefault ||
+    params.feed.noteCard?.cover?.urlPre ||
+    params.feed.noteCard?.cover?.url;
+
+  let coverDownloadPath: string | undefined;
+  try {
+    coverDownloadPath = await downloadXhsCoverImage(noteId, coverUrl);
+  } catch (error) {
+    console.warn("[XHS] download cover failed", error);
+  }
+
+  const noteUrl = `https://www.xiaohongshu.com/explore/${noteId}?xsec_token=${xsecToken}&xsec_source=pc_feed`;
+  return createTopicHubItem(GUEST_USER_ID, {
+    projectId: params.projectId,
+    title: params.feed.noteCard?.displayTitle || "小红书视频",
+    content: `关键词：${params.industry}${params.checklist ? ` | 补充关键词：${params.checklist}` : ""}`,
+    platform: "xiaohongshu",
+    url: noteUrl,
+    engagementScore: params.score,
+    type: "viral_post",
+    tags: {
+      source: "xiaohongshu",
+      sourceLabel: params.sourceLabel,
+      searchMode: params.searchMode,
+      targetPlatform: params.targetPlatform,
+      noteId,
+      xsecToken,
+      coverUrl,
+      authorName:
+        params.feed.noteCard?.user?.nickname ||
+        params.feed.noteCard?.user?.nickName ||
+        "小红书用户",
+      authorAvatar: params.feed.noteCard?.user?.avatar,
+      likedCount: params.likedCount,
+      commentCount: params.commentCount,
+      sharedCount: params.sharedCount,
+      duration: params.feed.noteCard?.video?.capa?.duration,
+      coverDownloadPath,
+      filters: params.filters,
+      authorKeywords: params.authorKeywords,
+    },
+  });
 }
 
 async function downloadXhsCoverImage(noteId: string, coverUrl?: string) {
@@ -351,8 +498,12 @@ ${input.checklist ? `关键词清单：${input.checklist}` : ""}
         z.object({
           projectId: z.number(),
           industry: z.string().min(1),
-          targetPlatform: z.enum(["xiaohongshu", "youtube", "douyin"]).default("xiaohongshu"),
+          mode: z.enum(["keyword", "mine", "authors"]).default("keyword"),
+          targetPlatform: z
+            .enum(["xiaohongshu", "youtube", "douyin"])
+            .default("xiaohongshu"),
           checklist: z.string().optional(),
+          bloggerAccounts: z.string().optional(),
           filters: z
             .object({
               sort_by: z.string().optional(),
@@ -386,9 +537,15 @@ ${input.checklist ? `关键词清单：${input.checklist}` : ""}
 
         const topVideoFeeds = (result.feeds || [])
           .map(feed => {
-            const likedCount = parseEngagementCount(feed.noteCard?.interactInfo?.likedCount);
-            const commentCount = parseEngagementCount(feed.noteCard?.interactInfo?.commentCount);
-            const sharedCount = parseEngagementCount(feed.noteCard?.interactInfo?.sharedCount);
+            const likedCount = parseEngagementCount(
+              feed.noteCard?.interactInfo?.likedCount
+            );
+            const commentCount = parseEngagementCount(
+              feed.noteCard?.interactInfo?.commentCount
+            );
+            const sharedCount = parseEngagementCount(
+              feed.noteCard?.interactInfo?.sharedCount
+            );
             const score = likedCount * 3 + commentCount * 2 + sharedCount;
 
             return {
@@ -453,6 +610,102 @@ ${input.checklist ? `关键词清单：${input.checklist}` : ""}
           items,
           count: items.length,
           keyword,
+        };
+      }),
+    searchXiaohongshuMulti: publicProcedure
+      .input(
+        z.object({
+          projectId: z.number(),
+          industry: z.string().min(1),
+          mode: z.enum(["keyword", "mine", "authors"]).default("keyword"),
+          targetPlatform: z
+            .enum(["xiaohongshu", "youtube", "douyin"])
+            .default("xiaohongshu"),
+          checklist: z.string().optional(),
+          bloggerAccounts: z.string().optional(),
+          filters: z
+            .object({
+              sort_by: z.string().optional(),
+              note_type: z.string().optional(),
+              publish_time: z.string().optional(),
+              search_type: z.string().optional(),
+              location: z.string().optional(),
+            })
+            .optional(),
+        })
+      )
+      .mutation(async ({ input }) => {
+        await logUsage(
+          GUEST_USER_ID,
+          input.projectId,
+          "topicHub",
+          "searchXiaohongshuMulti"
+        );
+
+        const keyword = buildXhsSearchKeyword(input.industry, input.checklist);
+        const keywordTerms = splitKeywordTerms(keyword);
+        const authorKeywords = splitAuthorKeywords(input.bloggerAccounts);
+        const filters: XhsSearchFilters | undefined = input.filters
+          ? {
+              sort_by: input.filters.sort_by,
+              note_type: input.filters.note_type,
+              publish_time: input.filters.publish_time,
+              search_scope: input.filters.search_type,
+              location: input.filters.location,
+            }
+          : undefined;
+
+        let topVideoFeeds: Array<{
+          feed: XhsFeed;
+          likedCount: number;
+          commentCount: number;
+          sharedCount: number;
+          score: number;
+        }> = [];
+        let sourceLabel = "关键词搜索";
+
+        if (input.mode === "mine") {
+          const profile = await getXhsMyProfile();
+          topVideoFeeds = selectTopVideoFeeds(profile.feeds || [], {
+            keywordTerms,
+            limit: 3,
+          });
+          sourceLabel = "我的内容";
+        } else {
+          const result = await searchXhsFeeds(keyword, filters);
+          topVideoFeeds = selectTopVideoFeeds(result.feeds || [], {
+            keywordTerms,
+            authorKeywords: input.mode === "authors" ? authorKeywords : [],
+            limit: 3,
+          });
+          sourceLabel = input.mode === "authors" ? "指定博主" : "关键词搜索";
+        }
+
+        const items = [];
+        for (const item of topVideoFeeds) {
+          const saved = await saveTopicHubVideoItem({
+            projectId: input.projectId,
+            industry: input.industry,
+            checklist: input.checklist,
+            targetPlatform: input.targetPlatform,
+            feed: item.feed,
+            likedCount: item.likedCount,
+            commentCount: item.commentCount,
+            sharedCount: item.sharedCount,
+            score: item.score,
+            filters,
+            searchMode: input.mode,
+            authorKeywords,
+            sourceLabel,
+          });
+          items.push(saved);
+        }
+
+        return {
+          items,
+          count: items.length,
+          keyword,
+          mode: input.mode,
         };
       }),
     crawlViral: publicProcedure

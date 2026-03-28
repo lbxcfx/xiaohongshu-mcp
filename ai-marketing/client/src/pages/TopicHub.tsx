@@ -1,5 +1,17 @@
 import { useMemo, useState } from "react";
-import { trpc } from "@/lib/trpc";
+import {
+  Download,
+  ExternalLink,
+  Heart,
+  Loader2,
+  MessageCircle,
+  RefreshCw,
+  Share2,
+  TrendingUp,
+  User,
+  Users,
+} from "lucide-react";
+import { toast } from "sonner";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -13,24 +25,18 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
-import { toast } from "sonner";
-import {
-  Download,
-  ExternalLink,
-  Heart,
-  Loader2,
-  MessageCircle,
-  RefreshCw,
-  Share2,
-  TrendingUp,
-} from "lucide-react";
+import { trpc } from "@/lib/trpc";
 
 interface Props {
   projectId: string;
 }
 
+type SearchMode = "keyword" | "mine" | "authors";
+
 type TopicHubTagMeta = {
   source?: string;
+  sourceLabel?: string;
+  searchMode?: SearchMode;
   targetPlatform?: string;
   noteId?: string;
   xsecToken?: string;
@@ -43,6 +49,7 @@ type TopicHubTagMeta = {
   commentCount?: number;
   sharedCount?: number;
   duration?: number;
+  authorKeywords?: string[];
   filters?: {
     sort_by?: string;
     note_type?: string;
@@ -52,17 +59,43 @@ type TopicHubTagMeta = {
   };
 };
 
-const PLATFORM_OPTIONS = [
-  { value: "xiaohongshu", label: "小红书" },
-  { value: "youtube", label: "YouTube" },
-  { value: "douyin", label: "抖音" },
+const SORT_OPTIONS = [
+  "综合",
+  "最新",
+  "最多点赞",
+  "最多评论",
+  "最多收藏",
 ] as const;
-
-const SORT_OPTIONS = ["综合", "最新", "最多点赞", "最多评论", "最多收藏"] as const;
 const NOTE_TYPE_OPTIONS = ["不限", "视频", "图文"] as const;
 const PUBLISH_TIME_OPTIONS = ["不限", "一天内", "一周内", "半年内"] as const;
 const SEARCH_TYPE_OPTIONS = ["不限", "已看过", "未看过", "已关注"] as const;
 const LOCATION_OPTIONS = ["不限", "同城", "附近"] as const;
+
+const SEARCH_MODE_OPTIONS: Array<{
+  value: SearchMode;
+  title: string;
+  description: string;
+  icon: typeof TrendingUp;
+}> = [
+  {
+    value: "keyword",
+    title: "关键词搜索",
+    description: "按关键词搜索平台内容，并保留 3 个相关视频。",
+    icon: TrendingUp,
+  },
+  {
+    value: "mine",
+    title: "我的内容",
+    description: "从自己已发布内容里筛出与关键词相关的 3 个视频。",
+    icon: User,
+  },
+  {
+    value: "authors",
+    title: "指定博主",
+    description: "输入关注博主账号，定向筛出与关键词相关的 3 个视频。",
+    icon: Users,
+  },
+];
 
 function formatCount(value?: number) {
   if (!value) return "0";
@@ -80,26 +113,32 @@ function formatDuration(seconds?: number) {
 export default function TopicHub({ projectId }: Props) {
   const pid = Number.parseInt(projectId, 10);
   const utils = trpc.useUtils();
+  const [searchMode, setSearchMode] = useState<SearchMode>("keyword");
   const [industry, setIndustry] = useState("");
-  const [targetPlatform, setTargetPlatform] = useState("xiaohongshu");
   const [checklist, setChecklist] = useState("");
-  const [sortBy, setSortBy] = useState<(typeof SORT_OPTIONS)[number]>("最多点赞");
-  const [noteType, setNoteType] = useState<(typeof NOTE_TYPE_OPTIONS)[number]>("视频");
+  const [bloggerAccounts, setBloggerAccounts] = useState("");
+  const [sortBy, setSortBy] =
+    useState<(typeof SORT_OPTIONS)[number]>("最多点赞");
+  const [noteType, setNoteType] =
+    useState<(typeof NOTE_TYPE_OPTIONS)[number]>("视频");
   const [publishTime, setPublishTime] =
     useState<(typeof PUBLISH_TIME_OPTIONS)[number]>("一周内");
   const [searchType, setSearchType] =
     useState<(typeof SEARCH_TYPE_OPTIONS)[number]>("不限");
-  const [location, setLocation] = useState<(typeof LOCATION_OPTIONS)[number]>("不限");
+  const [location, setLocation] =
+    useState<(typeof LOCATION_OPTIONS)[number]>("不限");
 
-  const { data: items, isLoading } = trpc.topicHub.list.useQuery({ projectId: pid });
+  const { data: items, isLoading } = trpc.topicHub.list.useQuery({
+    projectId: pid,
+  });
 
-  const searchMutation = trpc.topicHub.searchXiaohongshu.useMutation({
+  const searchMutation = trpc.topicHub.searchXiaohongshuMulti.useMutation({
     onSuccess: async data => {
       await utils.topicHub.list.invalidate({ projectId: pid });
-      toast.success(`已抓取 ${data.count} 条小红书内容`);
+      toast.success(`已抓取 ${data.count} 个视频`);
     },
     onError: error => {
-      toast.error(error.message || "抓取失败，请重试");
+      toast.error(error.message || "抓取失败");
     },
   });
 
@@ -117,17 +156,24 @@ export default function TopicHub({ projectId }: Props) {
     return (items ?? []).filter(item => item.platform === "xiaohongshu");
   }, [items]);
 
-  const handleSearch = () => {
+  function handleSearch() {
     if (!industry.trim()) {
       toast.error("请输入关键词");
+      return;
+    }
+
+    if (searchMode === "authors" && !bloggerAccounts.trim()) {
+      toast.error("请输入博主账号");
       return;
     }
 
     searchMutation.mutate({
       projectId: pid,
       industry: industry.trim(),
-      targetPlatform: targetPlatform as "xiaohongshu" | "youtube" | "douyin",
+      mode: searchMode,
+      targetPlatform: "xiaohongshu",
       checklist: checklist.trim() || undefined,
+      bloggerAccounts: bloggerAccounts.trim() || undefined,
       filters: {
         sort_by: sortBy,
         note_type: noteType,
@@ -136,74 +182,110 @@ export default function TopicHub({ projectId }: Props) {
         location,
       },
     });
-  };
+  }
 
   return (
     <div className="space-y-6">
       <div>
         <h1 className="flex items-center gap-2 text-2xl font-bold text-foreground">
           <TrendingUp className="h-6 w-6 text-rose-500" />
-          选题信息中台
+          选题信息中心
         </h1>
         <p className="mt-1 text-sm text-muted-foreground">
-          先用关键词搜索小红书内容，再按筛选条件抓取结果并下载视频。
+          支持 3 种搜索模式：关键词搜索、我的内容、指定博主。每次最多保留 3
+          个视频。
         </p>
       </div>
 
       <Card className="border-border bg-card">
         <CardHeader className="pb-3">
           <CardTitle className="text-sm font-medium text-foreground">
-            小红书搜索
+            小红书内容搜索
           </CardTitle>
         </CardHeader>
-        <CardContent className="space-y-4">
-          <div className="grid gap-4 md:grid-cols-3">
+        <CardContent className="space-y-5">
+          <div className="grid gap-3 md:grid-cols-3">
+            {SEARCH_MODE_OPTIONS.map(option => {
+              const Icon = option.icon;
+              const active = option.value === searchMode;
+
+              return (
+                <button
+                  key={option.value}
+                  type="button"
+                  onClick={() => setSearchMode(option.value)}
+                  className={`rounded-2xl border p-4 text-left transition-colors ${
+                    active
+                      ? "border-rose-500 bg-rose-500/10"
+                      : "border-border bg-muted/20 hover:border-rose-300"
+                  }`}
+                >
+                  <div className="flex items-center gap-2">
+                    <Icon
+                      className={`h-4 w-4 ${active ? "text-rose-500" : "text-muted-foreground"}`}
+                    />
+                    <span className="text-sm font-medium text-foreground">
+                      {option.title}
+                    </span>
+                  </div>
+                  <p className="mt-2 text-xs leading-5 text-muted-foreground">
+                    {option.description}
+                  </p>
+                </button>
+              );
+            })}
+          </div>
+
+          <div className="grid gap-4 md:grid-cols-2">
             <div className="space-y-1.5">
-              <Label className="text-sm text-foreground">关键词 *</Label>
+              <Label className="text-sm text-foreground">关键词</Label>
               <Input
                 value={industry}
                 onChange={event => setIndustry(event.target.value)}
-                placeholder="例如：医美 美妆"
+                placeholder="例如：护肤、抗衰、医美"
                 className="border-border bg-input text-foreground"
               />
             </div>
 
-            <div className="space-y-1.5">
-              <Label className="text-sm text-foreground">目标平台</Label>
-              <Select value={targetPlatform} onValueChange={setTargetPlatform}>
-                <SelectTrigger className="border-border bg-input text-foreground">
-                  <SelectValue placeholder="选择目标平台" />
-                </SelectTrigger>
-                <SelectContent className="border-border bg-popover">
-                  {PLATFORM_OPTIONS.map(option => (
-                    <SelectItem key={option.value} value={option.value}>
-                      {option.label}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </div>
-
-            <div className="space-y-1.5">
-              <Label className="text-sm text-foreground">排序</Label>
-              <Select value={sortBy} onValueChange={value => setSortBy(value as typeof sortBy)}>
-                <SelectTrigger className="border-border bg-input text-foreground">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent className="border-border bg-popover">
-                  {SORT_OPTIONS.map(option => (
-                    <SelectItem key={option} value={option}>
-                      {option}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </div>
+            {searchMode === "authors" ? (
+              <div className="space-y-1.5">
+                <Label className="text-sm text-foreground">博主账号</Label>
+                <Input
+                  value={bloggerAccounts}
+                  onChange={event => setBloggerAccounts(event.target.value)}
+                  placeholder="多个账号可用逗号、空格或换行分隔"
+                  className="border-border bg-input text-foreground"
+                />
+              </div>
+            ) : (
+              <div className="space-y-1.5">
+                <Label className="text-sm text-foreground">补充关键词</Label>
+                <Input
+                  value={checklist}
+                  onChange={event => setChecklist(event.target.value)}
+                  placeholder="可选，用于补充搜索词"
+                  className="border-border bg-input text-foreground"
+                />
+              </div>
+            )}
           </div>
+
+          {searchMode === "authors" ? (
+            <div className="space-y-1.5">
+              <Label className="text-sm text-foreground">补充关键词</Label>
+              <Textarea
+                value={checklist}
+                onChange={event => setChecklist(event.target.value)}
+                placeholder="可选，用于补充搜索词"
+                className="resize-none border-border bg-input text-foreground"
+                rows={3}
+              />
+            </div>
+          ) : null}
 
           <div className="grid gap-4 md:grid-cols-4">
             <div className="space-y-1.5">
-              <Label className="text-sm text-foreground">笔记类型</Label>
+              <Label className="text-sm text-foreground">内容类型</Label>
               <Select
                 value={noteType}
                 onValueChange={value => setNoteType(value as typeof noteType)}
@@ -225,7 +307,9 @@ export default function TopicHub({ projectId }: Props) {
               <Label className="text-sm text-foreground">发布时间</Label>
               <Select
                 value={publishTime}
-                onValueChange={value => setPublishTime(value as typeof publishTime)}
+                onValueChange={value =>
+                  setPublishTime(value as typeof publishTime)
+                }
               >
                 <SelectTrigger className="border-border bg-input text-foreground">
                   <SelectValue />
@@ -244,7 +328,9 @@ export default function TopicHub({ projectId }: Props) {
               <Label className="text-sm text-foreground">搜索范围</Label>
               <Select
                 value={searchType}
-                onValueChange={value => setSearchType(value as typeof searchType)}
+                onValueChange={value =>
+                  setSearchType(value as typeof searchType)
+                }
               >
                 <SelectTrigger className="border-border bg-input text-foreground">
                   <SelectValue />
@@ -261,7 +347,10 @@ export default function TopicHub({ projectId }: Props) {
 
             <div className="space-y-1.5">
               <Label className="text-sm text-foreground">位置</Label>
-              <Select value={location} onValueChange={value => setLocation(value as typeof location)}>
+              <Select
+                value={location}
+                onValueChange={value => setLocation(value as typeof location)}
+              >
                 <SelectTrigger className="border-border bg-input text-foreground">
                   <SelectValue />
                 </SelectTrigger>
@@ -276,28 +365,53 @@ export default function TopicHub({ projectId }: Props) {
             </div>
           </div>
 
-          <div className="space-y-1.5">
-            <Label className="text-sm text-foreground">Checklist 关键词</Label>
-            <Textarea
-              value={checklist}
-              onChange={event => setChecklist(event.target.value)}
-              placeholder="可选。多个词用空格、逗号或换行分隔。"
-              className="resize-none border-border bg-input text-foreground"
-              rows={3}
-            />
-          </div>
+          <div className="flex items-end justify-between gap-4">
+            <div className="space-y-1">
+              <p className="text-sm font-medium text-foreground">
+                当前模式：
+                {SEARCH_MODE_OPTIONS.find(option => option.value === searchMode)
+                  ?.title ?? "未知"}
+              </p>
+              <p className="text-xs text-muted-foreground">
+                每次最多保留 3 个视频。
+              </p>
+            </div>
 
-          <div className="flex justify-end">
-            <Button onClick={handleSearch} disabled={searchMutation.isPending} className="min-w-40">
-              {searchMutation.isPending ? (
-                <>
-                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                  抓取中...
-                </>
-              ) : (
-                "抓取 Top 3 视频"
-              )}
-            </Button>
+            <div className="flex gap-3">
+              <div className="w-40 space-y-1.5">
+                <Label className="text-sm text-foreground">排序</Label>
+                <Select
+                  value={sortBy}
+                  onValueChange={value => setSortBy(value as typeof sortBy)}
+                >
+                  <SelectTrigger className="border-border bg-input text-foreground">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent className="border-border bg-popover">
+                    {SORT_OPTIONS.map(option => (
+                      <SelectItem key={option} value={option}>
+                        {option}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+
+              <Button
+                onClick={handleSearch}
+                disabled={searchMutation.isPending}
+                className="min-w-40 self-end"
+              >
+                {searchMutation.isPending ? (
+                  <>
+                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                    抓取中...
+                  </>
+                ) : (
+                  "抓取 3 个视频"
+                )}
+              </Button>
+            </div>
           </div>
         </CardContent>
       </Card>
@@ -305,7 +419,7 @@ export default function TopicHub({ projectId }: Props) {
       <div className="space-y-4">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-3">
-            <h2 className="text-sm font-medium text-foreground">信息中台内容</h2>
+            <h2 className="text-sm font-medium text-foreground">搜索结果</h2>
             <Badge variant="outline">{videoItems.length}</Badge>
           </div>
           <Button
@@ -327,7 +441,7 @@ export default function TopicHub({ projectId }: Props) {
         ) : videoItems.length === 0 ? (
           <Card className="border-border bg-card">
             <CardContent className="py-16 text-center text-sm text-muted-foreground">
-              还没有内容，先输入关键词开始抓取。
+              暂无内容，请先选择搜索模式并开始抓取。
             </CardContent>
           </Card>
         ) : (
@@ -354,7 +468,7 @@ export default function TopicHub({ projectId }: Props) {
                       />
                     ) : (
                       <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
-                        无封面
+                        暂无封面
                       </div>
                     )}
                     {duration ? (
@@ -365,6 +479,15 @@ export default function TopicHub({ projectId }: Props) {
                   </div>
 
                   <CardContent className="space-y-3 p-4">
+                    <div className="flex items-center justify-between gap-2">
+                      <Badge variant="secondary">
+                        {meta.sourceLabel || "小红书"}
+                      </Badge>
+                      <span className="text-xs text-muted-foreground">
+                        热度分 {item.engagementScore ?? 0}
+                      </span>
+                    </div>
+
                     <div className="flex items-center gap-3">
                       <div className="h-9 w-9 overflow-hidden rounded-full bg-muted">
                         {meta.authorAvatar ? (
@@ -380,7 +503,7 @@ export default function TopicHub({ projectId }: Props) {
                           {meta.authorName || "小红书用户"}
                         </div>
                         <div className="text-xs text-muted-foreground">
-                          {targetPlatform === "xiaohongshu" ? "小红书" : `目标平台：${targetPlatform}`}
+                          小红书视频
                         </div>
                       </div>
                     </div>
