@@ -62,7 +62,11 @@ type SqlitePositioningRow = {
   updatedAt: string;
 };
 
-type TopicHubItemType = "trending" | "viral_post" | "high_conversion" | "manual";
+type TopicHubItemType =
+  | "trending"
+  | "viral_post"
+  | "high_conversion"
+  | "manual";
 
 type SqliteTopicHubItemRow = {
   id: number;
@@ -79,8 +83,50 @@ type SqliteTopicHubItemRow = {
   createdAt: string;
 };
 
+type TopicStatus = "draft" | "selected" | "in_production" | "published";
+type TopicType = "persona" | "traffic" | "marketing";
+type ViralPotential = "high" | "medium" | "low";
+
+type ScriptStatus = "draft" | "review" | "approved" | "produced";
+
+type SqliteScriptRow = {
+  id: number;
+  projectId: number;
+  userId: number;
+  topicId: number | null;
+  analysisId: number | null;
+  title: string;
+  hookType: string | null;
+  hookContent: string | null;
+  mainContent: string | null;
+  endingContent: string | null;
+  fullScript: string | null;
+  platform: string | null;
+  duration: number | null;
+  status: ScriptStatus;
+  createdAt: string;
+  updatedAt: string;
+};
+
+type SqliteTopicRow = {
+  id: number;
+  projectId: number;
+  userId: number;
+  title: string;
+  description: string | null;
+  topicType: TopicType;
+  viralPotential: ViralPotential | null;
+  rationale: string | null;
+  status: TopicStatus;
+  createdAt: string;
+  updatedAt: string;
+};
+
 function getSqliteDbPath() {
-  return process.env.SQLITE_DATABASE_PATH ?? resolve(process.cwd(), ".data", "ai-marketing.sqlite");
+  return (
+    process.env.SQLITE_DATABASE_PATH ??
+    resolve(process.cwd(), ".data", "ai-marketing.sqlite")
+  );
 }
 
 function getSqliteDb() {
@@ -133,6 +179,63 @@ function getSqliteDb() {
       tags TEXT,
       isSelected INTEGER NOT NULL DEFAULT 0,
       createdAt TEXT NOT NULL
+    )
+  `);
+  _sqliteDb.exec(`
+    CREATE TABLE IF NOT EXISTS topics (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      projectId INTEGER NOT NULL,
+      userId INTEGER NOT NULL,
+      title TEXT NOT NULL,
+      description TEXT,
+      topicType TEXT NOT NULL DEFAULT 'traffic',
+      viralPotential TEXT DEFAULT 'medium',
+      rationale TEXT,
+      status TEXT NOT NULL DEFAULT 'draft',
+      createdAt TEXT NOT NULL,
+      updatedAt TEXT NOT NULL
+    )
+  `);
+  _sqliteDb.exec(`
+    CREATE TABLE IF NOT EXISTS scripts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      projectId INTEGER NOT NULL,
+      userId INTEGER NOT NULL,
+      topicId INTEGER,
+      analysisId INTEGER,
+      title TEXT NOT NULL,
+      hookType TEXT,
+      hookContent TEXT,
+      mainContent TEXT,
+      endingContent TEXT,
+      fullScript TEXT,
+      platform TEXT,
+      duration INTEGER,
+      status TEXT NOT NULL DEFAULT 'draft',
+      createdAt TEXT NOT NULL,
+      updatedAt TEXT NOT NULL
+    )
+  `);
+  _sqliteDb.exec(`
+    CREATE TABLE IF NOT EXISTS materials (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      projectId INTEGER NOT NULL,
+      userId INTEGER NOT NULL,
+      scriptId INTEGER,
+      type TEXT NOT NULL DEFAULT 'other',
+      title TEXT NOT NULL,
+      fileUrl TEXT,
+      thumbnailUrl TEXT,
+      tags TEXT,
+      bodyPart TEXT,
+      treatmentType TEXT,
+      style TEXT,
+      status TEXT NOT NULL DEFAULT 'uploading',
+      seedanceTaskId TEXT,
+      referenceImageUrl TEXT,
+      prompt TEXT,
+      createdAt TEXT DEFAULT (datetime('now')),
+      updatedAt TEXT DEFAULT (datetime('now'))
     )
   `);
   return _sqliteDb;
@@ -193,7 +296,8 @@ function mapSqliteTopicHubItem(row: SqliteTopicHubItemRow | undefined | null) {
     title: row.title,
     content: row.content,
     url: row.url,
-    engagementScore: row.engagementScore == null ? null : Number(row.engagementScore),
+    engagementScore:
+      row.engagementScore == null ? null : Number(row.engagementScore),
     tags: parseSqliteJson(row.tags),
     isSelected: Boolean(row.isSelected),
     createdAt: new Date(row.createdAt),
@@ -215,7 +319,10 @@ export async function getDb() {
 export async function upsertUser(user: InsertUser): Promise<void> {
   if (!user.openId) throw new Error("User openId is required for upsert");
   const db = await getDb();
-  if (!db) { console.warn("[Database] Cannot upsert user: database not available"); return; }
+  if (!db) {
+    console.warn("[Database] Cannot upsert user: database not available");
+    return;
+  }
   try {
     const values: InsertUser = { openId: user.openId };
     const updateSet: Record<string, unknown> = {};
@@ -229,19 +336,38 @@ export async function upsertUser(user: InsertUser): Promise<void> {
       updateSet[field] = normalized;
     };
     textFields.forEach(assignNullable);
-    if (user.lastSignedIn !== undefined) { values.lastSignedIn = user.lastSignedIn; updateSet.lastSignedIn = user.lastSignedIn; }
-    if (user.role !== undefined) { values.role = user.role; updateSet.role = user.role; }
-    else if (user.openId === ENV.ownerOpenId) { values.role = "admin"; updateSet.role = "admin"; }
+    if (user.lastSignedIn !== undefined) {
+      values.lastSignedIn = user.lastSignedIn;
+      updateSet.lastSignedIn = user.lastSignedIn;
+    }
+    if (user.role !== undefined) {
+      values.role = user.role;
+      updateSet.role = user.role;
+    } else if (user.openId === ENV.ownerOpenId) {
+      values.role = "admin";
+      updateSet.role = "admin";
+    }
     if (!values.lastSignedIn) values.lastSignedIn = new Date();
-    if (Object.keys(updateSet).length === 0) updateSet.lastSignedIn = new Date();
-    await db.insert(users).values(values).onDuplicateKeyUpdate({ set: updateSet });
-  } catch (error) { console.error("[Database] Failed to upsert user:", error); throw error; }
+    if (Object.keys(updateSet).length === 0)
+      updateSet.lastSignedIn = new Date();
+    await db
+      .insert(users)
+      .values(values)
+      .onDuplicateKeyUpdate({ set: updateSet });
+  } catch (error) {
+    console.error("[Database] Failed to upsert user:", error);
+    throw error;
+  }
 }
 
 export async function getUserByOpenId(openId: string) {
   const db = await getDb();
   if (!db) return undefined;
-  const result = await db.select().from(users).where(eq(users.openId, openId)).limit(1);
+  const result = await db
+    .select()
+    .from(users)
+    .where(eq(users.openId, openId))
+    .limit(1);
   return result.length > 0 ? result[0] : undefined;
 }
 
@@ -260,7 +386,11 @@ export async function getProjects(userId: number) {
       .all(userId) as SqliteProjectRow[];
     return rows.map(row => mapSqliteProject(row)!);
   }
-  return db.select().from(projects).where(eq(projects.userId, userId)).orderBy(desc(projects.createdAt));
+  return db
+    .select()
+    .from(projects)
+    .where(eq(projects.userId, userId))
+    .orderBy(desc(projects.createdAt));
 }
 
 export async function getProjectById(userId: number, id: number) {
@@ -277,11 +407,18 @@ export async function getProjectById(userId: number, id: number) {
       .get(id, userId) as SqliteProjectRow | undefined;
     return mapSqliteProject(row);
   }
-  const result = await db.select().from(projects).where(and(eq(projects.id, id), eq(projects.userId, userId))).limit(1);
+  const result = await db
+    .select()
+    .from(projects)
+    .where(and(eq(projects.id, id), eq(projects.userId, userId)))
+    .limit(1);
   return result[0] ?? null;
 }
 
-export async function createProject(userId: number, data: Omit<InsertProject, "userId">) {
+export async function createProject(
+  userId: number,
+  data: Omit<InsertProject, "userId">
+) {
   const db = await getDb();
   if (!db) {
     const sqlite = getSqliteDb();
@@ -314,11 +451,25 @@ export async function createProject(userId: number, data: Omit<InsertProject, "u
   }
   const result = await db.insert(projects).values({ ...data, userId });
   const id = (result as unknown as { insertId: number }).insertId;
-  const rows = await db.select().from(projects).where(eq(projects.id, id)).limit(1);
+  const rows = await db
+    .select()
+    .from(projects)
+    .where(eq(projects.id, id))
+    .limit(1);
   return rows[0];
 }
 
-export async function updateProject(userId: number, data: { id: number; name?: string; description?: string; industry?: string; platform?: string; status?: "active" | "archived" }) {
+export async function updateProject(
+  userId: number,
+  data: {
+    id: number;
+    name?: string;
+    description?: string;
+    industry?: string;
+    platform?: string;
+    status?: "active" | "archived";
+  }
+) {
   const db = await getDb();
   if (!db) {
     const sqlite = getSqliteDb();
@@ -348,12 +499,17 @@ export async function updateProject(userId: number, data: { id: number; name?: s
     values.push(new Date().toISOString());
     values.push(data.id, userId);
     sqlite
-      .prepare(`UPDATE projects SET ${fields.join(", ")} WHERE id = ? AND userId = ?`)
+      .prepare(
+        `UPDATE projects SET ${fields.join(", ")} WHERE id = ? AND userId = ?`
+      )
       .run(...values);
     return { success: true };
   }
   const { id, ...rest } = data;
-  await db.update(projects).set(rest).where(and(eq(projects.id, id), eq(projects.userId, userId)));
+  await db
+    .update(projects)
+    .set(rest)
+    .where(and(eq(projects.id, id), eq(projects.userId, userId)));
   return { success: true };
 }
 
@@ -361,10 +517,14 @@ export async function deleteProject(userId: number, id: number) {
   const db = await getDb();
   if (!db) {
     const sqlite = getSqliteDb();
-    sqlite.prepare("DELETE FROM projects WHERE id = ? AND userId = ?").run(id, userId);
+    sqlite
+      .prepare("DELETE FROM projects WHERE id = ? AND userId = ?")
+      .run(id, userId);
     return { success: true };
   }
-  await db.delete(projects).where(and(eq(projects.id, id), eq(projects.userId, userId)));
+  await db
+    .delete(projects)
+    .where(and(eq(projects.id, id), eq(projects.userId, userId)));
   return { success: true };
 }
 
@@ -384,10 +544,22 @@ export async function getPositionings(userId: number, projectId: number) {
       .all(userId, projectId) as SqlitePositioningRow[];
     return rows.map(row => mapSqlitePositioning(row)!);
   }
-  return db.select().from(positionings).where(and(eq(positionings.userId, userId), eq(positionings.projectId, projectId))).orderBy(desc(positionings.createdAt));
+  return db
+    .select()
+    .from(positionings)
+    .where(
+      and(
+        eq(positionings.userId, userId),
+        eq(positionings.projectId, projectId)
+      )
+    )
+    .orderBy(desc(positionings.createdAt));
 }
 
-export async function createPositioning(userId: number, data: Omit<InsertPositioning, "userId">) {
+export async function createPositioning(
+  userId: number,
+  data: Omit<InsertPositioning, "userId">
+) {
   const db = await getDb();
   if (!db) {
     const sqlite = getSqliteDb();
@@ -418,7 +590,16 @@ export async function createPositioning(userId: number, data: Omit<InsertPositio
   return id;
 }
 
-export async function updatePositioning(userId: number, data: { id: number; positioningRecommendation?: string; analysisResult?: unknown; viralAccountInsights?: unknown; status?: "pending" | "analyzing" | "completed" | "failed" }) {
+export async function updatePositioning(
+  userId: number,
+  data: {
+    id: number;
+    positioningRecommendation?: string;
+    analysisResult?: unknown;
+    viralAccountInsights?: unknown;
+    status?: "pending" | "analyzing" | "completed" | "failed";
+  }
+) {
   const db = await getDb();
   if (!db) {
     const sqlite = getSqliteDb();
@@ -430,11 +611,17 @@ export async function updatePositioning(userId: number, data: { id: number; posi
     }
     if (data.analysisResult !== undefined) {
       fields.push("analysisResult = ?");
-      values.push(data.analysisResult == null ? null : JSON.stringify(data.analysisResult));
+      values.push(
+        data.analysisResult == null ? null : JSON.stringify(data.analysisResult)
+      );
     }
     if (data.viralAccountInsights !== undefined) {
       fields.push("viralAccountInsights = ?");
-      values.push(data.viralAccountInsights == null ? null : JSON.stringify(data.viralAccountInsights));
+      values.push(
+        data.viralAccountInsights == null
+          ? null
+          : JSON.stringify(data.viralAccountInsights)
+      );
     }
     if (data.status !== undefined) {
       fields.push("status = ?");
@@ -444,12 +631,56 @@ export async function updatePositioning(userId: number, data: { id: number; posi
     values.push(new Date().toISOString());
     values.push(data.id, userId);
     sqlite
-      .prepare(`UPDATE positionings SET ${fields.join(", ")} WHERE id = ? AND userId = ?`)
+      .prepare(
+        `UPDATE positionings SET ${fields.join(", ")} WHERE id = ? AND userId = ?`
+      )
       .run(...values);
     return { success: true };
   }
   const { id, ...rest } = data;
-  await db.update(positionings).set(rest as Record<string, unknown>).where(and(eq(positionings.id, id), eq(positionings.userId, userId)));
+  await db
+    .update(positionings)
+    .set(rest as Record<string, unknown>)
+    .where(and(eq(positionings.id, id), eq(positionings.userId, userId)));
+  return { success: true };
+}
+
+export async function deletePositioning(userId: number, id: number) {
+  const db = await getDb();
+  if (!db) {
+    const sqlite = getSqliteDb();
+    sqlite
+      .prepare("DELETE FROM positionings WHERE id = ? AND userId = ?")
+      .run(id, userId);
+    return { success: true };
+  }
+  await db
+    .delete(positionings)
+    .where(and(eq(positionings.id, id), eq(positionings.userId, userId)));
+  return { success: true };
+}
+
+export async function deletePositioningsByProject(
+  userId: number,
+  projectId: number
+) {
+  const db = await getDb();
+  if (!db) {
+    const sqlite = getSqliteDb();
+    sqlite
+      .prepare("DELETE FROM positionings WHERE userId = ? AND projectId = ?")
+      .run(userId, projectId);
+    return { success: true };
+  }
+
+  await db
+    .delete(positionings)
+    .where(
+      and(
+        eq(positionings.userId, userId),
+        eq(positionings.projectId, projectId)
+      )
+    );
   return { success: true };
 }
 
@@ -468,10 +699,36 @@ export async function getTopicHubItems(userId: number, projectId: number) {
       .all(userId, projectId) as SqliteTopicHubItemRow[];
     return rows.map(row => mapSqliteTopicHubItem(row)!);
   }
-  return db.select().from(topicHubItems).where(and(eq(topicHubItems.userId, userId), eq(topicHubItems.projectId, projectId))).orderBy(desc(topicHubItems.createdAt));
+  return db
+    .select()
+    .from(topicHubItems)
+    .where(
+      and(
+        eq(topicHubItems.userId, userId),
+        eq(topicHubItems.projectId, projectId)
+      )
+    )
+    .orderBy(desc(topicHubItems.createdAt));
 }
 
-export async function createTopicHubItem(userId: number, data: Omit<InsertTopicHubItem, "userId">) {
+export async function findTopicHubItemByNoteId(
+  userId: number,
+  projectId: number,
+  noteId: string
+) {
+  const items = await getTopicHubItems(userId, projectId);
+  return (
+    items.find(item => {
+      const tags = item.tags as Record<string, unknown> | null | undefined;
+      return String(tags?.noteId ?? "") === noteId;
+    }) ?? null
+  );
+}
+
+export async function createTopicHubItem(
+  userId: number,
+  data: Omit<InsertTopicHubItem, "userId">
+) {
   const db = await getDb();
   if (!db) {
     const sqlite = getSqliteDb();
@@ -509,49 +766,225 @@ export async function createTopicHubItem(userId: number, data: Omit<InsertTopicH
   }
   const result = await db.insert(topicHubItems).values({ ...data, userId });
   const id = (result as unknown as { insertId: number }).insertId;
-  const items = await db.select().from(topicHubItems).where(eq(topicHubItems.id, id)).limit(1);
+  const items = await db
+    .select()
+    .from(topicHubItems)
+    .where(eq(topicHubItems.id, id))
+    .limit(1);
   return items[0];
+}
+
+export async function updateTopicHubItemTags(
+  userId: number,
+  data: {
+    id: number;
+    tags: unknown;
+  }
+) {
+  const db = await getDb();
+  if (!db) {
+    const sqlite = getSqliteDb();
+    sqlite
+      .prepare(
+        "UPDATE topic_hub_items SET tags = ? WHERE id = ? AND userId = ?"
+      )
+      .run(
+        data.tags == null ? null : JSON.stringify(data.tags),
+        data.id,
+        userId
+      );
+    return { success: true };
+  }
+  await db
+    .update(topicHubItems)
+    .set({ tags: data.tags as Record<string, unknown> })
+    .where(
+      and(eq(topicHubItems.id, data.id), eq(topicHubItems.userId, userId))
+    );
+  return { success: true };
 }
 
 export async function deleteTopicHubItem(userId: number, id: number) {
   const db = await getDb();
   if (!db) {
     const sqlite = getSqliteDb();
-    sqlite.prepare("DELETE FROM topic_hub_items WHERE id = ? AND userId = ?").run(id, userId);
+    sqlite
+      .prepare("DELETE FROM topic_hub_items WHERE id = ? AND userId = ?")
+      .run(id, userId);
     return { success: true };
   }
-  await db.delete(topicHubItems).where(and(eq(topicHubItems.id, id), eq(topicHubItems.userId, userId)));
+  await db
+    .delete(topicHubItems)
+    .where(and(eq(topicHubItems.id, id), eq(topicHubItems.userId, userId)));
+  return { success: true };
+}
+
+export async function deleteTopicHubItemsByProject(
+  userId: number,
+  projectId: number
+) {
+  const db = await getDb();
+  if (!db) {
+    const sqlite = getSqliteDb();
+    sqlite
+      .prepare("DELETE FROM topic_hub_items WHERE projectId = ? AND userId = ?")
+      .run(projectId, userId);
+    return { success: true };
+  }
+  await db
+    .delete(topicHubItems)
+    .where(
+      and(
+        eq(topicHubItems.projectId, projectId),
+        eq(topicHubItems.userId, userId)
+      )
+    );
   return { success: true };
 }
 
 // ─── Topics ────────────────────────────────────────────────────────────────────
-export async function getTopics(userId: number, projectId: number) {
-  const db = await getDb();
-  if (!db) return [];
-  return db.select().from(topics).where(and(eq(topics.userId, userId), eq(topics.projectId, projectId))).orderBy(desc(topics.createdAt));
+function mapSqliteTopic(row: SqliteTopicRow | undefined | null) {
+  if (!row) return null;
+  return {
+    id: Number(row.id),
+    projectId: Number(row.projectId),
+    userId: Number(row.userId),
+    title: row.title,
+    description: row.description,
+    topicType: row.topicType,
+    viralPotential: row.viralPotential,
+    rationale: row.rationale,
+    status: row.status,
+    createdAt: new Date(row.createdAt),
+    updatedAt: new Date(row.updatedAt),
+  };
 }
 
-export async function createTopic(userId: number, data: Omit<InsertTopic, "userId">) {
+export async function getTopics(userId: number, projectId: number) {
   const db = await getDb();
-  if (!db) throw new Error("Database not available");
+  if (!db) {
+    const sqlite = getSqliteDb();
+    const rows = sqlite
+      .prepare(
+        `SELECT id, projectId, userId, title, description, topicType, viralPotential, rationale, status, createdAt, updatedAt
+         FROM topics
+         WHERE userId = ? AND projectId = ?
+         ORDER BY datetime(createdAt) DESC, id DESC`
+      )
+      .all(userId, projectId) as SqliteTopicRow[];
+    return rows.map(row => mapSqliteTopic(row)!);
+  }
+  return db
+    .select()
+    .from(topics)
+    .where(and(eq(topics.userId, userId), eq(topics.projectId, projectId)))
+    .orderBy(desc(topics.createdAt));
+}
+
+export async function createTopic(
+  userId: number,
+  data: Omit<InsertTopic, "userId">
+) {
+  const db = await getDb();
+  if (!db) {
+    const sqlite = getSqliteDb();
+    const now = new Date().toISOString();
+    const result = sqlite
+      .prepare(
+        `INSERT INTO topics (projectId, userId, title, description, topicType, viralPotential, rationale, status, createdAt, updatedAt)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        data.projectId,
+        userId,
+        data.title,
+        data.description ?? null,
+        data.topicType ?? "traffic",
+        data.viralPotential ?? "medium",
+        data.rationale ?? null,
+        data.status ?? "draft",
+        now,
+        now
+      );
+    const row = sqlite
+      .prepare("SELECT * FROM topics WHERE id = ? LIMIT 1")
+      .get(Number(result.lastInsertRowid)) as SqliteTopicRow | undefined;
+    const topic = mapSqliteTopic(row);
+    if (!topic) throw new Error("Failed to create topic in sqlite");
+    return topic;
+  }
   const result = await db.insert(topics).values({ ...data, userId });
   const id = (result as unknown as { insertId: number }).insertId;
   const rows = await db.select().from(topics).where(eq(topics.id, id)).limit(1);
   return rows[0];
 }
 
-export async function updateTopic(userId: number, data: { id: number; status?: "draft" | "selected" | "in_production" | "published"; title?: string }) {
+export async function updateTopic(
+  userId: number,
+  data: {
+    id: number;
+    status?: "draft" | "selected" | "in_production" | "published";
+    title?: string;
+  }
+) {
   const db = await getDb();
-  if (!db) throw new Error("Database not available");
+  if (!db) {
+    const sqlite = getSqliteDb();
+    const fields: string[] = [];
+    const values: Array<string | number | null> = [];
+    if (data.status !== undefined) {
+      fields.push("status = ?");
+      values.push(data.status);
+    }
+    if (data.title !== undefined) {
+      fields.push("title = ?");
+      values.push(data.title);
+    }
+    fields.push("updatedAt = ?");
+    values.push(new Date().toISOString());
+    values.push(data.id, userId);
+    sqlite
+      .prepare(
+        `UPDATE topics SET ${fields.join(", ")} WHERE id = ? AND userId = ?`
+      )
+      .run(...values);
+    return { success: true };
+  }
   const { id, ...rest } = data;
-  await db.update(topics).set(rest).where(and(eq(topics.id, id), eq(topics.userId, userId)));
+  await db
+    .update(topics)
+    .set(rest)
+    .where(and(eq(topics.id, id), eq(topics.userId, userId)));
   return { success: true };
 }
 
 export async function deleteTopic(userId: number, id: number) {
   const db = await getDb();
-  if (!db) throw new Error("Database not available");
-  await db.delete(topics).where(and(eq(topics.id, id), eq(topics.userId, userId)));
+  if (!db) {
+    const sqlite = getSqliteDb();
+    sqlite
+      .prepare("DELETE FROM topics WHERE id = ? AND userId = ?")
+      .run(id, userId);
+    return { success: true };
+  }
+  await db
+    .delete(topics)
+    .where(and(eq(topics.id, id), eq(topics.userId, userId)));
+  return { success: true };
+}
+
+export async function deleteTopicsByProject(userId: number, projectId: number) {
+  const db = await getDb();
+  if (!db) {
+    const sqlite = getSqliteDb();
+    sqlite
+      .prepare("DELETE FROM topics WHERE projectId = ? AND userId = ?")
+      .run(projectId, userId);
+    return { success: true };
+  }
+  await db
+    .delete(topics)
+    .where(and(eq(topics.projectId, projectId), eq(topics.userId, userId)));
   return { success: true };
 }
 
@@ -559,79 +992,374 @@ export async function deleteTopic(userId: number, id: number) {
 export async function getViralAnalyses(userId: number, projectId: number) {
   const db = await getDb();
   if (!db) return [];
-  return db.select().from(viralAnalyses).where(and(eq(viralAnalyses.userId, userId), eq(viralAnalyses.projectId, projectId))).orderBy(desc(viralAnalyses.createdAt));
+  return db
+    .select()
+    .from(viralAnalyses)
+    .where(
+      and(
+        eq(viralAnalyses.userId, userId),
+        eq(viralAnalyses.projectId, projectId)
+      )
+    )
+    .orderBy(desc(viralAnalyses.createdAt));
 }
 
-export async function createViralAnalysis(userId: number, data: Omit<InsertViralAnalysis, "userId">) {
+export async function createViralAnalysis(
+  userId: number,
+  data: Omit<InsertViralAnalysis, "userId">
+) {
   const db = await getDb();
   if (!db) throw new Error("Database not available");
   const result = await db.insert(viralAnalyses).values({ ...data, userId });
   return (result as unknown as { insertId: number }).insertId;
 }
 
-export async function updateViralAnalysis(userId: number, data: { id: number; viralFormula?: string; conversionFormula?: string; fullAnalysis?: unknown; status?: "pending" | "analyzing" | "completed" | "failed" }) {
+export async function updateViralAnalysis(
+  userId: number,
+  data: {
+    id: number;
+    viralFormula?: string;
+    conversionFormula?: string;
+    fullAnalysis?: unknown;
+    status?: "pending" | "analyzing" | "completed" | "failed";
+  }
+) {
   const db = await getDb();
   if (!db) throw new Error("Database not available");
   const { id, ...rest } = data;
-  await db.update(viralAnalyses).set(rest as Record<string, unknown>).where(and(eq(viralAnalyses.id, id), eq(viralAnalyses.userId, userId)));
+  await db
+    .update(viralAnalyses)
+    .set(rest as Record<string, unknown>)
+    .where(and(eq(viralAnalyses.id, id), eq(viralAnalyses.userId, userId)));
   return { success: true };
 }
 
 // ─── Scripts ───────────────────────────────────────────────────────────────────
-export async function getScripts(userId: number, projectId: number) {
-  const db = await getDb();
-  if (!db) return [];
-  return db.select().from(scripts).where(and(eq(scripts.userId, userId), eq(scripts.projectId, projectId))).orderBy(desc(scripts.createdAt));
+function mapSqliteScript(row: SqliteScriptRow | undefined | null) {
+  if (!row) return null;
+  return {
+    id: Number(row.id),
+    projectId: Number(row.projectId),
+    userId: Number(row.userId),
+    topicId: row.topicId != null ? Number(row.topicId) : null,
+    analysisId: row.analysisId != null ? Number(row.analysisId) : null,
+    title: row.title,
+    hookType: row.hookType,
+    hookContent: row.hookContent,
+    mainContent: row.mainContent,
+    endingContent: row.endingContent,
+    fullScript: row.fullScript,
+    platform: row.platform,
+    duration: row.duration != null ? Number(row.duration) : null,
+    status: row.status,
+    createdAt: new Date(row.createdAt),
+    updatedAt: new Date(row.updatedAt),
+  };
 }
 
-export async function createScript(userId: number, data: Omit<InsertScript, "userId">) {
+export async function getScripts(userId: number, projectId: number) {
   const db = await getDb();
-  if (!db) throw new Error("Database not available");
+  if (!db) {
+    const sqlite = getSqliteDb();
+    const rows = sqlite
+      .prepare(
+        `SELECT * FROM scripts WHERE userId = ? AND projectId = ? ORDER BY datetime(createdAt) DESC, id DESC`
+      )
+      .all(userId, projectId) as SqliteScriptRow[];
+    return rows.map(row => mapSqliteScript(row)!);
+  }
+  return db
+    .select()
+    .from(scripts)
+    .where(and(eq(scripts.userId, userId), eq(scripts.projectId, projectId)))
+    .orderBy(desc(scripts.createdAt));
+}
+
+export async function createScript(
+  userId: number,
+  data: Omit<InsertScript, "userId">
+) {
+  const db = await getDb();
+  if (!db) {
+    const sqlite = getSqliteDb();
+    const now = new Date().toISOString();
+    const result = sqlite
+      .prepare(
+        `INSERT INTO scripts (projectId, userId, topicId, analysisId, title, hookType, hookContent, mainContent, endingContent, fullScript, platform, duration, status, createdAt, updatedAt)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        data.projectId,
+        userId,
+        data.topicId ?? null,
+        data.analysisId ?? null,
+        data.title,
+        data.hookType ?? null,
+        data.hookContent ?? null,
+        data.mainContent ?? null,
+        data.endingContent ?? null,
+        data.fullScript ?? null,
+        data.platform ?? null,
+        data.duration ?? null,
+        data.status ?? "draft",
+        now,
+        now
+      );
+    return Number(result.lastInsertRowid);
+  }
   const result = await db.insert(scripts).values({ ...data, userId });
   return (result as unknown as { insertId: number }).insertId;
 }
 
-export async function updateScript(userId: number, data: { id: number; status?: "draft" | "review" | "approved" | "produced"; fullScript?: string }) {
+export async function updateScript(
+  userId: number,
+  data: {
+    id: number;
+    status?: "draft" | "review" | "approved" | "produced";
+    fullScript?: string;
+  }
+) {
   const db = await getDb();
-  if (!db) throw new Error("Database not available");
+  if (!db) {
+    const sqlite = getSqliteDb();
+    const fields: string[] = [];
+    const values: Array<string | number | null> = [];
+    if (data.status !== undefined) {
+      fields.push("status = ?");
+      values.push(data.status);
+    }
+    if (data.fullScript !== undefined) {
+      fields.push("fullScript = ?");
+      values.push(data.fullScript);
+    }
+    fields.push("updatedAt = ?");
+    values.push(new Date().toISOString());
+    values.push(data.id, userId);
+    sqlite
+      .prepare(
+        `UPDATE scripts SET ${fields.join(", ")} WHERE id = ? AND userId = ?`
+      )
+      .run(...values);
+    return { success: true };
+  }
   const { id, ...rest } = data;
-  await db.update(scripts).set(rest).where(and(eq(scripts.id, id), eq(scripts.userId, userId)));
+  await db
+    .update(scripts)
+    .set(rest)
+    .where(and(eq(scripts.id, id), eq(scripts.userId, userId)));
   return { success: true };
 }
 
 export async function deleteScript(userId: number, id: number) {
   const db = await getDb();
-  if (!db) throw new Error("Database not available");
-  await db.delete(scripts).where(and(eq(scripts.id, id), eq(scripts.userId, userId)));
+  if (!db) {
+    const sqlite = getSqliteDb();
+    sqlite
+      .prepare("DELETE FROM scripts WHERE id = ? AND userId = ?")
+      .run(id, userId);
+    return { success: true };
+  }
+  await db
+    .delete(scripts)
+    .where(and(eq(scripts.id, id), eq(scripts.userId, userId)));
   return { success: true };
 }
 
 // ─── Materials ─────────────────────────────────────────────────────────────────
-export async function getMaterials(userId: number, projectId: number) {
-  const db = await getDb();
-  if (!db) return [];
-  return db.select().from(materials).where(and(eq(materials.userId, userId), eq(materials.projectId, projectId))).orderBy(desc(materials.createdAt));
+
+type SqliteMaterialRow = {
+  id: number;
+  projectId: number;
+  userId: number;
+  scriptId: number | null;
+  type: string;
+  title: string;
+  fileUrl: string | null;
+  thumbnailUrl: string | null;
+  tags: string | null;
+  bodyPart: string | null;
+  treatmentType: string | null;
+  style: string | null;
+  status: string;
+  seedanceTaskId: string | null;
+  referenceImageUrl: string | null;
+  prompt: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+function mapSqliteMaterial(row: SqliteMaterialRow | undefined | null) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    projectId: row.projectId,
+    userId: row.userId,
+    scriptId: row.scriptId,
+    type: row.type as
+      | "real_person"
+      | "digital_avatar"
+      | "before_after"
+      | "other",
+    title: row.title,
+    fileUrl: row.fileUrl,
+    thumbnailUrl: row.thumbnailUrl,
+    tags: row.tags ? (JSON.parse(row.tags) as string[]) : null,
+    bodyPart: row.bodyPart,
+    treatmentType: row.treatmentType,
+    style: row.style,
+    status: row.status as "uploading" | "processing" | "ready" | "failed",
+    seedanceTaskId: row.seedanceTaskId,
+    referenceImageUrl: row.referenceImageUrl,
+    prompt: row.prompt,
+    createdAt: new Date(row.createdAt),
+    updatedAt: new Date(row.updatedAt),
+  };
 }
 
-export async function createMaterial(userId: number, data: Omit<InsertMaterial, "userId">) {
+export async function getMaterials(userId: number, projectId: number) {
   const db = await getDb();
-  if (!db) throw new Error("Database not available");
-  const result = await db.insert(materials).values({ ...data, userId });
+  if (!db) {
+    const sqlite = getSqliteDb();
+    const rows = sqlite
+      .prepare(
+        "SELECT * FROM materials WHERE userId = ? AND projectId = ? ORDER BY createdAt DESC"
+      )
+      .all(userId, projectId) as SqliteMaterialRow[];
+    return rows.map(r => mapSqliteMaterial(r)!);
+  }
+  return db
+    .select()
+    .from(materials)
+    .where(
+      and(eq(materials.userId, userId), eq(materials.projectId, projectId))
+    )
+    .orderBy(desc(materials.createdAt));
+}
+
+export async function createMaterial(
+  userId: number,
+  data: Omit<InsertMaterial, "userId"> & {
+    seedanceTaskId?: string;
+    referenceImageUrl?: string;
+    prompt?: string;
+  }
+) {
+  const db = await getDb();
+  if (!db) {
+    const sqlite = getSqliteDb();
+    const now = new Date().toISOString();
+    const result = sqlite
+      .prepare(
+        `INSERT INTO materials (projectId, userId, scriptId, type, title, fileUrl, thumbnailUrl, tags, bodyPart, treatmentType, style, status, seedanceTaskId, referenceImageUrl, prompt, createdAt, updatedAt)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        data.projectId,
+        userId,
+        data.scriptId ?? null,
+        data.type ?? "other",
+        data.title,
+        data.fileUrl ?? null,
+        data.thumbnailUrl ?? null,
+        data.tags ? JSON.stringify(data.tags) : null,
+        data.bodyPart ?? null,
+        data.treatmentType ?? null,
+        data.style ?? null,
+        data.status ?? "uploading",
+        data.seedanceTaskId ?? null,
+        data.referenceImageUrl ?? null,
+        data.prompt ?? null,
+        now,
+        now
+      );
+    return Number(
+      (result as { lastInsertRowid: number | bigint }).lastInsertRowid
+    );
+  }
+  const result = await db
+    .insert(materials)
+    .values({ ...data, userId } as InsertMaterial);
   return (result as unknown as { insertId: number }).insertId;
 }
 
-export async function updateMaterial(userId: number, data: { id: number; status?: "uploading" | "processing" | "ready" | "failed"; tags?: string[]; fileUrl?: string; thumbnailUrl?: string }) {
+export async function updateMaterial(
+  userId: number,
+  data: {
+    id: number;
+    status?: "uploading" | "processing" | "ready" | "failed";
+    tags?: string[];
+    fileUrl?: string;
+    thumbnailUrl?: string;
+    seedanceTaskId?: string;
+    referenceImageUrl?: string;
+    prompt?: string;
+  }
+) {
   const db = await getDb();
-  if (!db) throw new Error("Database not available");
+  if (!db) {
+    const sqlite = getSqliteDb();
+    const { id, ...rest } = data;
+    const sets: string[] = [];
+    const vals: unknown[] = [];
+    if (rest.status !== undefined) {
+      sets.push("status = ?");
+      vals.push(rest.status);
+    }
+    if (rest.tags !== undefined) {
+      sets.push("tags = ?");
+      vals.push(JSON.stringify(rest.tags));
+    }
+    if (rest.fileUrl !== undefined) {
+      sets.push("fileUrl = ?");
+      vals.push(rest.fileUrl);
+    }
+    if (rest.thumbnailUrl !== undefined) {
+      sets.push("thumbnailUrl = ?");
+      vals.push(rest.thumbnailUrl);
+    }
+    if (rest.seedanceTaskId !== undefined) {
+      sets.push("seedanceTaskId = ?");
+      vals.push(rest.seedanceTaskId);
+    }
+    if (rest.referenceImageUrl !== undefined) {
+      sets.push("referenceImageUrl = ?");
+      vals.push(rest.referenceImageUrl);
+    }
+    if (rest.prompt !== undefined) {
+      sets.push("prompt = ?");
+      vals.push(rest.prompt);
+    }
+    if (sets.length === 0) return { success: true };
+    sets.push("updatedAt = ?");
+    vals.push(new Date().toISOString());
+    vals.push(id, userId);
+    sqlite
+      .prepare(
+        `UPDATE materials SET ${sets.join(", ")} WHERE id = ? AND userId = ?`
+      )
+      .run(...vals);
+    return { success: true };
+  }
   const { id, ...rest } = data;
-  await db.update(materials).set(rest as Record<string, unknown>).where(and(eq(materials.id, id), eq(materials.userId, userId)));
+  await db
+    .update(materials)
+    .set(rest as Record<string, unknown>)
+    .where(and(eq(materials.id, id), eq(materials.userId, userId)));
   return { success: true };
 }
 
 export async function deleteMaterial(userId: number, id: number) {
   const db = await getDb();
-  if (!db) throw new Error("Database not available");
-  await db.delete(materials).where(and(eq(materials.id, id), eq(materials.userId, userId)));
+  if (!db) {
+    const sqlite = getSqliteDb();
+    sqlite
+      .prepare("DELETE FROM materials WHERE id = ? AND userId = ?")
+      .run(id, userId);
+    return { success: true };
+  }
+  await db
+    .delete(materials)
+    .where(and(eq(materials.id, id), eq(materials.userId, userId)));
   return { success: true };
 }
 
@@ -639,30 +1367,53 @@ export async function deleteMaterial(userId: number, id: number) {
 export async function getPlatformAdaptations(userId: number, scriptId: number) {
   const db = await getDb();
   if (!db) return [];
-  return db.select().from(platformAdaptations).where(and(eq(platformAdaptations.userId, userId), eq(platformAdaptations.scriptId, scriptId))).orderBy(desc(platformAdaptations.createdAt));
+  return db
+    .select()
+    .from(platformAdaptations)
+    .where(
+      and(
+        eq(platformAdaptations.userId, userId),
+        eq(platformAdaptations.scriptId, scriptId)
+      )
+    )
+    .orderBy(desc(platformAdaptations.createdAt));
 }
 
-export async function createPlatformAdaptation(userId: number, data: Omit<InsertPlatformAdaptation, "userId">) {
+export async function createPlatformAdaptation(
+  userId: number,
+  data: Omit<InsertPlatformAdaptation, "userId">
+) {
   const db = await getDb();
   if (!db) throw new Error("Database not available");
-  const result = await db.insert(platformAdaptations).values({ ...data, userId });
+  const result = await db
+    .insert(platformAdaptations)
+    .values({ ...data, userId });
   return (result as unknown as { insertId: number }).insertId;
 }
 
 // ─── Usage Stats ───────────────────────────────────────────────────────────────
-export async function logUsage(userId: number, projectId: number | undefined, module: string, action: string) {
+export async function logUsage(
+  userId: number,
+  projectId: number | undefined,
+  module: string,
+  action: string
+) {
   const db = await getDb();
   if (!db) return;
   try {
     await db.insert(usageStats).values({ userId, projectId, module, action });
-  } catch { /* non-critical */ }
+  } catch {
+    /* non-critical */
+  }
 }
 
 export async function getDashboardStats(userId: number) {
   const db = await getDb();
   if (!db) {
     const sqlite = getSqliteDb();
-    const row = sqlite.prepare("SELECT COUNT(*) AS count FROM projects WHERE userId = ?").get(userId) as { count: number } | undefined;
+    const row = sqlite
+      .prepare("SELECT COUNT(*) AS count FROM projects WHERE userId = ?")
+      .get(userId) as { count: number } | undefined;
     return {
       projects: Number(row?.count ?? 0),
       topics: 0,
@@ -684,7 +1435,10 @@ export async function getDashboardStats(userId: number) {
     db.select().from(topics).where(eq(topics.userId, userId)),
     db.select().from(scripts).where(eq(scripts.userId, userId)),
     db.select().from(materials).where(eq(materials.userId, userId)),
-    db.select().from(platformAdaptations).where(eq(platformAdaptations.userId, userId)),
+    db
+      .select()
+      .from(platformAdaptations)
+      .where(eq(platformAdaptations.userId, userId)),
     db.select().from(viralAnalyses).where(eq(viralAnalyses.userId, userId)),
   ]);
   return {

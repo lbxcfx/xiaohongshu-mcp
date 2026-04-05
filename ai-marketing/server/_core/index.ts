@@ -2,12 +2,16 @@ import "dotenv/config";
 import express from "express";
 import { createServer } from "http";
 import net from "net";
+import path from "node:path";
+import { mkdirSync } from "node:fs";
+import multer from "multer";
 import { createExpressMiddleware } from "@trpc/server/adapters/express";
 import { registerOAuthRoutes } from "./oauth";
-import { appRouter } from "../routers";
+import { appRouter, ensureTopicHubVideoPipelineStarted } from "../routers";
 import { createContext } from "./context";
 import { serveStatic, setupVite } from "./vite";
 import {
+  deleteXhsCookies,
   getXhsLoginQrcode,
   getXhsLoginStatus,
   sendXhsPhoneLoginCode,
@@ -36,11 +40,53 @@ async function findAvailablePort(startPort: number = 3000): Promise<number> {
 }
 
 async function startServer() {
+  ensureTopicHubVideoPipelineStarted();
+
   const app = express();
   const server = createServer(app);
   // Configure body parser with larger size limit for file uploads
   app.use(express.json({ limit: "50mb" }));
   app.use(express.urlencoded({ limit: "50mb", extended: true }));
+  app.use(
+    "/_local",
+    express.static(path.resolve(process.cwd(), ".data"), {
+      fallthrough: true,
+    })
+  );
+  // 文件上传端点：POST /api/upload?projectId=xxx
+  const upload = multer({
+    storage: multer.diskStorage({
+      destination: (req, _file, cb) => {
+        const projectId = String(req.query.projectId || "0");
+        const dir = path.resolve(process.cwd(), ".data", "uploads", projectId);
+        mkdirSync(dir, { recursive: true });
+        cb(null, dir);
+      },
+      filename: (_req, file, cb) => {
+        const ext = path.extname(file.originalname) || ".bin";
+        cb(null, `${Date.now()}${ext}`);
+      },
+    }),
+    limits: { fileSize: 30 * 1024 * 1024 }, // 最大 30MB
+    fileFilter: (_req, file, cb) => {
+      // 仅允许图片
+      if (file.mimetype.startsWith("image/")) {
+        cb(null, true);
+      } else {
+        cb(new Error("仅支持上传图片文件"));
+      }
+    },
+  });
+  app.post("/api/upload", upload.single("file"), (req, res) => {
+    if (!req.file) {
+      res.status(400).json({ success: false, error: "未收到文件" });
+      return;
+    }
+    const projectId = String(req.query.projectId || "0");
+    const url = `/_local/uploads/${projectId}/${req.file.filename}`;
+    res.json({ success: true, url });
+  });
+
   // OAuth callback under /api/oauth/callback
   registerOAuthRoutes(app);
   app.get("/api/xhs/login/qrcode", async (_req, res) => {
@@ -62,6 +108,17 @@ async function startServer() {
       res.status(502).json({
         success: false,
         error: error instanceof Error ? error.message : "获取登录状态失败",
+      });
+    }
+  });
+  app.delete("/api/xhs/login/cookies", async (_req, res) => {
+    try {
+      await deleteXhsCookies();
+      res.json({ success: true });
+    } catch (error) {
+      res.status(502).json({
+        success: false,
+        error: error instanceof Error ? error.message : "清理登录态失败",
       });
     }
   });

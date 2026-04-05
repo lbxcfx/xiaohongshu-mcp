@@ -147,15 +147,20 @@ function DashboardLayoutContent({
   children: React.ReactNode;
   setSidebarWidth: (width: number) => void;
 }) {
-  const { user, logout } = useAuth();
+  const { user, loading, logout } = useAuth();
   const [location, setLocation] = useLocation();
   const { state, toggleSidebar } = useSidebar();
   const isCollapsed = state === "collapsed";
   const [isResizing, setIsResizing] = useState(false);
   const sidebarRef = useRef<HTMLDivElement>(null);
   const isMobile = useIsMobile();
-  const displayName = user?.username || "访客模式，无需登录，直接使用";
   const isLoggedIn = Boolean(user?.is_logged_in);
+  const isReady = !loading;
+  const displayName = loading
+    ? "读取账号中..."
+    : isLoggedIn
+      ? user?.username || "小红书用户"
+      : "前往登录小红书";
 
   const projectMatch = location.match(/^\/projects\/(\d+)/);
   const currentProjectId = projectMatch ? projectMatch[1] : null;
@@ -283,7 +288,25 @@ function DashboardLayoutContent({
           </SidebarContent>
 
           <SidebarFooter className="p-3 border-t border-sidebar-border">
-            {isLoggedIn ? (
+            {!isReady ? (
+              <div className="flex items-center gap-3 rounded-lg px-2 py-2 w-full">
+                <Avatar className="h-8 w-8 border border-border shrink-0">
+                  <AvatarFallback className="text-xs font-medium bg-primary/20 text-primary">
+                    ...
+                  </AvatarFallback>
+                </Avatar>
+                {!isCollapsed && (
+                  <div className="flex-1 min-w-0">
+                    <p className="text-sm font-medium truncate leading-none text-sidebar-foreground">
+                      {displayName}
+                    </p>
+                    <p className="text-xs text-sidebar-foreground/50 truncate mt-1">
+                      正在同步登录状态
+                    </p>
+                  </div>
+                )}
+              </div>
+            ) : isLoggedIn ? (
               <DropdownMenu>
                 <DropdownMenuTrigger asChild>
                   <button className="flex items-center gap-3 rounded-lg px-2 py-2 hover:bg-sidebar-accent transition-colors w-full text-left focus:outline-none">

@@ -107,6 +107,11 @@ export type XhsUserProfile = {
   feeds: XhsFeed[];
 };
 
+export type XhsUserProfileLookup = {
+  user_id: string;
+  xsec_token: string;
+};
+
 async function requestXhsApi<T>(
   path: string,
   init: RequestInit = {}
@@ -212,6 +217,22 @@ export async function searchXhsFeeds(
 export async function getXhsMyProfile(): Promise<XhsUserProfile> {
   const result = await requestXhsApi<{ data?: XhsUserProfile }>(
     "/api/v1/user/me"
+  );
+  return result.data ?? { feeds: [] };
+}
+
+export async function getXhsUserProfile(
+  params: XhsUserProfileLookup
+): Promise<XhsUserProfile> {
+  const result = await requestXhsApi<{ data?: XhsUserProfile }>(
+    "/api/v1/user/profile",
+    {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(params),
+    }
   );
   return result.data ?? { feeds: [] };
 }

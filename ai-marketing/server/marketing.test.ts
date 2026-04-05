@@ -5,20 +5,48 @@ import type { TrpcContext } from "./_core/context";
 // Mock the database module
 vi.mock("./db", () => ({
   getProjects: vi.fn().mockResolvedValue([
-    { id: 1, userId: 1, name: "Test Project", description: "A test project", industry: "医美", platform: "小红书", status: "active", createdAt: new Date(), updatedAt: new Date() },
+    {
+      id: 1,
+      userId: 1,
+      name: "Test Project",
+      description: "A test project",
+      industry: "医美",
+      platform: "小红书",
+      status: "active",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    },
   ]),
   createProject: vi.fn().mockResolvedValue([{ insertId: 2 }]),
   updateProject: vi.fn().mockResolvedValue({ success: true }),
   deleteProject: vi.fn().mockResolvedValue({ success: true }),
-  getProjectById: vi.fn().mockResolvedValue({ id: 1, userId: 1, name: "Test Project", industry: "医美", status: "active", createdAt: new Date(), updatedAt: new Date() }),
+  getProjectById: vi.fn().mockResolvedValue({
+    id: 1,
+    userId: 1,
+    name: "Test Project",
+    industry: "医美",
+    status: "active",
+    createdAt: new Date(),
+    updatedAt: new Date(),
+  }),
   getPositionings: vi.fn().mockResolvedValue([]),
   createPositioning: vi.fn().mockResolvedValue(1),
   updatePositioning: vi.fn().mockResolvedValue({ success: true }),
   getTopicHubItems: vi.fn().mockResolvedValue([]),
-  createTopicHubItem: vi.fn().mockResolvedValue({ id: 1, title: "Test Topic", type: "trending", createdAt: new Date() }),
+  createTopicHubItem: vi.fn().mockResolvedValue({
+    id: 1,
+    title: "Test Topic",
+    type: "trending",
+    createdAt: new Date(),
+  }),
   deleteTopicHubItem: vi.fn().mockResolvedValue({ success: true }),
   getTopics: vi.fn().mockResolvedValue([]),
-  createTopic: vi.fn().mockResolvedValue({ id: 1, title: "Test", topicType: "traffic", createdAt: new Date() }),
+  createTopic: vi.fn().mockResolvedValue({
+    id: 1,
+    title: "Test",
+    topicType: "traffic",
+    createdAt: new Date(),
+  }),
   updateTopic: vi.fn().mockResolvedValue({ success: true }),
   deleteTopic: vi.fn().mockResolvedValue({ success: true }),
   getViralAnalyses: vi.fn().mockResolvedValue([]),
@@ -34,7 +62,14 @@ vi.mock("./db", () => ({
   deleteMaterial: vi.fn().mockResolvedValue({ success: true }),
   getPlatformAdaptations: vi.fn().mockResolvedValue([]),
   createPlatformAdaptation: vi.fn().mockResolvedValue(1),
-  getDashboardStats: vi.fn().mockResolvedValue({ projects: 3, topics: 10, scripts: 5, materials: 8, adaptations: 15, analyses: 4 }),
+  getDashboardStats: vi.fn().mockResolvedValue({
+    projects: 3,
+    topics: 10,
+    scripts: 5,
+    materials: 8,
+    adaptations: 15,
+    analyses: 4,
+  }),
   logUsage: vi.fn().mockResolvedValue(undefined),
   upsertUser: vi.fn().mockResolvedValue(undefined),
   getUserByOpenId: vi.fn().mockResolvedValue(undefined),
@@ -43,7 +78,28 @@ vi.mock("./db", () => ({
 // Mock the LLM module
 vi.mock("./_core/llm", () => ({
   invokeLLM: vi.fn().mockResolvedValue({
-    choices: [{ message: { content: "AI分析结果：这是一个测试响应，包含账号定位建议。" } }],
+    choices: [
+      {
+        message: {
+          content: "AI分析结果：这是一个测试响应，包含账号定位建议。",
+        },
+      },
+    ],
+  }),
+}));
+
+vi.mock("./_core/ark", () => ({
+  analyzeVideoWithArk: vi.fn().mockResolvedValue({
+    text: "视频定位分析结果：适合做细分赛道账号。",
+    raw: { id: "ark-test-response" },
+  }),
+}));
+
+vi.mock("./_core/lux", () => ({
+  downloadWithLux: vi.fn().mockResolvedValue({
+    success: true,
+    filePath: "/tmp/test-video.mp4",
+    attempts: 1,
   }),
 }));
 
@@ -66,11 +122,12 @@ function createAuthContext(): TrpcContext {
 }
 
 describe("auth router", () => {
-  it("returns null from me query (no-auth guest mode)", async () => {
+  it("returns current auth status from me query", async () => {
     const ctx = createAuthContext();
     const caller = appRouter.createCaller(ctx);
     const result = await caller.auth.me();
-    expect(result).toBeNull();
+    expect(result).toHaveProperty("status");
+    expect(result).toHaveProperty("is_logged_in");
   });
 
   it("clears cookie on logout", async () => {
@@ -88,7 +145,10 @@ describe("projects router", () => {
     const projects = await caller.projects.list();
     expect(Array.isArray(projects)).toBe(true);
     expect(projects.length).toBeGreaterThan(0);
-    expect(projects[0]).toMatchObject({ name: "Test Project", industry: "医美" });
+    expect(projects[0]).toMatchObject({
+      name: "Test Project",
+      industry: "医美",
+    });
   });
 
   it("creates a new project", async () => {
@@ -106,7 +166,10 @@ describe("projects router", () => {
   it("updates a project", async () => {
     const ctx = createAuthContext();
     const caller = appRouter.createCaller(ctx);
-    const result = await caller.projects.update({ id: 1, name: "更新后的项目名" });
+    const result = await caller.projects.update({
+      id: 1,
+      name: "更新后的项目名",
+    });
     expect(result).toEqual({ success: true });
   });
 
@@ -145,6 +208,34 @@ describe("positioning router", () => {
       personaType: "权威专家型",
     });
     expect(result).toBeDefined();
+  });
+
+  it("creates and analyzes a positioning record in one step", async () => {
+    const ctx = createAuthContext();
+    const caller = appRouter.createCaller(ctx);
+    const result = await caller.positioning.createAndAnalyze({
+      projectId: 1,
+      industry: "鍖荤編",
+      track: "杞诲尰缇?",
+      monetizationMethod: "鐢靛晢甯﹁揣",
+      targetAudience: "25-40宀佸コ鎬?",
+      personaType: "鏉冨▉涓撳鍨?",
+    });
+    expect(result).toHaveProperty("id");
+    expect(result).toHaveProperty("analysis");
+  });
+
+  it("analyzes a video link for positioning", async () => {
+    const ctx = createAuthContext();
+    const caller = appRouter.createCaller(ctx);
+    const result = await caller.positioning.analyzeVideo({
+      projectId: 1,
+      videoUrl: "https://www.xiaohongshu.com/explore/abc123",
+      filePath: "/tmp/test-video.mp4",
+      industry: "鍖荤編",
+    });
+    expect(result).toHaveProperty("id");
+    expect(result).toMatchObject({ status: "analyzing" });
   });
 
   it("runs AI analysis on a positioning", async () => {

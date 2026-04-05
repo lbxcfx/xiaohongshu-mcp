@@ -12,13 +12,19 @@ import {
   getPositionings,
   createPositioning,
   updatePositioning,
+  deletePositioning,
+  deletePositioningsByProject,
   getTopicHubItems,
+  findTopicHubItemByNoteId,
   createTopicHubItem,
+  updateTopicHubItemTags,
   deleteTopicHubItem,
+  deleteTopicHubItemsByProject,
   getTopics,
   createTopic,
   updateTopic,
   deleteTopic,
+  deleteTopicsByProject,
   getViralAnalyses,
   createViralAnalysis,
   updateViralAnalysis,
@@ -35,16 +41,20 @@ import {
   getDashboardStats,
   logUsage,
 } from "./db";
+import { ENV } from "./_core/env";
 import { invokeLLM } from "./_core/llm";
+import { analyzeVideoWithArk } from "./_core/ark";
+import { createSeedanceTask, querySeedanceTask } from "./_core/seedance";
 import { callDataApi } from "./_core/dataApi";
 import { generateImage } from "./_core/imageGeneration";
+import { downloadWithLux } from "./_core/lux";
 import { mkdir, writeFile } from "node:fs/promises";
 import { extname, join, resolve } from "node:path";
 import {
   deleteXhsCookies,
   getXhsLoginQrcode,
   getXhsLoginStatus,
-  getXhsMyProfile,
+  getXhsUserProfile,
   type XhsFeed,
   searchXhsFeeds,
   type XhsLoginStatus,
@@ -53,7 +63,6 @@ import {
 
 // Guest user ID – all data is stored under this shared ID since auth is disabled
 const GUEST_USER_ID = 1;
-
 function parseEngagementCount(value?: string | null): number {
   if (!value) return 0;
   const normalized = value.replace(/,/g, "").trim();
@@ -89,13 +98,56 @@ function splitAuthorKeywords(value?: string) {
     .filter(Boolean);
 }
 
+function parseXhsProfileLinks(value?: string) {
+  return (value ?? "")
+    .split(/[\n\r\s,;]+/)
+    .map(item => item.trim())
+    .filter(Boolean)
+    .map(item => {
+      try {
+        const parsed = new URL(item);
+        const segments = parsed.pathname.split("/").filter(Boolean);
+        const profileIndex = segments.findIndex(
+          segment => segment === "profile"
+        );
+        const userId =
+          profileIndex >= 0 ? segments[profileIndex + 1] || "" : "";
+        const xsecToken = parsed.searchParams.get("xsec_token") || "";
+        if (!userId || !xsecToken) return null;
+        return { url: item, userId, xsecToken };
+      } catch {
+        return null;
+      }
+    })
+    .filter(
+      (
+        item
+      ): item is {
+        url: string;
+        userId: string;
+        xsecToken: string;
+      } => Boolean(item)
+    );
+}
+
+function normalizeAuthorValue(value?: string | null) {
+  return String(value ?? "")
+    .trim()
+    .replace(/^@+/, "")
+    .toLowerCase();
+}
+
 function includesAnyKeyword(text: string, terms: string[]) {
   if (terms.length === 0) return true;
   const normalized = text.toLowerCase();
   return terms.some(term => normalized.includes(term));
 }
 
-function matchesAuthor(feed: XhsFeed, authorKeywords: string[]) {
+function matchesAuthor(
+  feed: XhsFeed,
+  authorKeywords: string[],
+  matchMode: "exact" | "contains" = "contains"
+) {
   if (authorKeywords.length === 0) return true;
 
   const candidates = [
@@ -104,10 +156,15 @@ function matchesAuthor(feed: XhsFeed, authorKeywords: string[]) {
     feed.noteCard?.user?.userId,
   ]
     .filter(Boolean)
-    .map(value => String(value).trim().replace(/^@+/, "").toLowerCase());
+    .map(value => normalizeAuthorValue(value));
+
+  const matcher =
+    matchMode === "exact"
+      ? (keyword: string, candidate: string) => candidate === keyword
+      : (keyword: string, candidate: string) => candidate.includes(keyword);
 
   return authorKeywords.some(keyword =>
-    candidates.some(candidate => candidate.includes(keyword))
+    candidates.some(candidate => matcher(keyword, candidate))
   );
 }
 
@@ -116,11 +173,13 @@ function selectTopVideoFeeds(
   options?: {
     keywordTerms?: string[];
     authorKeywords?: string[];
+    authorMatchMode?: "exact" | "contains";
     limit?: number;
   }
 ) {
   const keywordTerms = options?.keywordTerms ?? [];
   const authorKeywords = options?.authorKeywords ?? [];
+  const authorMatchMode = options?.authorMatchMode ?? "contains";
   const limit = options?.limit ?? 3;
 
   return feeds
@@ -133,7 +192,7 @@ function selectTopVideoFeeds(
         keywordTerms
       )
     )
-    .filter(feed => matchesAuthor(feed, authorKeywords))
+    .filter(feed => matchesAuthor(feed, authorKeywords, authorMatchMode))
     .map(feed => {
       const likedCount = parseEngagementCount(
         feed.noteCard?.interactInfo?.likedCount
@@ -158,6 +217,676 @@ function selectTopVideoFeeds(
     .slice(0, limit);
 }
 
+function buildAuthorCandidates(feed: XhsFeed) {
+  return [
+    feed.noteCard?.user?.nickname,
+    feed.noteCard?.user?.nickName,
+    feed.noteCard?.user?.userId,
+  ]
+    .filter(Boolean)
+    .map(value => normalizeAuthorValue(value));
+}
+
+async function resolveTargetAuthors(params: {
+  authorKeywords: string[];
+  authorMatchMode: "exact" | "contains";
+}) {
+  const resolvedAuthors = new Map<
+    string,
+    {
+      userId: string;
+      xsecToken: string;
+    }
+  >();
+
+  for (const authorKeyword of params.authorKeywords) {
+    const result = await searchXhsFeeds(authorKeyword);
+    for (const feed of result.feeds || []) {
+      const userId = feed.noteCard?.user?.userId?.trim();
+      const xsecToken = feed.xsecToken?.trim();
+      if (!userId || !xsecToken) continue;
+
+      const candidates = buildAuthorCandidates(feed);
+      const matched = candidates.some(candidate =>
+        params.authorMatchMode === "exact"
+          ? candidate === authorKeyword
+          : candidate.includes(authorKeyword)
+      );
+      if (!matched) continue;
+
+      resolvedAuthors.set(userId, {
+        userId,
+        xsecToken,
+      });
+    }
+  }
+
+  return Array.from(resolvedAuthors.values());
+}
+
+const TOPIC_HUB_DOWNLOAD_CONCURRENCY = 2;
+const TOPIC_HUB_ANALYSIS_CONCURRENCY = 2;
+const TOPIC_HUB_PIPELINE_SCAN_INTERVAL_MS = 5_000;
+const ANALYSIS_CONCURRENCY = TOPIC_HUB_ANALYSIS_CONCURRENCY;
+
+const topicHubDownloadRunning = new Set<number>();
+const topicHubAnalysisRunning = new Set<number>();
+let topicHubPipelineRunning = false;
+let topicHubPipelineStarted = false;
+let topicHubDownloadQueue = Promise.resolve();
+let analysisRunning = 0;
+const analysisPendingQueue: Array<() => Promise<void>> = [];
+
+function drainAnalysisQueue() {
+  while (
+    analysisRunning < TOPIC_HUB_ANALYSIS_CONCURRENCY &&
+    analysisPendingQueue.length > 0
+  ) {
+    const next = analysisPendingQueue.shift()!;
+    next();
+  }
+}
+
+// 医美短视频爆款因子分析 prompt
+const TOPIC_HUB_VIRAL_ANALYSIS_PROMPT = `角色定位
+
+你是专业的医美短视频爆款因子智能分析引擎，专为医美、轻医美、皮肤管理、抗衰护肤类账号提供结构化、可复制、可直接用于脚本生成的爆款因子提取服务。所有输出必须标准化、标签化、可被下游脚本生成模块直接调用。
+
+分析范围
+
+仅针对医美/护肤/变美类爆款视频进行分析。
+只提取可复制因子，不可复制内容（个人长相、特殊事件、偶然流量、隐私信息）一律忽略。
+
+严格按照以下维度结构化分析
+
+1. 基础信息
+
+- 视频来源平台
+- 视频时长
+- 核心项目/主题
+- 账号人设类型
+- 核心数据表现（点赞/评论/收藏/完播特征）
+
+2. 黄金3秒钩子因子
+
+- 钩子类型：痛点直问 / 反常识颠覆 / 结果前置 / 禁忌警告 / 数字清单 / 场景代入
+- 钩子原文与句式模板
+- 核心关键词
+- 可复制强度：高 / 中 / 低
+- 合规风险：低 / 中 / 高
+
+3. 痛点与情绪唤醒因子
+
+- 核心痛点：衰老松弛 / 色斑暗沉 / 痘痘痘印 / 敏感泛红 / 毛孔粗大 / 熬夜垮脸等
+- 情绪方向：焦虑唤醒 / 希望唤醒 / 安全感 / 避坑恐惧 / 性价比冲动
+- 痛点强度与目标人群
+- 可复制强度：高 / 中 / 低
+
+4. 内容结构因子
+
+- 完整脚本结构拆解：开头→共鸣→误区→科普→方案→效果→背书→互动
+- 叙事节奏：快节奏高密度 / 舒缓 / 故事化
+- 关键信息节点
+- 可复制结构强度：高 / 中 / 低
+
+5. 信任与人设因子
+
+- 信任元素：医师资质 / 机构资质 / 案例对比 / 过程实拍 / 科普讲解
+- 表达风格：专业严谨 / 闺蜜贴心 / 犀利直白 / 温柔安抚
+- 可复用信任话术
+- 可复制强度：高 / 中 / 低
+
+6. 视觉呈现因子
+
+- 画面风格：高清特写 / 前后对比 / 诊室实景 / 高级感 / 生活化
+- 镜头语言、字幕特点、封面标题特征
+- 可复制视觉强度：高 / 中 / 低
+
+7. 话术与关键词因子
+
+- 爆款高频关键词
+- 可复用句式模板
+- 口播节奏与语气特点
+- 可复制话术强度：高 / 中 / 低
+
+8. 互动与完播驱动因子
+
+- 完播设计：短时长、信息密度、悬念、反转
+- 互动引导：评论提问 / 收藏 / 转发 / 私信
+- 可复制互动设计：有 / 无
+
+9. 合规与转化因子
+
+- 合规表达类型：科普 / 护理建议 / 误区纠正 / 案例展示
+- 违规风险点识别：绝对化用词、疗效承诺、夸大宣传等
+- 转化引导方式：私信领资料 / 预约面诊 / 方案咨询
+- 可复制合规强度：高 / 中 / 低
+
+输出要求
+
+1. 结构清晰、条目化，禁止口语化、情绪化表达。
+2. 每项必须标注可复制强度，便于AI筛选复用。
+3. 最终必须输出一条【爆款核心可复制公式】，用于直接生成新脚本。
+4. 最后给出【同人设迁移建议】，确保可落地到该医美账号自身风格。
+5. 全程遵守医美广告合规要求，不鼓励、不提取违规内容。
+
+爆款视频 = 强钩子 + 精准痛点 + 情绪唤醒 + 专业信任 + 视觉冲击 + 清晰结构 + 合规引导
+
+你可以把每个维度再拆成可量化标签，让AI抓取爆款视频后自动打分、提取关键词、提取句式、提取结构。`;
+
+const TOPIC_HUB_VIRAL_ANALYSIS_PROMPT_V2 = `你是专业的医美短视频爆款因子智能分析引擎，专为医美、轻医美、皮肤管理、抗衰护肤类账号提供结构化、可复制、可直接用于脚本生成的爆款因子提取服务。所有输出必须标准化、标签化、可被下游脚本生成模块直接调用。
+
+分析范围
+
+仅针对抖音、快手、小红书、视频号等平台的医美/护肤/变美类爆款视频进行分析。
+只提取可复制因子，不可复制内容（个人长相、特殊事件、偶然流量、隐私信息）一律忽略。
+
+严格按照以下维度结构化分析
+
+1. 基础信息
+
+- 视频来源平台
+- 视频时长
+- 核心项目/主题
+- 账号人设类型
+- 核心数据表现（点赞/评论/收藏/完播特征）
+
+2. 黄金3秒钩子因子
+
+- 钩子类型：痛点直问 / 反常识颠覆 / 结果前置 / 禁忌警告 / 数字清单 / 场景代入
+- 钩子原文与句式模板
+- 核心关键词
+- 可复制强度：高 / 中 / 低
+- 合规风险：低 / 中 / 高
+
+3. 痛点与情绪唤醒因子
+
+- 核心痛点：衰老松弛 / 色斑暗沉 / 痘痘痘印 / 敏感泛红 / 毛孔粗大 / 熬夜垮脸等
+- 情绪方向：焦虑唤醒 / 希望唤醒 / 安全感 / 避坑恐惧 / 性价比冲动
+- 痛点强度与目标人群
+- 可复制强度：高 / 中 / 低
+
+4. 内容结构因子
+
+- 完整脚本结构拆解：开头共鸣误区科普方案效果背书互动
+- 叙事节奏：快节奏高密度 / 舒缓 / 故事化
+- 关键信息节点
+- 可复制结构强度：高 / 中 / 低
+
+5. 信任与人设因子
+
+- 信任元素：医师资质 / 机构资质 / 案例对比 / 过程实拍 / 科普讲解
+- 表达风格：专业严谨 / 闺蜜贴心 / 犀利直白 / 温柔安抚
+- 可复用信任话术
+- 可复制强度：高 / 中 / 低
+
+6. 视觉呈现因子
+
+- 画面风格：高清特写 / 前后对比 / 诊室实景 / 高级感 / 生活化
+- 镜头语言、字幕特点、封面标题特征
+- 可复制视觉强度：高 / 中 / 低
+
+7. 话术与关键词因子
+
+- 爆款高频关键词
+- 可复用句式模板
+- 口播节奏与语气特点
+- 可复制话术强度：高 / 中 / 低
+
+8. 互动与完播驱动因子
+
+- 完播设计：短时长、信息密度、悬念、反转
+- 互动引导：评论提问 / 收藏 / 转发 / 私信
+- 可复制互动设计：有 / 无
+
+9. 合规与转化因子
+
+- 合规表达类型：科普 / 护理建议 / 误区纠正 / 案例展示
+- 违规风险点识别：绝对化用词、疗效承诺、夸大宣传等
+- 转化引导方式：私信领资料 / 预约面诊 / 方案咨询
+- 可复制合规强度：高 / 中 / 低
+
+输出要求
+
+1. 结构清晰、条目化，禁止口语化、情绪化表达。
+2. 每项必须标注可复制强度，便于 AI 筛选复用。
+3. 最终必须输出一条【爆款核心可复制公式】，用于直接生成新脚本。
+4. 最后给出【同人设迁移建议】，确保可落地到该医美账号自身风格。
+5. 全程遵守医美广告合规要求，不鼓励、不提取违规内容。
+
+爆款视频 = 强钩子 + 精准痛点 + 情绪唤醒 + 专业信任 + 视觉冲击 + 清晰结构 + 合规引导
+
+你可以把每个维度再拆成可量化标签，让 AI 抓取爆款视频后自动打分、提取关键词、提取句式、提取结构。`;
+
+function queueTopicHubVideoAnalysis(task: {
+  itemId: number;
+  projectId: number;
+  filePath: string;
+  tags: Record<string, unknown>;
+}) {
+  const run = async () => {
+    analysisRunning++;
+    console.info(
+      `[TopicHub] analysis started for item ${task.itemId} (${analysisRunning}/${ANALYSIS_CONCURRENCY} slots)`
+    );
+
+    const analyzingTags = {
+      ...task.tags,
+      videoAnalysisStatus: "analyzing",
+    };
+    await updateTopicHubItemTags(GUEST_USER_ID, {
+      id: task.itemId,
+      tags: analyzingTags,
+    });
+
+    try {
+      const result = await analyzeVideoWithArk({
+        filePath: task.filePath,
+        prompt: TOPIC_HUB_VIRAL_ANALYSIS_PROMPT_V2,
+      });
+
+      await updateTopicHubItemTags(GUEST_USER_ID, {
+        id: task.itemId,
+        tags: {
+          ...analyzingTags,
+          videoAnalysisStatus: "completed",
+          videoAnalysisResult: result.text,
+          videoAnalysisFileId: result.fileId,
+        },
+      });
+      console.info(
+        `[TopicHub] video analysis completed for item ${task.itemId}`
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await updateTopicHubItemTags(GUEST_USER_ID, {
+        id: task.itemId,
+        tags: {
+          ...analyzingTags,
+          videoAnalysisStatus: "failed",
+          videoAnalysisError: message,
+        },
+      });
+      console.warn("[TopicHub] video analysis failed", error);
+    } finally {
+      analysisRunning--;
+      drainAnalysisQueue();
+    }
+  };
+
+  if (analysisRunning < ANALYSIS_CONCURRENCY) {
+    run();
+  } else {
+    analysisPendingQueue.push(run);
+    console.info(
+      `[TopicHub] analysis queued for item ${task.itemId} (pending: ${analysisPendingQueue.length})`
+    );
+  }
+}
+
+function queueTopicHubVideoDownload(task: {
+  itemId: number;
+  projectId: number;
+  noteId: string;
+  noteUrl: string;
+  tags: Record<string, unknown>;
+}) {
+  topicHubDownloadQueue = topicHubDownloadQueue
+    .then(async () => {
+      const previousFailedAttempts = Number(
+        task.tags.videoDownloadAttempts ?? 0
+      );
+      const previousStatus = String(task.tags.videoDownloadStatus ?? "");
+
+      if (previousStatus === "failed" && previousFailedAttempts >= 3) {
+        await updateTopicHubItemTags(GUEST_USER_ID, {
+          id: task.itemId,
+          tags: {
+            ...task.tags,
+            videoDownloadStatus: "skipped",
+            videoDownloadError: "已达到最大重试次数，跳过下载",
+          },
+        });
+        return;
+      }
+
+      try {
+        const downloadResult = await downloadWithLux({
+          url: task.noteUrl,
+          noteId: task.noteId,
+          projectId: task.projectId,
+        });
+        const updatedTags = {
+          ...task.tags,
+          videoDownloadPath: downloadResult.filePath,
+          videoDownloadAttempts: downloadResult.attempts,
+          videoDownloadStatus: downloadResult.success ? "success" : "failed",
+          videoDownloadError: downloadResult.error,
+        };
+        await updateTopicHubItemTags(GUEST_USER_ID, {
+          id: task.itemId,
+          tags: updatedTags,
+        });
+
+        if (downloadResult.success && downloadResult.filePath) {
+          queueTopicHubVideoAnalysis({
+            itemId: task.itemId,
+            projectId: task.projectId,
+            filePath: downloadResult.filePath,
+            tags: updatedTags,
+          });
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        await updateTopicHubItemTags(GUEST_USER_ID, {
+          id: task.itemId,
+          tags: {
+            ...task.tags,
+            videoDownloadAttempts: 3,
+            videoDownloadStatus: "failed",
+            videoDownloadError: message,
+          },
+        });
+        console.warn("[XHS] background download video failed", error);
+      }
+    })
+    .catch(error => {
+      console.warn("[XHS] topic hub download queue failed", error);
+    });
+}
+
+function getTopicHubQueueTimestamp(tags: Record<string, unknown>, key: string) {
+  const value = tags[key];
+  if (typeof value !== "string" || !value) return 0;
+
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) ? timestamp : 0;
+}
+
+async function listTopicHubVideoItemsForPipeline() {
+  const projects = await getProjects(GUEST_USER_ID);
+  const itemGroups = await Promise.all(
+    projects.map(project => getTopicHubItems(GUEST_USER_ID, project.id))
+  );
+
+  return itemGroups
+    .flat()
+    .filter(
+      item => item.platform === "xiaohongshu" && item.type === "viral_post"
+    );
+}
+
+async function recoverTopicHubVideoPipelineState() {
+  const items = await listTopicHubVideoItemsForPipeline();
+  let recoveredCount = 0;
+
+  for (const item of items) {
+    const tags = (item.tags ?? {}) as Record<string, unknown>;
+    if (String(tags.videoAnalysisStatus || "") !== "analyzing") continue;
+
+    await updateTopicHubItemTags(GUEST_USER_ID, {
+      id: item.id,
+      tags: {
+        ...tags,
+        videoAnalysisStatus: "pending",
+        videoAnalysisQueuedAt:
+          String(
+            tags.videoAnalysisQueuedAt || tags.videoAnalysisStartedAt || ""
+          ) || new Date().toISOString(),
+        videoAnalysisStartedAt: undefined,
+      },
+    });
+    recoveredCount += 1;
+  }
+
+  if (recoveredCount > 0) {
+    console.info(
+      `[TopicHub] recovered ${recoveredCount} video analysis tasks after restart`
+    );
+  }
+}
+
+async function runTopicHubDownloadTask(
+  item: Awaited<ReturnType<typeof listTopicHubVideoItemsForPipeline>>[number]
+) {
+  topicHubDownloadRunning.add(item.id);
+
+  const tags = (item.tags ?? {}) as Record<string, unknown>;
+  const noteId = String(tags.noteId || "");
+  const noteUrl = String(item.url || "");
+  const previousFailedAttempts = Number(tags.videoDownloadAttempts ?? 0);
+  const previousStatus = String(tags.videoDownloadStatus ?? "");
+
+  try {
+    if (!noteId || !noteUrl) {
+      throw new Error("缺少视频链接信息，无法触发下载");
+    }
+
+    if (previousStatus === "failed" && previousFailedAttempts >= 3) {
+      await updateTopicHubItemTags(GUEST_USER_ID, {
+        id: item.id,
+        tags: {
+          ...tags,
+          videoDownloadStatus: "skipped",
+          videoDownloadError: "已达到最大重试次数，跳过下载",
+          videoDownloadFinishedAt: new Date().toISOString(),
+        },
+      });
+      return;
+    }
+
+    await updateTopicHubItemTags(GUEST_USER_ID, {
+      id: item.id,
+      tags: {
+        ...tags,
+        videoDownloadStatus: "pending",
+        videoDownloadError: undefined,
+        videoDownloadStartedAt: new Date().toISOString(),
+      },
+    });
+
+    console.info(`[TopicHub] download started for item ${item.id}`);
+
+    const downloadResult = await downloadWithLux({
+      url: noteUrl,
+      noteId,
+      projectId: item.projectId,
+    });
+
+    const finishedAt = new Date().toISOString();
+    const nextTags = {
+      ...tags,
+      videoDownloadPath: downloadResult.filePath,
+      videoDownloadAttempts: downloadResult.attempts,
+      videoDownloadStatus: downloadResult.success ? "success" : "failed",
+      videoDownloadError: downloadResult.error,
+      videoDownloadFinishedAt: finishedAt,
+      videoAnalysisStatus: downloadResult.success ? "pending" : undefined,
+      videoAnalysisError: undefined,
+      videoAnalysisResult: undefined,
+      videoAnalysisFileId: undefined,
+      videoAnalysisQueuedAt: downloadResult.success ? finishedAt : undefined,
+      videoAnalysisStartedAt: undefined,
+      videoAnalysisFinishedAt: undefined,
+    };
+    await updateTopicHubItemTags(GUEST_USER_ID, {
+      id: item.id,
+      tags: nextTags,
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await updateTopicHubItemTags(GUEST_USER_ID, {
+      id: item.id,
+      tags: {
+        ...tags,
+        videoDownloadAttempts: Math.max(previousFailedAttempts, 3),
+        videoDownloadStatus: "failed",
+        videoDownloadError: message,
+        videoDownloadFinishedAt: new Date().toISOString(),
+      },
+    });
+    console.warn("[TopicHub] background download video failed", error);
+  } finally {
+    topicHubDownloadRunning.delete(item.id);
+    void pumpTopicHubVideoPipeline();
+  }
+}
+
+async function runTopicHubAnalysisTask(
+  item: Awaited<ReturnType<typeof listTopicHubVideoItemsForPipeline>>[number]
+) {
+  topicHubAnalysisRunning.add(item.id);
+
+  const tags = (item.tags ?? {}) as Record<string, unknown>;
+  const filePath = String(tags.videoDownloadPath || "");
+
+  try {
+    if (!filePath) {
+      throw new Error("视频尚未下载完成");
+    }
+
+    const analyzingTags = {
+      ...tags,
+      videoAnalysisStatus: "analyzing",
+      videoAnalysisError: undefined,
+      videoAnalysisStartedAt: new Date().toISOString(),
+    };
+    await updateTopicHubItemTags(GUEST_USER_ID, {
+      id: item.id,
+      tags: analyzingTags,
+    });
+
+    console.info(`[TopicHub] analysis started for item ${item.id}`);
+
+    const result = await analyzeVideoWithArk({
+      filePath,
+      prompt: TOPIC_HUB_VIRAL_ANALYSIS_PROMPT_V2,
+    });
+
+    await updateTopicHubItemTags(GUEST_USER_ID, {
+      id: item.id,
+      tags: {
+        ...analyzingTags,
+        videoAnalysisStatus: "completed",
+        videoAnalysisResult: result.text,
+        videoAnalysisFileId: result.fileId,
+        videoAnalysisFinishedAt: new Date().toISOString(),
+      },
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await updateTopicHubItemTags(GUEST_USER_ID, {
+      id: item.id,
+      tags: {
+        ...tags,
+        videoAnalysisStatus: "failed",
+        videoAnalysisError: message,
+        videoAnalysisFinishedAt: new Date().toISOString(),
+      },
+    });
+    console.warn("[TopicHub] video analysis failed", error);
+  } finally {
+    topicHubAnalysisRunning.delete(item.id);
+    void pumpTopicHubVideoPipeline();
+  }
+}
+
+async function pumpTopicHubVideoPipeline() {
+  if (topicHubPipelineRunning) return;
+  topicHubPipelineRunning = true;
+
+  try {
+    const items = await listTopicHubVideoItemsForPipeline();
+
+    const downloadSlots =
+      TOPIC_HUB_DOWNLOAD_CONCURRENCY - topicHubDownloadRunning.size;
+    if (downloadSlots > 0) {
+      const downloadCandidates = items
+        .filter(item => {
+          if (topicHubDownloadRunning.has(item.id)) return false;
+          const tags = (item.tags ?? {}) as Record<string, unknown>;
+          return (
+            String(tags.videoDownloadStatus || "") === "pending" &&
+            !String(tags.videoDownloadPath || "") &&
+            Boolean(tags.noteId) &&
+            Boolean(item.url)
+          );
+        })
+        .sort((a, b) => {
+          const aTags = (a.tags ?? {}) as Record<string, unknown>;
+          const bTags = (b.tags ?? {}) as Record<string, unknown>;
+          const aTs =
+            getTopicHubQueueTimestamp(aTags, "videoDownloadQueuedAt") ||
+            a.createdAt.getTime();
+          const bTs =
+            getTopicHubQueueTimestamp(bTags, "videoDownloadQueuedAt") ||
+            b.createdAt.getTime();
+          return aTs - bTs || a.id - b.id;
+        })
+        .slice(0, downloadSlots);
+
+      for (const item of downloadCandidates) {
+        void runTopicHubDownloadTask(item);
+      }
+    }
+
+    const analysisSlots =
+      TOPIC_HUB_ANALYSIS_CONCURRENCY - topicHubAnalysisRunning.size;
+    if (analysisSlots > 0) {
+      const analysisCandidates = items
+        .filter(item => {
+          if (topicHubAnalysisRunning.has(item.id)) return false;
+          const tags = (item.tags ?? {}) as Record<string, unknown>;
+          return (
+            String(tags.videoAnalysisStatus || "") === "pending" &&
+            Boolean(String(tags.videoDownloadPath || ""))
+          );
+        })
+        .sort((a, b) => {
+          const aTags = (a.tags ?? {}) as Record<string, unknown>;
+          const bTags = (b.tags ?? {}) as Record<string, unknown>;
+          const aTs =
+            getTopicHubQueueTimestamp(aTags, "videoAnalysisQueuedAt") ||
+            a.createdAt.getTime();
+          const bTs =
+            getTopicHubQueueTimestamp(bTags, "videoAnalysisQueuedAt") ||
+            b.createdAt.getTime();
+          return aTs - bTs || a.id - b.id;
+        })
+        .slice(0, analysisSlots);
+
+      for (const item of analysisCandidates) {
+        void runTopicHubAnalysisTask(item);
+      }
+    }
+  } catch (error) {
+    console.warn("[TopicHub] pipeline pump failed", error);
+  } finally {
+    topicHubPipelineRunning = false;
+  }
+}
+
+export function ensureTopicHubVideoPipelineStarted() {
+  if (topicHubPipelineStarted) return;
+
+  topicHubPipelineStarted = true;
+  void recoverTopicHubVideoPipelineState()
+    .catch(error => {
+      console.warn("[TopicHub] pipeline recovery failed", error);
+    })
+    .finally(() => {
+      void pumpTopicHubVideoPipeline();
+    });
+
+  const timer = setInterval(() => {
+    void pumpTopicHubVideoPipeline();
+  }, TOPIC_HUB_PIPELINE_SCAN_INTERVAL_MS);
+
+  if (typeof timer.unref === "function") {
+    timer.unref();
+  }
+}
+
 async function saveTopicHubVideoItem(params: {
   projectId: number;
   industry: string;
@@ -169,7 +898,7 @@ async function saveTopicHubVideoItem(params: {
   sharedCount: number;
   score: number;
   filters?: XhsSearchFilters;
-  searchMode: "keyword" | "mine" | "authors";
+  searchMode: "keyword" | "link";
   authorKeywords?: string[];
   sourceLabel: string;
 }) {
@@ -188,10 +917,18 @@ async function saveTopicHubVideoItem(params: {
   }
 
   const noteUrl = `https://www.xiaohongshu.com/explore/${noteId}?xsec_token=${xsecToken}&xsec_source=pc_feed`;
-  return createTopicHubItem(GUEST_USER_ID, {
+  const existingItem = await findTopicHubItemByNoteId(
+    GUEST_USER_ID,
+    params.projectId,
+    noteId
+  );
+  const existingTags =
+    (existingItem?.tags as Record<string, unknown> | null | undefined) ?? {};
+
+  const item = await createTopicHubItem(GUEST_USER_ID, {
     projectId: params.projectId,
-    title: params.feed.noteCard?.displayTitle || "小红书视频",
-    content: `关键词：${params.industry}${params.checklist ? ` | 补充关键词：${params.checklist}` : ""}`,
+    title: params.feed.noteCard?.displayTitle || "?????",
+    content: `关键词：${params.industry}${params.checklist ? ` | 链接搜索：${params.checklist}` : ""}`,
     platform: "xiaohongshu",
     url: noteUrl,
     engagementScore: params.score,
@@ -207,17 +944,33 @@ async function saveTopicHubVideoItem(params: {
       authorName:
         params.feed.noteCard?.user?.nickname ||
         params.feed.noteCard?.user?.nickName ||
-        "小红书用户",
+        "?????",
       authorAvatar: params.feed.noteCard?.user?.avatar,
       likedCount: params.likedCount,
       commentCount: params.commentCount,
       sharedCount: params.sharedCount,
       duration: params.feed.noteCard?.video?.capa?.duration,
       coverDownloadPath,
+      videoDownloadPath: undefined,
+      videoDownloadAttempts: Number(existingTags.videoDownloadAttempts ?? 0),
+      videoDownloadStatus: "idle",
+      videoDownloadError: undefined,
+      videoDownloadQueuedAt: undefined,
+      videoDownloadStartedAt: undefined,
+      videoDownloadFinishedAt: undefined,
+      videoAnalysisStatus: undefined,
+      videoAnalysisError: undefined,
+      videoAnalysisResult: undefined,
+      videoAnalysisFileId: undefined,
+      videoAnalysisQueuedAt: undefined,
+      videoAnalysisStartedAt: undefined,
+      videoAnalysisFinishedAt: undefined,
       filters: params.filters,
       authorKeywords: params.authorKeywords,
     },
   });
+
+  return item;
 }
 
 async function downloadXhsCoverImage(noteId: string, coverUrl?: string) {
@@ -244,6 +997,284 @@ async function downloadXhsCoverImage(noteId: string, coverUrl?: string) {
   const localPath = join(downloadDir, filename);
   await writeFile(localPath, bytes);
   return localPath;
+}
+
+function buildPositioningPrompt(input: {
+  industry: string;
+  track?: string;
+  monetizationMethod?: string;
+  targetAudience?: string;
+  personaType?: string;
+}) {
+  return `你是一位专业的小红书账号定位顾问，请根据以下信息输出可直接执行的账号定位方案。
+
+行业：${input.industry || "未提供"}
+细分赛道：${input.track || "未提供"}
+变现方式：${input.monetizationMethod || "未提供"}
+目标用户描述：${input.targetAudience || "未提供"}
+人设类型：${input.personaType || "未提供"}
+
+请按以下结构输出，内容务必具体：
+1. 账号定位一句话
+2. 核心价值主张
+3. 目标用户画像
+4. 内容栏目设计（至少 4 个）
+5. 人设表达建议
+6. 差异化竞争策略
+7. 变现路径规划
+8. 前 10 条内容选题建议`;
+}
+
+function buildVideoPositioningPrompt(input: {
+  videoUrl: string;
+  industry?: string;
+  track?: string;
+  monetizationMethod?: string;
+  targetAudience?: string;
+  personaType?: string;
+}) {
+  const hasIndustry = !!input.industry;
+  const hasTrack = !!input.track;
+  const hasMonetization = !!input.monetizationMethod;
+  const hasPersona = !!input.personaType;
+  const hasAudience = !!input.targetAudience;
+
+  const contextLines: string[] = [];
+  if (hasIndustry) contextLines.push(`- 用户指定行业：${input.industry}`);
+  if (hasTrack) contextLines.push(`- 用户指定细分赛道：${input.track}`);
+  if (hasMonetization)
+    contextLines.push(`- 用户指定变现方式：${input.monetizationMethod}`);
+  if (hasPersona) contextLines.push(`- 用户指定人设类型：${input.personaType}`);
+  if (hasAudience)
+    contextLines.push(`- 用户指定目标用户：${input.targetAudience}`);
+
+  const contextBlock =
+    contextLines.length > 0
+      ? `\n用户补充的上下文信息：\n${contextLines.join("\n")}\n`
+      : "";
+
+  return `你是一位专业的小红书账号定位顾问。请深度观看并理解这个视频，从以下五个核心维度进行定位分析。
+${contextBlock}
+请严格按以下五个维度输出分析，每个维度必须结合视频中的具体细节：
+
+## 一、行业分析
+- 视频属于什么行业？判断依据是什么（产品、场景、术语等）？
+- 该行业在小红书的内容生态现状如何？竞争激烈程度？
+- ${hasIndustry ? `与用户指定的「${input.industry}」行业是否吻合？差异点在哪？` : "推荐该视频最适合切入的行业方向"}
+
+## 二、细分赛道分析
+- 视频聚焦在哪个细分赛道？（如：行业中的具体品类、技术、场景）
+- 该赛道的内容饱和度、用户需求热度如何？
+- ${hasTrack ? `与用户指定的「${input.track}」赛道是否匹配？建议调整方向？` : "推荐最佳细分赛道，并说明为什么"}
+
+## 三、变现方式分析
+- 视频中透露了哪些变现信号？（如：产品植入、知识付费引导、私域引流等）
+- 该内容形式最适合什么变现模式？
+- ${hasMonetization ? `与用户指定的「${input.monetizationMethod}」变现方式的契合度如何？如何优化？` : "推荐最合适的变现路径，给出具体执行建议"}
+
+## 四、人设类型分析
+- 视频中的表达方式、语气、形象塑造属于什么人设类型？
+- 该人设的优势和局限性是什么？
+- ${hasPersona ? `与用户期望的「${input.personaType}」人设是否一致？如何调整？` : "推荐最适合的人设类型，说明如何打造"}
+
+## 五、目标用户分析
+- 视频的内容风格、话题、表达方式在吸引什么样的用户群体？
+- 这些用户的核心痛点、消费能力、内容偏好是什么？
+- ${hasAudience ? `与用户描述的目标用户「${input.targetAudience}」是否匹配？覆盖面差异？` : "画出最精准的目标用户画像（年龄、城市、兴趣、痛点）"}
+
+## 综合定位结论
+基于以上五个维度的分析，给出一句话定位结论和3条可立即执行的行动建议。
+
+要求：使用中文，避免空话套话，所有结论必须结合视频中的具体画面、话术、产品等细节，不要给通用模板。`;
+}
+
+function extractXhsNoteId(videoUrl: string) {
+  try {
+    const parsed = new URL(videoUrl);
+    const segments = parsed.pathname.split("/").filter(Boolean);
+    const itemIndex = segments.findIndex(segment =>
+      ["explore", "item"].includes(segment)
+    );
+    if (itemIndex >= 0 && segments[itemIndex + 1]) {
+      return segments[itemIndex + 1];
+    }
+
+    const discoveryIndex = segments.findIndex(
+      segment => segment === "discovery"
+    );
+    if (
+      discoveryIndex >= 0 &&
+      segments[discoveryIndex + 1] === "item" &&
+      segments[discoveryIndex + 2]
+    ) {
+      return segments[discoveryIndex + 2];
+    }
+
+    const lastSegment = segments.at(-1);
+    if (lastSegment) {
+      return lastSegment.replace(/[^a-zA-Z0-9_-]/g, "") || undefined;
+    }
+  } catch {
+    return undefined;
+  }
+
+  return undefined;
+}
+
+async function runTextPositioningAnalysis(input: {
+  industry: string;
+  track?: string;
+  monetizationMethod?: string;
+  targetAudience?: string;
+  personaType?: string;
+}) {
+  const response = await invokeLLM({
+    messages: [
+      {
+        role: "system",
+        content:
+          "你是一位专业的小红书账号定位顾问。请使用中文输出，结构清晰、建议具体、强调可执行性。",
+      },
+      {
+        role: "user",
+        content: buildPositioningPrompt(input),
+      },
+    ],
+  });
+
+  return String(response.choices[0]?.message?.content || "");
+}
+
+function buildManualPositioningContent(input: {
+  industry: string;
+  track?: string;
+  monetizationMethod?: string;
+  targetAudience?: string;
+  personaType?: string;
+}) {
+  return [
+    "# 手动创建定位",
+    "",
+    "## 基础信息",
+    `- 行业：${input.industry}`,
+    `- 细分赛道：${input.track?.trim() || "未填写"}`,
+    `- 变现方式：${input.monetizationMethod?.trim() || "未填写"}`,
+    `- 人设类型：${input.personaType?.trim() || "未填写"}`,
+    "",
+    "## 目标用户描述",
+    input.targetAudience?.trim() || "未填写",
+  ].join("\n");
+}
+
+async function runVideoPositioningAnalysisInBackground(input: {
+  positioningId: number;
+  projectId: number;
+  videoUrl: string;
+  filePath: string;
+  industry?: string;
+  track?: string;
+  monetizationMethod?: string;
+  targetAudience?: string;
+  personaType?: string;
+}) {
+  let currentFilePath = input.filePath;
+  const updateStage = async (
+    stage: string,
+    details?: Record<string, unknown>,
+    status: "analyzing" | "completed" | "failed" = "analyzing"
+  ) => {
+    console.info("[Positioning] video analysis stage", {
+      positioningId: input.positioningId,
+      stage,
+      ...details,
+    });
+
+    await updatePositioning(GUEST_USER_ID, {
+      id: input.positioningId,
+      analysisResult: {
+        mode: "video",
+        provider: "ark",
+        sourceUrl: input.videoUrl,
+        filePath: input.filePath,
+        stage,
+        ...details,
+      },
+      status,
+    });
+  };
+
+  try {
+    if (!currentFilePath) {
+      const noteId =
+        extractXhsNoteId(input.videoUrl) ||
+        `positioning-${Date.now().toString(36)}`;
+
+      await updateStage("download.started", {
+        projectId: input.projectId,
+        noteId,
+      });
+
+      const downloadResult = await downloadWithLux({
+        url: input.videoUrl,
+        noteId,
+        projectId: input.projectId,
+      });
+
+      if (!downloadResult.success || !downloadResult.filePath) {
+        throw new Error(downloadResult.error || "视频下载失败");
+      }
+
+      currentFilePath = downloadResult.filePath;
+
+      await updateStage("download.completed", {
+        noteId,
+        filePath: currentFilePath,
+        attempts: downloadResult.attempts,
+      });
+    }
+
+    await updateStage("task.started", {
+      projectId: input.projectId,
+      filePath: currentFilePath,
+    });
+
+    const result = await analyzeVideoWithArk({
+      filePath: currentFilePath,
+      prompt: buildVideoPositioningPrompt(input),
+      onStageChange: (stage, details) => {
+        void updateStage(stage, details);
+      },
+    });
+
+    await updatePositioning(GUEST_USER_ID, {
+      id: input.positioningId,
+      positioningRecommendation: result.text,
+      analysisResult: {
+        mode: "video",
+        provider: "ark",
+        sourceUrl: input.videoUrl,
+        filePath: currentFilePath,
+        stage: "task.completed",
+        fileId: result.fileId,
+        raw: result.raw,
+      },
+      status: "completed",
+    });
+  } catch (error) {
+    await updatePositioning(GUEST_USER_ID, {
+      id: input.positioningId,
+      analysisResult: {
+        mode: "video",
+        provider: "ark",
+        sourceUrl: input.videoUrl,
+        filePath: currentFilePath,
+        stage: "task.failed",
+        error: error instanceof Error ? error.message : String(error),
+      },
+      status: "failed",
+    });
+    console.warn("[Positioning] video analysis failed", error);
+  }
 }
 
 export const appRouter = router({
@@ -326,7 +1357,133 @@ export const appRouter = router({
           personaType: z.string().optional(),
         })
       )
-      .mutation(({ input }) => createPositioning(GUEST_USER_ID, input)),
+      .mutation(async ({ input }) => {
+        await deletePositioningsByProject(GUEST_USER_ID, input.projectId);
+        return createPositioning(GUEST_USER_ID, input);
+      }),
+    createAndAnalyze: publicProcedure
+      .input(
+        z.object({
+          projectId: z.number(),
+          industry: z.string().min(1),
+          track: z.string().optional(),
+          monetizationMethod: z.string().optional(),
+          targetAudience: z.string().optional(),
+          personaType: z.string().optional(),
+        })
+      )
+      .mutation(async ({ input }) => {
+        await logUsage(GUEST_USER_ID, input.projectId, "positioning", "create");
+        await deletePositioningsByProject(GUEST_USER_ID, input.projectId);
+
+        const positioningId = await createPositioning(GUEST_USER_ID, {
+          ...input,
+          status: "completed",
+        });
+
+        const analysis = buildManualPositioningContent(input);
+
+        await updatePositioning(GUEST_USER_ID, {
+          id: positioningId,
+          positioningRecommendation: analysis,
+          analysisResult: {
+            mode: "manual",
+            provider: "manual",
+            input,
+          },
+          status: "completed",
+        });
+
+        return { id: positioningId, analysis };
+      }),
+    downloadVideoForAnalysis: publicProcedure
+      .input(
+        z.object({
+          projectId: z.number(),
+          videoUrl: z.string().url(),
+        })
+      )
+      .mutation(async ({ input }) => {
+        await logUsage(
+          GUEST_USER_ID,
+          input.projectId,
+          "positioning",
+          "downloadVideo"
+        );
+
+        const noteId =
+          extractXhsNoteId(input.videoUrl) ||
+          `positioning-${Date.now().toString(36)}`;
+        const downloadResult = await downloadWithLux({
+          url: input.videoUrl,
+          noteId,
+          projectId: input.projectId,
+        });
+
+        if (!downloadResult.success || !downloadResult.filePath) {
+          throw new Error(downloadResult.error || "视频下载失败");
+        }
+
+        return {
+          noteId,
+          filePath: downloadResult.filePath,
+          attempts: downloadResult.attempts,
+        };
+      }),
+    analyzeVideo: publicProcedure
+      .input(
+        z.object({
+          projectId: z.number(),
+          videoUrl: z.string().url(),
+          filePath: z.string().min(1),
+          industry: z.string().optional(),
+          track: z.string().optional(),
+          monetizationMethod: z.string().optional(),
+          targetAudience: z.string().optional(),
+          personaType: z.string().optional(),
+        })
+      )
+      .mutation(async ({ input }) => {
+        await logUsage(
+          GUEST_USER_ID,
+          input.projectId,
+          "positioning",
+          "analyzeVideo"
+        );
+        await deletePositioningsByProject(GUEST_USER_ID, input.projectId);
+
+        const positioningId = await createPositioning(GUEST_USER_ID, {
+          projectId: input.projectId,
+          industry: input.industry || "视频定位分析",
+          track: input.track || "小红书视频链接",
+          monetizationMethod: input.monetizationMethod,
+          targetAudience: input.targetAudience,
+          personaType: input.personaType,
+          status: "analyzing",
+        });
+
+        await updatePositioning(GUEST_USER_ID, {
+          id: positioningId,
+          analysisResult: {
+            mode: "video",
+            provider: "ark",
+            sourceUrl: input.videoUrl,
+            filePath: input.filePath,
+            stage: "queued",
+          },
+          status: "analyzing",
+        });
+
+        void runVideoPositioningAnalysisInBackground({
+          positioningId,
+          ...input,
+        });
+
+        return { id: positioningId, status: "analyzing" as const };
+      }),
+    delete: publicProcedure
+      .input(z.object({ id: z.number() }))
+      .mutation(({ input }) => deletePositioning(GUEST_USER_ID, input.id)),
     analyze: publicProcedure
       .input(
         z.object({
@@ -504,6 +1661,7 @@ ${input.checklist ? `关键词清单：${input.checklist}` : ""}
             .default("xiaohongshu"),
           checklist: z.string().optional(),
           bloggerAccounts: z.string().optional(),
+          authorMatchMode: z.enum(["exact", "contains"]).default("exact"),
           filters: z
             .object({
               sort_by: z.string().optional(),
@@ -616,13 +1774,11 @@ ${input.checklist ? `关键词清单：${input.checklist}` : ""}
       .input(
         z.object({
           projectId: z.number(),
-          industry: z.string().min(1),
-          mode: z.enum(["keyword", "mine", "authors"]).default("keyword"),
+          industry: z.string().optional(),
           targetPlatform: z
             .enum(["xiaohongshu", "youtube", "douyin"])
             .default("xiaohongshu"),
           checklist: z.string().optional(),
-          bloggerAccounts: z.string().optional(),
           filters: z
             .object({
               sort_by: z.string().optional(),
@@ -642,9 +1798,11 @@ ${input.checklist ? `关键词清单：${input.checklist}` : ""}
           "searchXiaohongshuMulti"
         );
 
-        const keyword = buildXhsSearchKeyword(input.industry, input.checklist);
+        await deleteTopicHubItemsByProject(GUEST_USER_ID, input.projectId);
+
+        const keyword = (input.industry ?? "").trim();
+        const profileLinks = parseXhsProfileLinks(input.checklist);
         const keywordTerms = splitKeywordTerms(keyword);
-        const authorKeywords = splitAuthorKeywords(input.bloggerAccounts);
         const filters: XhsSearchFilters | undefined = input.filters
           ? {
               sort_by: input.filters.sort_by,
@@ -655,37 +1813,92 @@ ${input.checklist ? `关键词清单：${input.checklist}` : ""}
             }
           : undefined;
 
-        let topVideoFeeds: Array<{
+        if (!keyword && profileLinks.length === 0) {
+          throw new Error(
+            "\u8bf7\u81f3\u5c11\u8f93\u5165\u5173\u952e\u8bcd\u641c\u7d22\u6216\u94fe\u63a5\u641c\u7d22"
+          );
+        }
+
+        const keywordLimit = keyword && profileLinks.length > 0 ? 10 : 15;
+        const linkLimit = keyword && profileLinks.length > 0 ? 5 : 15;
+
+        const collectedItems: Array<{
           feed: XhsFeed;
           likedCount: number;
           commentCount: number;
           sharedCount: number;
           score: number;
+          searchMode: "keyword" | "link";
+          sourceLabel: string;
         }> = [];
-        let sourceLabel = "关键词搜索";
 
-        if (input.mode === "mine") {
-          const profile = await getXhsMyProfile();
-          topVideoFeeds = selectTopVideoFeeds(profile.feeds || [], {
-            keywordTerms,
-            limit: 3,
-          });
-          sourceLabel = "我的内容";
-        } else {
+        if (keyword) {
           const result = await searchXhsFeeds(keyword, filters);
-          topVideoFeeds = selectTopVideoFeeds(result.feeds || [], {
+          let keywordFeeds = selectTopVideoFeeds(result.feeds || [], {
             keywordTerms,
-            authorKeywords: input.mode === "authors" ? authorKeywords : [],
-            limit: 3,
+            limit: keywordLimit,
           });
-          sourceLabel = input.mode === "authors" ? "指定博主" : "关键词搜索";
+          if (keywordFeeds.length === 0 && filters) {
+            const fallbackResult = await searchXhsFeeds(keyword);
+            keywordFeeds = selectTopVideoFeeds(fallbackResult.feeds || [], {
+              keywordTerms,
+              limit: keywordLimit,
+            });
+          }
+          collectedItems.push(
+            ...keywordFeeds.map(item => ({
+              ...item,
+              searchMode: "keyword" as const,
+              sourceLabel: "\u5173\u952e\u8bcd\u641c\u7d22",
+            }))
+          );
+        }
+
+        if (profileLinks.length > 0) {
+          const authorProfiles = await Promise.all(
+            profileLinks.map(link =>
+              getXhsUserProfile({
+                user_id: link.userId,
+                xsec_token: link.xsecToken,
+              })
+            )
+          );
+          const authorFeeds = authorProfiles.flatMap(
+            profile => profile.feeds || []
+          );
+          const linkedFeeds = selectTopVideoFeeds(authorFeeds, {
+            keywordTerms,
+            limit: linkLimit,
+          });
+          collectedItems.push(
+            ...linkedFeeds.map(item => ({
+              ...item,
+              searchMode: "link" as const,
+              sourceLabel: "\u94fe\u63a5\u641c\u7d22",
+            }))
+          );
+        }
+
+        const uniqueItems: typeof collectedItems = [];
+        const seenFeedIds = new Set<string>();
+        for (const item of collectedItems) {
+          if (seenFeedIds.has(item.feed.id)) continue;
+          seenFeedIds.add(item.feed.id);
+          uniqueItems.push(item);
+          if (uniqueItems.length >= 15) break;
+        }
+
+        if (uniqueItems.length === 0) {
+          throw new Error(
+            "\u672a\u627e\u5230\u7b26\u5408\u6761\u4ef6\u7684\u89c6\u9891\u5185\u5bb9"
+          );
         }
 
         const items = [];
-        for (const item of topVideoFeeds) {
+        for (const item of uniqueItems) {
           const saved = await saveTopicHubVideoItem({
             projectId: input.projectId,
-            industry: input.industry,
+            industry: keyword,
             checklist: input.checklist,
             targetPlatform: input.targetPlatform,
             feed: item.feed,
@@ -694,9 +1907,8 @@ ${input.checklist ? `关键词清单：${input.checklist}` : ""}
             sharedCount: item.sharedCount,
             score: item.score,
             filters,
-            searchMode: input.mode,
-            authorKeywords,
-            sourceLabel,
+            searchMode: item.searchMode,
+            sourceLabel: item.sourceLabel,
           });
           items.push(saved);
         }
@@ -705,7 +1917,12 @@ ${input.checklist ? `关键词清单：${input.checklist}` : ""}
           items,
           count: items.length,
           keyword,
-          mode: input.mode,
+          mode:
+            profileLinks.length > 0 && keyword
+              ? "mixed"
+              : keyword
+                ? "keyword"
+                : "link",
         };
       }),
     crawlViral: publicProcedure
@@ -790,6 +2007,108 @@ ${input.checklist ? `关键词清单：${input.checklist}` : ""}
           items.push(item);
         }
         return { items, count: items.length };
+      }),
+    analyzeVideo: publicProcedure
+      .input(z.object({ id: z.number(), projectId: z.number() }))
+      .mutation(async ({ input }) => {
+        const items = await getTopicHubItems(GUEST_USER_ID, input.projectId);
+        const item = items.find(i => i.id === input.id);
+        if (!item) throw new Error("未找到该条目");
+
+        const tags = (item.tags ?? {}) as Record<string, unknown>;
+        const filePath = String(tags.videoDownloadPath || "");
+        if (!filePath) throw new Error("视频尚未下载完成");
+
+        await updateTopicHubItemTags(GUEST_USER_ID, {
+          id: item.id,
+          tags: {
+            ...tags,
+            videoAnalysisStatus: "pending",
+            videoAnalysisError: undefined,
+            videoAnalysisResult: undefined,
+            videoAnalysisFileId: undefined,
+            videoAnalysisQueuedAt: new Date().toISOString(),
+            videoAnalysisStartedAt: undefined,
+            videoAnalysisFinishedAt: undefined,
+          },
+        });
+        void pumpTopicHubVideoPipeline();
+
+        return { status: "analysis_queued" as const };
+      }),
+    requestVideoAnalysis: publicProcedure
+      .input(z.object({ id: z.number(), projectId: z.number() }))
+      .mutation(async ({ input }) => {
+        const items = await getTopicHubItems(GUEST_USER_ID, input.projectId);
+        const item = items.find(i => i.id === input.id);
+        if (!item) throw new Error("未找到该条目");
+
+        const tags = (item.tags ?? {}) as Record<string, unknown>;
+        const filePath = String(tags.videoDownloadPath || "");
+        const noteId = String(tags.noteId || "");
+        const noteUrl = String(item.url || "");
+        const analysisStatus = String(tags.videoAnalysisStatus || "");
+        const downloadStatus = String(tags.videoDownloadStatus || "");
+
+        if (downloadStatus === "pending") {
+          return { status: "download_queued" as const };
+        }
+
+        if (analysisStatus === "pending" || analysisStatus === "analyzing") {
+          return {
+            status:
+              analysisStatus === "analyzing"
+                ? ("analysis_running" as const)
+                : ("analysis_queued" as const),
+          };
+        }
+
+        if (!filePath && (!noteId || !noteUrl)) {
+          throw new Error("缺少视频链接信息，无法触发下载分析");
+        }
+
+        const nextTags = {
+          ...tags,
+          videoDownloadStatus: filePath ? "success" : "pending",
+          videoDownloadAttempts: filePath
+            ? Number(tags.videoDownloadAttempts ?? 0)
+            : downloadStatus === "failed"
+              ? Number(tags.videoDownloadAttempts ?? 0)
+              : 0,
+          videoDownloadError: undefined,
+          videoDownloadQueuedAt: filePath
+            ? tags.videoDownloadQueuedAt
+            : new Date().toISOString(),
+          videoDownloadStartedAt: filePath
+            ? tags.videoDownloadStartedAt
+            : undefined,
+          videoDownloadFinishedAt: filePath
+            ? tags.videoDownloadFinishedAt
+            : undefined,
+          videoAnalysisStatus: filePath ? "pending" : undefined,
+          videoAnalysisError: undefined,
+          videoAnalysisResult: undefined,
+          videoAnalysisFileId: undefined,
+          videoAnalysisQueuedAt: filePath
+            ? new Date().toISOString()
+            : undefined,
+          videoAnalysisStartedAt: undefined,
+          videoAnalysisFinishedAt: undefined,
+        };
+
+        await updateTopicHubItemTags(GUEST_USER_ID, {
+          id: item.id,
+          tags: nextTags,
+        });
+
+        if (filePath) {
+          void pumpTopicHubVideoPipeline();
+          return { status: "analysis_queued" as const };
+        }
+
+        void pumpTopicHubVideoPipeline();
+
+        return { status: "download_queued" as const };
       }),
     delete: publicProcedure
       .input(z.object({ id: z.number() }))
@@ -1049,51 +2368,75 @@ ${input.checklist ? `关键词清单：${input.checklist}` : ""}
       .input(z.object({ projectId: z.number() }))
       .query(({ input }) => getTopics(GUEST_USER_ID, input.projectId)),
     generate: publicProcedure
-      .input(
-        z.object({
-          projectId: z.number(),
-          industry: z.string(),
-          personaType: z.string(),
-          monetizationMethod: z.string(),
-          trendingTopics: z.string().optional(),
-          viralPosts: z.string().optional(),
-        })
-      )
+      .input(z.object({ projectId: z.number() }))
       .mutation(async ({ input }) => {
         await logUsage(GUEST_USER_ID, input.projectId, "topics", "generate");
-        const prompt = `你是一位顶级的社交媒体选题策划师。
 
-账号信息：
-- 行业：${input.industry}
-- 人设类型：${input.personaType}
-- 变现方式：${input.monetizationMethod}
+        const [positionings, hubItems] = await Promise.all([
+          getPositionings(GUEST_USER_ID, input.projectId),
+          getTopicHubItems(GUEST_USER_ID, input.projectId),
+        ]);
 
-当前热点话题：
-${input.trendingTopics || "暂无热点数据"}
+        const completedPositioning = positionings.find(
+          p => p.status === "completed" && p.positioningRecommendation
+        );
+        const positioningBlock = completedPositioning
+          ? `## 账号定位分析\n\n${completedPositioning.positioningRecommendation}\n`
+          : "";
 
-近期爆款内容：
-${input.viralPosts || "暂无爆款数据"}
+        type HubTags = Record<string, unknown>;
+        const analyzedVideos = hubItems.filter(item => {
+          const tags = (item.tags ?? {}) as HubTags;
+          return (
+            tags.videoAnalysisStatus === "completed" &&
+            typeof tags.videoAnalysisResult === "string"
+          );
+        });
 
-请结合以上信息，生成5个具有高爆款潜质的选题，每个选题需要：
-1. 明确的选题类型（人设型/流量型/营销型）
-2. 吸引眼球的标题
-3. 选题理由和爆款潜力分析
-4. 建议的内容角度
-5. 爆款潜力评级（high/medium/low）
+        let viralAnalysisBlock = "";
+        if (analyzedVideos.length > 0) {
+          const sections = analyzedVideos.map((item, i) => {
+            const tags = (item.tags ?? {}) as HubTags;
+            return `### 爆款视频 ${i + 1}: ${item.title}\n${String(tags.videoAnalysisResult)}`;
+          });
+          viralAnalysisBlock = `## 爆款视频因子分析（共${analyzedVideos.length}条）\n\n${sections.join("\n\n---\n\n")}\n`;
+        }
 
-人设型选题：展示个人经历、建立信任感的内容
-流量型选题：泛流量干货、知识分享类内容
-营销型选题：引导转化、销售类内容
+        if (!positioningBlock && !viralAnalysisBlock) {
+          throw new Error(
+            "请先完成账号定位分析或选题中台的视频爆款因子分析，再生成选题"
+          );
+        }
+
+        await deleteTopicsByProject(GUEST_USER_ID, input.projectId);
+
+        const prompt = `你是一位顶级的医美短视频选题策划师，擅长基于账号定位和爆款因子分析，生成可直接执行的高爆款潜质选题。
+
+${positioningBlock}
+${viralAnalysisBlock}
+
+## 选题生成要求
+
+请基于以上账号定位信息和爆款视频因子分析结果，生成 10 个高爆款潜质的短视频选题方案。
+
+每个选题必须满足：
+1. **选题标题**：直接可用的视频标题，具备钩子感和点击欲望
+2. **选题类型**：persona（人设型，建立信任感）/ traffic（流量型，泛流量干货）/ marketing（营销型，引导转化）
+3. **内容方向**：具体的拍摄思路、脚本结构、核心话术方向
+4. **爆款潜力评级**：high / medium / low
+5. **选题理由**：结合了哪些爆款因子（钩子类型、痛点、情绪、信任元素等），为什么有爆款潜质
+
+选题分配建议：人设型 3 条 + 流量型 4 条 + 营销型 3 条
 
 以JSON格式返回：
 {
   "topics": [
     {
       "title": "选题标题",
-      "description": "选题描述和内容角度",
+      "description": "内容方向与拍摄思路",
       "topicType": "persona|traffic|marketing",
       "viralPotential": "high|medium|low",
-      "rationale": "爆款潜力分析"
+      "rationale": "爆款因子应用分析"
     }
   ]
 }`;
@@ -1103,7 +2446,7 @@ ${input.viralPosts || "暂无爆款数据"}
             {
               role: "system",
               content:
-                "你是专业的社交媒体选题策划师，擅长结合热点和账号定位生成高爆款潜质选题。请严格按JSON格式返回。",
+                "你是专业的医美短视频选题策划师，擅长从爆款因子分析中提取可复制公式并生成新选题。请严格按JSON格式返回。",
             },
             { role: "user", content: prompt },
           ],
@@ -1127,7 +2470,7 @@ ${input.viralPosts || "暂无爆款数据"}
         }
 
         const savedTopics = [];
-        for (const topic of (parsed.topics || []).slice(0, 5)) {
+        for (const topic of (parsed.topics || []).slice(0, 10)) {
           const saved = await createTopic(GUEST_USER_ID, {
             projectId: input.projectId,
             title: topic.title,
@@ -1244,69 +2587,99 @@ ${input.accountPositioning ? `账号定位：${input.accountPositioning}` : ""}
     list: publicProcedure
       .input(z.object({ projectId: z.number() }))
       .query(({ input }) => getScripts(GUEST_USER_ID, input.projectId)),
-    generate: publicProcedure
+    generateForTopic: publicProcedure
       .input(
         z.object({
           projectId: z.number(),
-          topicId: z.number().optional(),
-          analysisId: z.number().optional(),
-          title: z.string(),
-          personaType: z.string(),
-          industry: z.string(),
-          viralFormula: z.string().optional(),
-          hookType: z.enum(["camp_split", "anti_cognition", "curiosity"]),
-          platform: z.string().optional(),
-          duration: z.number().optional(),
+          topicId: z.number(),
+          hubItemId: z.number(),
         })
       )
       .mutation(async ({ input }) => {
         await logUsage(GUEST_USER_ID, input.projectId, "scripts", "generate");
-        const hookTypeLabel = {
-          camp_split: "分阵营（制造对立，引发共鸣）",
-          anti_cognition: "反认知（颠覆常识，制造惊喜）",
-          curiosity: "好奇感（悬念设置，引发追问）",
-        }[input.hookType];
 
-        const prompt = `你是一位顶级的短视频脚本编导，擅长创作高完播率、高转化率的视频脚本。
+        const [allTopics, hubItems, allPositionings] = await Promise.all([
+          getTopics(GUEST_USER_ID, input.projectId),
+          getTopicHubItems(GUEST_USER_ID, input.projectId),
+          getPositionings(GUEST_USER_ID, input.projectId),
+        ]);
 
-选题：${input.title}
-行业：${input.industry}
-人设类型：${input.personaType}
-开头类型：${hookTypeLabel}
-目标平台：${input.platform || "通用"}
-视频时长：${input.duration ? `${input.duration}秒` : "60-90秒"}
+        const topic = allTopics.find(t => t.id === input.topicId);
+        if (!topic) throw new Error("未找到选题");
 
-${input.viralFormula ? `爆款公式参考：\n${input.viralFormula.substring(0, 500)}` : ""}
+        const hubItem = hubItems.find(i => i.id === input.hubItemId);
+        type HubTags = Record<string, unknown>;
+        const hubTags = (hubItem?.tags ?? {}) as HubTags;
+        const viralAnalysis = String(hubTags.videoAnalysisResult || "");
+        if (!viralAnalysis) throw new Error("该视频尚无爆款因子分析结果");
 
-请创作一个完整的视频脚本，包含：
+        const positioning = allPositionings.find(
+          p => p.status === "completed" && p.positioningRecommendation
+        );
+        const positioningBlock = positioning
+          ? `## 账号定位\n${positioning.positioningRecommendation}\n`
+          : "";
 
-**【前3秒钩子】**
-使用${hookTypeLabel}的方式，设计一个让用户无法划走的开场白。
-要求：具体、有冲击力、直击痛点或制造好奇
+        const prompt = `角色定位
 
-**【中段内容】**
-核心内容展开，要求：
-- 用动词和形容词把场景刻画得非常具体、可带入
-- 讲故事时注重共鸣感
-- 干货与情感并重
-- 每个观点有具体案例支撑
+你是专业的医美短视频爆款脚本生成引擎。
+基于上游输出的【可复制爆款因子分析结果】，结合账号人设，自动生成高完播、高互动、合规安全的短视频脚本，可直接拍摄。
 
-**【结尾CTA】**
-- 总结升华
-- 引导关注/点赞/评论
-- 预告下期内容（可选）
+核心约束
 
-**【镜头/拍摄建议】**
-简要说明每个段落的拍摄建议
+1. 严格复用可复制强度=高/中的爆款因子，不使用低可复制内容。
+2. 全程遵守医美合规：禁止疗效承诺、禁止绝对化用词、禁止夸大效果。
+3. 脚本时长控制在 15～30秒，适配抖音/小红书/视频号。
+4. 语言口语化、节奏快、情绪强，符合短视频传播逻辑。
+5. 必须保留：强钩子 + 痛点共鸣 + 信任表达 + 清晰结构 + 互动引导。
 
-请直接输出完整脚本，格式清晰，内容专业有感染力。`;
+${positioningBlock}
+
+## 参考爆款视频：${hubItem?.title || ""}
+${viralAnalysis}
+
+## 本次选题
+- 标题：${topic.title}
+- 类型：${topic.topicType === "persona" ? "人设型" : topic.topicType === "marketing" ? "营销型" : "流量型"}
+- 内容方向：${topic.description || ""}
+- 爆款因子应用：${topic.rationale || ""}
+
+## 生成规则
+
+1. 开头3秒必须用高可复制钩子，直接抓住用户。
+2. 前5秒点出核心痛点，快速共鸣。
+3. 中间部分用科普/避坑/原理建立专业信任，不硬广。
+4. 视觉画面建议与口播同步，方便拍摄。
+5. 结尾必须带互动引导或轻转化引导（评论/私信/预约）。
+6. 整段脚本无废话、高密度信息，保证完播率。
+
+## 输出格式（固定结构）
+
+【视频基础信息】
+
+- 适合平台：
+- 预估时长：
+- 适用人设：
+- 核心爆款公式来源：
+
+【脚本正文】
+0-3秒 钩子：
+3-8秒 痛点共鸣：
+8-18秒 专业科普/避坑/方案：
+18-25秒 信任强化/效果描述：
+25-30秒 互动引导：
+
+【画面建议】
+【字幕重点】
+【爆款关键词复用】
+【合规注意事项】`;
 
         const response = await invokeLLM({
           messages: [
             {
               role: "system",
               content:
-                "你是专业的短视频脚本编导，擅长创作高完播率、高转化率的视频脚本。请用中文创作，脚本要有感染力、具体生动、可直接拍摄使用。",
+                "你是专业的医美短视频爆款脚本生成引擎。请基于爆款因子分析结果生成可直接拍摄的短视频脚本。使用中文，结构清晰，内容专业。",
             },
             { role: "user", content: prompt },
           ],
@@ -1318,12 +2691,8 @@ ${input.viralFormula ? `爆款公式参考：\n${input.viralFormula.substring(0,
         const saved = await createScript(GUEST_USER_ID, {
           projectId: input.projectId,
           topicId: input.topicId,
-          analysisId: input.analysisId,
-          title: input.title,
-          hookType: input.hookType,
+          title: `${topic.title} — ${hubItem?.title || "脚本"}`,
           fullScript: scriptContent,
-          platform: input.platform,
-          duration: input.duration,
           status: "draft",
         });
 
@@ -1735,6 +3104,287 @@ ${input.scriptContent.substring(0, 1000)}
   // ─── Dashboard Stats ───────────────────────────────────────────────────────
   dashboard: router({
     stats: publicProcedure.query(() => getDashboardStats(GUEST_USER_ID)),
+  }),
+
+  // ─── Video Generation (Seedance 1.5 Pro) ────────────────────────────────────
+  videoGeneration: router({
+    // 根据脚本内容生成分镜头列表（不入库，前端状态管理）
+    generateStoryboard: publicProcedure
+      .input(
+        z.object({
+          projectId: z.number(),
+          scriptId: z.number(),
+        })
+      )
+      .mutation(async ({ input }) => {
+        await logUsage(
+          GUEST_USER_ID,
+          input.projectId,
+          "materials",
+          "storyboard"
+        );
+
+        const allScripts = await getScripts(GUEST_USER_ID, input.projectId);
+        const script = allScripts.find(s => s.id === input.scriptId);
+        if (!script) throw new Error("未找到脚本");
+
+        const scriptContent =
+          script.fullScript || script.mainContent || script.title;
+
+        const prompt = `你是专业短视频分镜头策划师。请根据以下短视频脚本，拆解为可执行的分镜头列表。
+
+【脚本内容】
+${scriptContent}
+
+【要求】
+1. 按时间顺序拆分为 4-8 个分镜头
+2. 每个镜头时长 3-8 秒，总时长控制在 15-30 秒内
+3. 每个镜头需包含：时间段、画面描述、拍摄建议、重点文案
+
+【输出格式】严格输出 JSON 数组，不要有其他文字：
+[
+  {
+    "shotIndex": 1,
+    "timeRange": "0-3s",
+    "description": "画面描述",
+    "cameraInstruction": "拍摄/镜头指令",
+    "visualSuggestion": "视觉建议（背景、光线、道具等）",
+    "voiceOver": "该镜头对应的口播文案"
+  }
+]`;
+
+        const response = await invokeLLM({
+          messages: [
+            {
+              role: "system",
+              content:
+                "你是短视频分镜头策划师，请严格按JSON格式输出，不要有任何额外文字。",
+            },
+            { role: "user", content: prompt },
+          ],
+        });
+
+        const raw = String(response.choices[0]?.message?.content || "");
+        // 提取 JSON 数组
+        const match = raw.match(/\[[\s\S]*\]/);
+        if (!match) throw new Error("分镜头生成失败：无法解析返回结果");
+
+        type ShotItem = {
+          shotIndex: number;
+          timeRange: string;
+          description: string;
+          cameraInstruction: string;
+          visualSuggestion: string;
+          voiceOver: string;
+        };
+        const shots = JSON.parse(match[0]) as ShotItem[];
+        return { shots, scriptTitle: script.title };
+      }),
+
+    // 创建 Seedance 视频生成任务
+    createTask: publicProcedure
+      .input(
+        z.object({
+          projectId: z.number(),
+          scriptId: z.number().optional(),
+          title: z.string().min(1),
+          type: z.enum([
+            "real_person",
+            "digital_avatar",
+            "before_after",
+            "other",
+          ]),
+          prompt: z.string().min(1),
+          referenceImageUrl: z.string().optional(), // 远端 URL 或 /_local/ 开头的本地路径
+          ratio: z
+            .enum(["16:9", "4:3", "1:1", "3:4", "9:16", "21:9", "adaptive"])
+            .optional(),
+          duration: z.number().min(4).max(12).optional(),
+          resolution: z.enum(["480p", "720p", "1080p"]).optional(),
+          generateAudio: z.boolean().optional(),
+        })
+      )
+      .mutation(async ({ input }) => {
+        await logUsage(GUEST_USER_ID, input.projectId, "materials", "seedance");
+
+        // 本地路径转换：/_local/xxx -> .data/xxx（服务端物理路径）
+        let imageInput = input.referenceImageUrl;
+        if (imageInput?.startsWith("/_local/")) {
+          const relativePath = imageInput.replace("/_local/", "");
+          imageInput = resolve(process.cwd(), ".data", relativePath);
+        }
+
+        const { taskId } = await createSeedanceTask(input.prompt, imageInput, {
+          ratio: input.ratio,
+          duration: input.duration,
+          resolution: input.resolution,
+          generateAudio: input.generateAudio,
+        });
+
+        const materialId = await createMaterial(GUEST_USER_ID, {
+          projectId: input.projectId,
+          scriptId: input.scriptId,
+          type: input.type,
+          title: input.title,
+          status: "processing",
+          seedanceTaskId: taskId,
+          referenceImageUrl: input.referenceImageUrl,
+          prompt: input.prompt,
+          tags: ["seedance", "AI生成"],
+        });
+
+        return { materialId, taskId };
+      }),
+
+    // 查询 Seedance 任务状态，完成后更新素材记录
+    checkStatus: publicProcedure
+      .input(
+        z.object({
+          materialId: z.number(),
+          taskId: z.string(),
+        })
+      )
+      .mutation(async ({ input }) => {
+        const result = await querySeedanceTask(input.taskId);
+
+        if (result.status === "succeeded" && result.videoUrl) {
+          await updateMaterial(GUEST_USER_ID, {
+            id: input.materialId,
+            status: "ready",
+            fileUrl: result.videoUrl,
+          });
+          return { status: "completed", videoUrl: result.videoUrl };
+        }
+
+        if (result.status === "failed" || result.status === "expired") {
+          await updateMaterial(GUEST_USER_ID, {
+            id: input.materialId,
+            status: "failed",
+          });
+          return { status: "failed", error: result.error || "生成失败" };
+        }
+
+        // queued / running
+        return { status: "processing" };
+      }),
+  }),
+
+  // ─── XHS 发布 ────────────────────────────────────────────────────────────────
+  xhsPublish: router({
+    // 查询 XHS 登录状态
+    loginStatus: publicProcedure.query(async () => {
+      try {
+        const resp = await fetch(`${ENV.xhsApiUrl}/api/v1/login/status`, {
+          signal: AbortSignal.timeout(5000),
+        });
+        const data = (await resp.json()) as {
+          success?: boolean;
+          data?: { is_logged_in?: boolean; username?: string };
+        };
+        return {
+          isLoggedIn: data.data?.is_logged_in ?? false,
+          username: data.data?.username ?? "",
+        };
+      } catch {
+        return { isLoggedIn: false, username: "" };
+      }
+    }),
+
+    // 发布视频到小红书
+    publishVideo: publicProcedure
+      .input(
+        z.object({
+          projectId: z.number(),
+          materialId: z.number(),
+          title: z.string().min(1),
+          content: z.string().min(1),
+          tags: z.array(z.string()).optional(),
+          visibility: z
+            .enum(["公开可见", "仅自己可见", "仅互关好友可见"])
+            .default("公开可见"),
+        })
+      )
+      .mutation(async ({ input }) => {
+        await logUsage(
+          GUEST_USER_ID,
+          input.projectId,
+          "platform",
+          "xhs_publish"
+        );
+
+        // 获取素材记录
+        const allMaterials = await getMaterials(GUEST_USER_ID, input.projectId);
+        const material = allMaterials.find(m => m.id === input.materialId);
+        if (!material) throw new Error("未找到素材记录");
+        if (!material.fileUrl) throw new Error("该素材没有可用的视频文件");
+
+        // 确定本地视频路径
+        let localVideoPath: string;
+        if (material.fileUrl.startsWith("/_local/")) {
+          // 已经是本地路径
+          localVideoPath = resolve(
+            process.cwd(),
+            ".data",
+            material.fileUrl.replace("/_local/", "")
+          );
+        } else if (material.fileUrl.startsWith("http")) {
+          // 远端 URL（Seedance CDN），下载到本地
+          const dir = resolve(
+            process.cwd(),
+            ".data",
+            "xhs-publish",
+            String(input.projectId)
+          );
+          await mkdir(dir, { recursive: true });
+          const filename = `video_${input.materialId}_${Date.now()}.mp4`;
+          localVideoPath = join(dir, filename);
+
+          const resp = await fetch(material.fileUrl, {
+            signal: AbortSignal.timeout(300_000),
+          });
+          if (!resp.ok) throw new Error(`视频下载失败 (${resp.status})`);
+          const buf = await resp.arrayBuffer();
+          await writeFile(localVideoPath, Buffer.from(buf));
+        } else {
+          throw new Error("不支持的视频文件路径格式");
+        }
+
+        // 调用 XHS 发布视频 API
+        const publishResp = await fetch(
+          `${ENV.xhsApiUrl}/api/v1/publish_video`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              title: input.title,
+              content: input.content,
+              video: localVideoPath,
+              tags: input.tags ?? [],
+              visibility: input.visibility,
+            }),
+            signal: AbortSignal.timeout(600_000), // 视频发布可能较慢，给 10 分钟
+          }
+        );
+
+        const result = (await publishResp.json()) as {
+          success?: boolean;
+          data?: { post_id?: string; status?: string };
+          message?: string;
+          error?: string;
+        };
+
+        if (!publishResp.ok || !result.success) {
+          throw new Error(
+            result.error || result.message || `发布失败 (${publishResp.status})`
+          );
+        }
+
+        return {
+          postId: result.data?.post_id,
+          status: result.data?.status ?? "published",
+          message: result.message ?? "发布成功",
+        };
+      }),
   }),
 });
 

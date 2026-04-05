@@ -60,8 +60,12 @@ export function serveStatic(app: Express) {
 
   app.use(express.static(distPath));
 
-  // fall through to index.html if the file doesn't exist
-  app.use("*", (_req, res) => {
+  // 仅对前端路由做 SPA 回退，避免吞掉 /api 的非 GET 请求
+  app.get("*", (req, res, next) => {
+    if (req.path.startsWith("/api/")) {
+      next();
+      return;
+    }
     res.sendFile(path.resolve(distPath, "index.html"));
   });
 }

@@ -15,12 +15,14 @@ import ViralAnalysis from "./pages/ViralAnalysis";
 import ScriptDirector from "./pages/ScriptDirector";
 import MaterialGeneration from "./pages/MaterialGeneration";
 import PlatformAdaptation from "./pages/PlatformAdaptation";
+import XhsLoginPage from "./pages/XhsLoginPage";
 import DashboardLayout from "./components/DashboardLayout";
 
 function AppRouter() {
   return (
     <Switch>
       <Route path="/" component={Home} />
+      <Route path="/xhs-login" component={XhsLoginPage} />
       <Route path="/dashboard">
         <DashboardLayout>
           <Dashboard />
