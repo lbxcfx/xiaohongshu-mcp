@@ -408,18 +408,18 @@ export default function Dashboard() {
           >
             <CardContent className="p-6">
               <div
-                className={`mb-5 flex h-11 w-11 items-center justify-center rounded-2xl ${card.bg}`}
+                className={`mb-4 flex h-14 w-14 items-center justify-center rounded-3xl ${card.bg}`}
               >
-                <card.icon className={`h-5 w-5 ${card.color}`} />
+                <card.icon className={`h-7 w-7 ${card.color}`} />
               </div>
-              <div className="text-4xl font-black text-foreground">
+              <div className="text-5xl font-black leading-none text-foreground">
                 {isLoading ? (
-                  <div className="h-9 w-14 rounded shimmer" />
+                  <div className="h-12 w-16 rounded shimmer" />
                 ) : (
                   card.value
                 )}
               </div>
-              <div className="mt-3 text-sm font-medium text-muted-foreground">
+              <div className="mt-4 text-base font-semibold text-muted-foreground">
                 {card.label}
               </div>
             </CardContent>
