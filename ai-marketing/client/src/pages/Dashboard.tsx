@@ -1,6 +1,7 @@
 import { trpc } from "@/lib/trpc";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import {
   BarChart,
   Bar,
@@ -17,14 +18,18 @@ import {
   ArrowRight,
   BookOpen,
   Brain,
+  CheckCircle2,
   ClipboardList,
+  FileText,
   FolderOpen,
   BarChart3,
+  Send,
   Share2,
   Sparkles,
   Target,
   TrendingUp,
   Upload,
+  Video,
   Zap,
 } from "lucide-react";
 import { useLocation } from "wouter";
@@ -35,12 +40,56 @@ const COLORS = [
   "oklch(0.65 0.22 340)",
   "oklch(0.78 0.18 70)",
   "oklch(0.68 0.18 150)",
+  "oklch(0.72 0.18 35)",
 ];
+
+function summarize(value?: string | null, fallback = "暂无内容") {
+  const text = String(value || "").trim();
+  return text || fallback;
+}
+
+function formatDate(value?: string | Date | null) {
+  if (!value) return "暂无时间";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "暂无时间";
+  return date.toLocaleDateString("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+function calcProgress(counts: {
+  positionings: number;
+  analyzedVideos: number;
+  topicPlans: number;
+  scripts: number;
+  readyMaterials: number;
+  published: number;
+}) {
+  const steps = [
+    counts.positionings > 0,
+    counts.analyzedVideos > 0,
+    counts.topicPlans > 0,
+    counts.scripts > 0,
+    counts.readyMaterials > 0,
+    counts.published > 0,
+  ];
+  return Math.round(
+    (steps.filter(Boolean).length / Math.max(steps.length, 1)) * 100
+  );
+}
 
 export default function Dashboard() {
   const [, setLocation] = useLocation();
   const { data: stats, isLoading } = trpc.dashboard.stats.useQuery();
   const { data: projects } = trpc.projects.list.useQuery();
+  const { data: contentResults, isLoading: resultsLoading } =
+    trpc.dashboard.contentResults.useQuery();
+
+  const projectResults = contentResults?.projects ?? [];
+  const featuredProject = projectResults[0] ?? null;
 
   const statCards = [
     {
@@ -51,48 +100,49 @@ export default function Dashboard() {
       bg: "bg-purple-400/10",
     },
     {
-      icon: Sparkles,
-      label: "生成选题",
-      value: stats?.topics ?? 0,
+      icon: Brain,
+      label: "AI分析",
+      value: stats?.analyses ?? 0,
       color: "text-cyan-400",
       bg: "bg-cyan-400/10",
     },
     {
+      icon: ClipboardList,
+      label: "选题策划",
+      value: stats?.topicPlans ?? 0,
+      color: "text-orange-400",
+      bg: "bg-orange-400/10",
+    },
+    {
       icon: BookOpen,
-      label: "创作脚本",
+      label: "爆款复刻",
       value: stats?.scripts ?? 0,
       color: "text-pink-400",
       bg: "bg-pink-400/10",
     },
     {
-      icon: Upload,
-      label: "素材数量",
+      icon: Video,
+      label: "素材视频",
       value: stats?.materials ?? 0,
       color: "text-amber-400",
       bg: "bg-amber-400/10",
     },
     {
-      icon: Share2,
-      label: "分发适配",
-      value: stats?.adaptations ?? 0,
+      icon: Send,
+      label: "分发记录",
+      value: stats?.publications ?? 0,
       color: "text-green-400",
       bg: "bg-green-400/10",
-    },
-    {
-      icon: Brain,
-      label: "爆款分析",
-      value: stats?.analyses ?? 0,
-      color: "text-blue-400",
-      bg: "bg-blue-400/10",
     },
   ];
 
   const barData = [
-    { name: "选题", value: stats?.topics ?? 0 },
+    { name: "爆款源", value: stats?.topicHubItems ?? 0 },
+    { name: "AI分析", value: stats?.analyses ?? 0 },
+    { name: "选题", value: stats?.topicPlans ?? 0 },
     { name: "脚本", value: stats?.scripts ?? 0 },
-    { name: "素材", value: stats?.materials ?? 0 },
-    { name: "分发", value: stats?.adaptations ?? 0 },
-    { name: "分析", value: stats?.analyses ?? 0 },
+    { name: "视频", value: stats?.materials ?? 0 },
+    { name: "发布", value: stats?.publications ?? 0 },
   ];
 
   const pieData = statCards
@@ -158,18 +208,75 @@ export default function Dashboard() {
     },
   ];
 
+  const featuredResults = featuredProject
+    ? [
+        {
+          icon: Target,
+          label: "账号定位",
+          title: featuredProject.latest.positioning?.title,
+          content: featuredProject.latest.positioning?.content,
+          path: "/positioning",
+          color: "text-purple-400",
+        },
+        {
+          icon: Brain,
+          label: "爆款分析",
+          title: featuredProject.latest.analyzedVideo?.title,
+          content: featuredProject.latest.analyzedVideo?.content,
+          path: "/viral-analysis",
+          color: "text-cyan-400",
+        },
+        {
+          icon: ClipboardList,
+          label: "选题策划",
+          title: featuredProject.latest.topicPlan?.title,
+          content: featuredProject.latest.topicPlan?.content,
+          path: "/topic-planning",
+          color: "text-orange-400",
+        },
+        {
+          icon: FileText,
+          label: "脚本内容",
+          title: featuredProject.latest.script?.title,
+          content: featuredProject.latest.script?.content,
+          path: "/scripts",
+          color: "text-pink-400",
+        },
+        {
+          icon: Video,
+          label: "素材视频",
+          title: featuredProject.latest.material?.title,
+          content: `状态：${featuredProject.latest.material?.status ?? "暂无"}`,
+          path: "/materials",
+          color: "text-blue-400",
+        },
+        {
+          icon: Send,
+          label: "发布结果",
+          title: featuredProject.latest.publication?.title,
+          content:
+            featuredProject.latest.publication?.errorMessage ||
+            `状态：${featuredProject.latest.publication?.status ?? "暂无"}`,
+          path: "/platform",
+          color: "text-green-400",
+        },
+      ]
+    : [];
+
   return (
     <div className="space-y-6">
-      <div className="flex items-center justify-between">
+      <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
         <div>
           <h1 className="text-2xl font-bold text-foreground">
-            欢迎来到 <span className="gradient-text">AI营销增长引擎</span>
+            内容生产看板 <span className="gradient-text">AI营销增长引擎</span>
           </h1>
-          <p className="mt-1 text-sm text-muted-foreground">AI营销增长工作台</p>
+          <p className="mt-1 text-sm text-muted-foreground">
+            汇总项目从账号定位、爆款分析、选题策划到素材发布的生成结果。
+          </p>
         </div>
         <Button
           onClick={() => setLocation("/projects")}
-          className="glow-purple"
+          className="glow-purple w-full lg:w-auto"
         >
           <FolderOpen className="mr-2 h-4 w-4" />
           新建项目
@@ -200,16 +307,16 @@ export default function Dashboard() {
         ))}
       </div>
 
-      <div className="grid grid-cols-1 gap-5 lg:grid-cols-3">
-        <Card className="border-border bg-card lg:col-span-2">
+      <div className="grid grid-cols-1 gap-5 xl:grid-cols-3">
+        <Card className="border-border bg-card xl:col-span-2">
           <CardHeader className="pb-2">
             <CardTitle className="flex items-center gap-2 text-sm font-medium text-foreground">
               <BarChart3 className="h-4 w-4 text-primary" />
-              内容产出统计
+              内容生产链路
             </CardTitle>
           </CardHeader>
           <CardContent>
-            <ResponsiveContainer width="100%" height={200}>
+            <ResponsiveContainer width="100%" height={220}>
               <BarChart
                 data={barData}
                 margin={{ top: 5, right: 10, left: -20, bottom: 5 }}
@@ -252,18 +359,18 @@ export default function Dashboard() {
           <CardHeader className="pb-2">
             <CardTitle className="flex items-center gap-2 text-sm font-medium text-foreground">
               <Zap className="h-4 w-4 text-primary" />
-              内容分布
+              产出分布
             </CardTitle>
           </CardHeader>
           <CardContent>
-            <ResponsiveContainer width="100%" height={160}>
+            <ResponsiveContainer width="100%" height={170}>
               <PieChart>
                 <Pie
                   data={pieData}
                   cx="50%"
                   cy="50%"
-                  innerRadius={40}
-                  outerRadius={70}
+                  innerRadius={42}
+                  outerRadius={72}
                   paddingAngle={3}
                   dataKey="value"
                 >
@@ -295,6 +402,146 @@ export default function Dashboard() {
                 </div>
               ))}
             </div>
+          </CardContent>
+        </Card>
+      </div>
+
+      <div className="grid grid-cols-1 gap-5 xl:grid-cols-5">
+        <Card className="border-border bg-card xl:col-span-2">
+          <CardHeader className="pb-3">
+            <div className="flex items-center justify-between">
+              <CardTitle className="flex items-center gap-2 text-sm font-medium text-foreground">
+                <FolderOpen className="h-4 w-4 text-primary" />
+                项目内容总览
+              </CardTitle>
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => setLocation("/projects")}
+                className="h-7 text-xs text-muted-foreground"
+              >
+                查看全部
+                <ArrowRight className="ml-1 h-3 w-3" />
+              </Button>
+            </div>
+          </CardHeader>
+          <CardContent>
+            {resultsLoading ? (
+              <div className="space-y-3">
+                {[1, 2, 3].map(item => (
+                  <div key={item} className="h-24 rounded-xl shimmer" />
+                ))}
+              </div>
+            ) : projectResults.length > 0 ? (
+              <div className="space-y-3">
+                {projectResults.slice(0, 4).map(row => {
+                  const progress = calcProgress(row.counts);
+                  return (
+                    <button
+                      key={row.project.id}
+                      onClick={() => setLocation(`/projects/${row.project.id}`)}
+                      className="group w-full rounded-xl border border-border bg-secondary/30 p-4 text-left transition-all hover:border-primary/40 hover:bg-secondary/50"
+                    >
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="min-w-0">
+                          <div className="truncate text-sm font-medium text-foreground transition-colors group-hover:text-primary">
+                            {row.project.name}
+                          </div>
+                          <div className="mt-1 flex flex-wrap gap-2 text-xs text-muted-foreground">
+                            {row.project.industry && (
+                              <span>{row.project.industry}</span>
+                            )}
+                            {row.project.platform && (
+                              <span>{row.project.platform}</span>
+                            )}
+                          </div>
+                        </div>
+                        <Badge
+                          variant="outline"
+                          className="shrink-0 border-primary/30 text-primary"
+                        >
+                          {progress}%
+                        </Badge>
+                      </div>
+                      <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-muted">
+                        <div
+                          className="h-full rounded-full bg-primary"
+                          style={{ width: `${progress}%` }}
+                        />
+                      </div>
+                      <div className="mt-3 grid grid-cols-3 gap-2 text-xs text-muted-foreground">
+                        <span>分析 {row.counts.analyzedVideos}</span>
+                        <span>选题 {row.counts.topicPlans}</span>
+                        <span>发布 {row.counts.published}</span>
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+            ) : (
+              <div className="rounded-xl border border-dashed border-border p-6 text-center text-sm text-muted-foreground">
+                暂无项目内容，先创建项目并生成内容。
+              </div>
+            )}
+          </CardContent>
+        </Card>
+
+        <Card className="border-border bg-card xl:col-span-3">
+          <CardHeader className="pb-3">
+            <div className="flex flex-col gap-1 md:flex-row md:items-center md:justify-between">
+              <CardTitle className="flex items-center gap-2 text-sm font-medium text-foreground">
+                <CheckCircle2 className="h-4 w-4 text-primary" />
+                最新生成成果
+              </CardTitle>
+              {featuredProject && (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() =>
+                    setLocation(`/projects/${featuredProject.project.id}`)
+                  }
+                  className="h-7 justify-start text-xs text-muted-foreground md:justify-center"
+                >
+                  {featuredProject.project.name}
+                  <ArrowRight className="ml-1 h-3 w-3" />
+                </Button>
+              )}
+            </div>
+          </CardHeader>
+          <CardContent>
+            {featuredProject ? (
+              <div className="grid gap-3 md:grid-cols-2">
+                {featuredResults.map(item => (
+                  <button
+                    key={item.label}
+                    onClick={() =>
+                      setLocation(
+                        `/projects/${featuredProject.project.id}${item.path}`
+                      )
+                    }
+                    className="group min-h-32 rounded-xl border border-border bg-secondary/30 p-4 text-left transition-all hover:border-primary/40 hover:bg-secondary/50"
+                  >
+                    <div className="flex items-center justify-between gap-3">
+                      <div className="flex items-center gap-2 text-xs font-medium text-muted-foreground">
+                        <item.icon className={`h-4 w-4 ${item.color}`} />
+                        {item.label}
+                      </div>
+                      <ArrowRight className="h-3.5 w-3.5 text-muted-foreground transition-transform group-hover:translate-x-0.5 group-hover:text-primary" />
+                    </div>
+                    <div className="mt-3 line-clamp-1 text-sm font-medium text-foreground">
+                      {summarize(item.title, "暂无生成结果")}
+                    </div>
+                    <p className="mt-2 line-clamp-3 text-xs leading-relaxed text-muted-foreground">
+                      {summarize(item.content)}
+                    </p>
+                  </button>
+                ))}
+              </div>
+            ) : (
+              <div className="rounded-xl border border-dashed border-border p-8 text-center text-sm text-muted-foreground">
+                暂无生成成果。完成爆款分析、选题策划、脚本和素材生成后会在这里展示。
+              </div>
+            )}
           </CardContent>
         </Card>
       </div>
@@ -351,6 +598,9 @@ export default function Dashboard() {
                         {project.industry}
                       </span>
                     )}
+                    <span className="text-xs text-muted-foreground">
+                      {formatDate(project.updatedAt)}
+                    </span>
                   </div>
                 </div>
               ))}

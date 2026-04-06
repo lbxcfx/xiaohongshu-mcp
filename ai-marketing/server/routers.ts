@@ -536,6 +536,160 @@ async function publishMaterialToXhs(input: {
   }
 }
 
+function getCompletedVideoAnalyses(
+  hubItems: Awaited<ReturnType<typeof getTopicHubItems>>
+) {
+  return hubItems.filter(item => {
+    const tags = item.tags as Record<string, unknown> | null | undefined;
+    return tags?.videoAnalysisStatus === "completed";
+  });
+}
+
+function getLatestByDate<T extends { createdAt?: Date; updatedAt?: Date }>(
+  items: T[]
+) {
+  return [...items].sort((a, b) => {
+    const aTime = (a.updatedAt ?? a.createdAt ?? new Date(0)).getTime();
+    const bTime = (b.updatedAt ?? b.createdAt ?? new Date(0)).getTime();
+    return bTime - aTime;
+  })[0];
+}
+
+async function getDashboardContentResults() {
+  const projects = await getProjects(GUEST_USER_ID);
+  const rows = await Promise.all(
+    projects.map(async project => {
+      const [
+        positionings,
+        hubItems,
+        topicPlans,
+        scripts,
+        materials,
+        adaptations,
+        publications,
+      ] = await Promise.all([
+        getPositionings(GUEST_USER_ID, project.id),
+        getTopicHubItems(GUEST_USER_ID, project.id),
+        getTopicPlans(GUEST_USER_ID, project.id),
+        getScripts(GUEST_USER_ID, project.id),
+        getMaterials(GUEST_USER_ID, project.id),
+        getPlatformAdaptationsByProject(GUEST_USER_ID, project.id),
+        getMaterialPublications(GUEST_USER_ID, project.id),
+      ]);
+
+      const completedPositioning = positionings.find(
+        item => item.status === "completed" && item.positioningRecommendation
+      );
+      const completedAnalyses = getCompletedVideoAnalyses(hubItems);
+      const readyMaterials = materials.filter(item => item.status === "ready");
+      const published = publications.filter(
+        item => item.status === "published"
+      );
+      const failedPublications = publications.filter(
+        item => item.status === "failed"
+      );
+      const latestAnalyzedVideo = getLatestByDate(completedAnalyses);
+      const latestTopicPlan = getLatestByDate(topicPlans);
+      const latestScript = getLatestByDate(scripts);
+      const latestMaterial =
+        getLatestByDate(readyMaterials) ?? getLatestByDate(materials);
+      const latestPublication = getLatestByDate(publications);
+      const latestAnalysisTags = latestAnalyzedVideo?.tags as
+        | Record<string, unknown>
+        | null
+        | undefined;
+
+      return {
+        project: {
+          id: project.id,
+          name: project.name,
+          description: project.description,
+          industry: project.industry,
+          platform: project.platform,
+          status: project.status,
+          updatedAt: project.updatedAt,
+        },
+        counts: {
+          positionings: positionings.length,
+          topicHubItems: hubItems.length,
+          analyzedVideos: completedAnalyses.length,
+          topicPlans: topicPlans.length,
+          scripts: scripts.length,
+          materials: materials.length,
+          readyMaterials: readyMaterials.length,
+          adaptations: adaptations.length,
+          publications: publications.length,
+          published: published.length,
+          failedPublications: failedPublications.length,
+        },
+        latest: {
+          positioning: completedPositioning
+            ? {
+                id: completedPositioning.id,
+                title: completedPositioning.industry || "账号定位",
+                content: completedPositioning.positioningRecommendation,
+                updatedAt: completedPositioning.updatedAt,
+              }
+            : null,
+          analyzedVideo: latestAnalyzedVideo
+            ? {
+                id: latestAnalyzedVideo.id,
+                title: latestAnalyzedVideo.title,
+                content: String(latestAnalysisTags?.videoAnalysisResult || ""),
+                createdAt: latestAnalyzedVideo.createdAt,
+              }
+            : null,
+          topicPlan: latestTopicPlan
+            ? {
+                id: latestTopicPlan.id,
+                title: latestTopicPlan.title,
+                content: latestTopicPlan.rationale,
+                createdAt: latestTopicPlan.createdAt,
+              }
+            : null,
+          script: latestScript
+            ? {
+                id: latestScript.id,
+                title: latestScript.title,
+                content: latestScript.fullScript,
+                status: latestScript.status,
+                createdAt: latestScript.createdAt,
+              }
+            : null,
+          material: latestMaterial
+            ? {
+                id: latestMaterial.id,
+                title: latestMaterial.title,
+                fileUrl: latestMaterial.fileUrl,
+                status: latestMaterial.status,
+                updatedAt: latestMaterial.updatedAt,
+              }
+            : null,
+          publication: latestPublication
+            ? {
+                id: latestPublication.id,
+                title: latestPublication.title,
+                status: latestPublication.status,
+                visibility: latestPublication.visibility,
+                errorMessage: latestPublication.errorMessage,
+                publishedAt: latestPublication.publishedAt,
+                updatedAt: latestPublication.updatedAt,
+              }
+            : null,
+        },
+      };
+    })
+  );
+
+  return {
+    projects: rows.sort((a, b) => {
+      const aTime = a.project.updatedAt?.getTime?.() ?? 0;
+      const bTime = b.project.updatedAt?.getTime?.() ?? 0;
+      return bTime - aTime || b.project.id - a.project.id;
+    }),
+  };
+}
+
 async function generateTopicPlansForProject(projectId: number) {
   const [positionings, hubItems] = await Promise.all([
     getPositionings(GUEST_USER_ID, projectId),
@@ -3866,6 +4020,7 @@ ${input.scriptContent.substring(0, 1000)}
   // ─── Dashboard Stats ───────────────────────────────────────────────────────
   dashboard: router({
     stats: publicProcedure.query(() => getDashboardStats(GUEST_USER_ID)),
+    contentResults: publicProcedure.query(() => getDashboardContentResults()),
   }),
 
   // ─── Video Generation (Seedance 1.5 Pro) ────────────────────────────────────

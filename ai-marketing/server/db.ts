@@ -1875,42 +1875,78 @@ export async function getDashboardStats(userId: number) {
   const db = await getDb();
   if (!db) {
     const sqlite = getSqliteDb();
-    const row = sqlite
-      .prepare("SELECT COUNT(*) AS count FROM projects WHERE userId = ?")
-      .get(userId) as { count: number } | undefined;
+    const countRows = (table: string) => {
+      const row = sqlite
+        .prepare(`SELECT COUNT(*) AS count FROM ${table} WHERE userId = ?`)
+        .get(userId) as { count: number } | undefined;
+      return Number(row?.count ?? 0);
+    };
+    const hubRows = sqlite
+      .prepare("SELECT tags FROM topic_hub_items WHERE userId = ?")
+      .all(userId) as Array<{ tags: string | null }>;
+    const completedAnalyses = hubRows.filter(row => {
+      try {
+        const tags = row.tags
+          ? (JSON.parse(row.tags) as Record<string, unknown>)
+          : {};
+        return tags.videoAnalysisStatus === "completed";
+      } catch {
+        return false;
+      }
+    }).length;
+
     return {
-      projects: Number(row?.count ?? 0),
-      topics: 0,
-      scripts: 0,
-      materials: 0,
-      adaptations: 0,
-      analyses: 0,
+      projects: countRows("projects"),
+      topicHubItems: countRows("topic_hub_items"),
+      topics: countRows("topics"),
+      topicPlans: countRows("topic_plans"),
+      scripts: countRows("scripts"),
+      materials: countRows("materials"),
+      adaptations: countRows("platform_adaptations"),
+      publications: countRows("material_publications"),
+      analyses: completedAnalyses,
     };
   }
   const [
     projectCount,
+    topicHubItemCount,
     topicCount,
+    topicPlanCount,
     scriptCount,
     materialCount,
     adaptationCount,
+    publicationCount,
     analysisCount,
   ] = await Promise.all([
     db.select().from(projects).where(eq(projects.userId, userId)),
+    db.select().from(topicHubItems).where(eq(topicHubItems.userId, userId)),
     db.select().from(topics).where(eq(topics.userId, userId)),
+    db.select().from(topicPlans).where(eq(topicPlans.userId, userId)),
     db.select().from(scripts).where(eq(scripts.userId, userId)),
     db.select().from(materials).where(eq(materials.userId, userId)),
     db
       .select()
       .from(platformAdaptations)
       .where(eq(platformAdaptations.userId, userId)),
+    db
+      .select()
+      .from(materialPublications)
+      .where(eq(materialPublications.userId, userId)),
     db.select().from(viralAnalyses).where(eq(viralAnalyses.userId, userId)),
   ]);
+  const completedHubAnalyses = topicHubItemCount.filter(item => {
+    const tags = item.tags as Record<string, unknown> | null | undefined;
+    return tags?.videoAnalysisStatus === "completed";
+  }).length;
   return {
     projects: projectCount.length,
+    topicHubItems: topicHubItemCount.length,
     topics: topicCount.length,
+    topicPlans: topicPlanCount.length,
     scripts: scriptCount.length,
     materials: materialCount.length,
     adaptations: adaptationCount.length,
-    analyses: analysisCount.length,
+    publications: publicationCount.length,
+    analyses: analysisCount.length + completedHubAnalyses,
   };
 }

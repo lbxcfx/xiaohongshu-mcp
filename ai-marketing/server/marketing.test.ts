@@ -50,6 +50,14 @@ vi.mock("./db", () => ({
   }),
   updateTopic: vi.fn().mockResolvedValue({ success: true }),
   deleteTopic: vi.fn().mockResolvedValue({ success: true }),
+  getTopicPlans: vi.fn().mockResolvedValue([]),
+  createTopicPlan: vi.fn().mockResolvedValue({
+    id: 1,
+    title: "Test Plan",
+    hubItemId: 1,
+    createdAt: new Date(),
+    updatedAt: new Date(),
+  }),
   getViralAnalyses: vi.fn().mockResolvedValue([]),
   createViralAnalysis: vi.fn().mockResolvedValue(1),
   updateViralAnalysis: vi.fn().mockResolvedValue({ success: true }),
@@ -62,13 +70,18 @@ vi.mock("./db", () => ({
   updateMaterial: vi.fn().mockResolvedValue({ success: true }),
   deleteMaterial: vi.fn().mockResolvedValue({ success: true }),
   getPlatformAdaptations: vi.fn().mockResolvedValue([]),
+  getPlatformAdaptationsByProject: vi.fn().mockResolvedValue([]),
   createPlatformAdaptation: vi.fn().mockResolvedValue(1),
+  getMaterialPublications: vi.fn().mockResolvedValue([]),
   getDashboardStats: vi.fn().mockResolvedValue({
     projects: 3,
+    topicHubItems: 6,
     topics: 10,
+    topicPlans: 7,
     scripts: 5,
     materials: 8,
     adaptations: 15,
+    publications: 2,
     analyses: 4,
   }),
   logUsage: vi.fn().mockResolvedValue(undefined),
@@ -387,10 +400,30 @@ describe("dashboard router", () => {
     expect(stats).toMatchObject({
       projects: expect.any(Number),
       topics: expect.any(Number),
+      topicPlans: expect.any(Number),
       scripts: expect.any(Number),
       materials: expect.any(Number),
+      publications: expect.any(Number),
       adaptations: expect.any(Number),
       analyses: expect.any(Number),
+    });
+  });
+
+  it("returns dashboard content results", async () => {
+    const ctx = createAuthContext();
+    const caller = appRouter.createCaller(ctx);
+    const result = await caller.dashboard.contentResults();
+    expect(result.projects[0]).toMatchObject({
+      project: {
+        id: 1,
+        name: "Test Project",
+      },
+      counts: {
+        topicPlans: expect.any(Number),
+        scripts: expect.any(Number),
+        materials: expect.any(Number),
+        published: expect.any(Number),
+      },
     });
   });
 });
