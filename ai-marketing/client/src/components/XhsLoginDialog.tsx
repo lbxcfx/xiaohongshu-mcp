@@ -16,7 +16,11 @@ type XhsLoginDialogProps = {
   onSuccess?: () => void;
 };
 
-type LoginStatus = "unknown" | "waiting_verification" | "secondary_required" | "logged_in";
+type LoginStatus =
+  | "unknown"
+  | "waiting_verification"
+  | "secondary_required"
+  | "logged_in";
 
 type LoginStatusResponse = {
   status?: LoginStatus;
@@ -27,8 +31,8 @@ type LoginStatusResponse = {
 };
 
 function resolveStatus(status: LoginStatusResponse | null): LoginStatus {
-  if (status?.status) return status.status;
   if (status?.is_logged_in) return "logged_in";
+  if (status?.status) return status.status;
   return "waiting_verification";
 }
 
@@ -51,10 +55,14 @@ async function fetchJson<T>(path: string, init: RequestInit = {}): Promise<T> {
   return (payload?.data ?? payload) as T;
 }
 
-function getInstruction(status: LoginStatusResponse | null, fallbackError: string | null) {
+function getInstruction(
+  status: LoginStatusResponse | null,
+  fallbackError: string | null
+) {
   if (fallbackError) return fallbackError;
   if (!status) return "正在打开小红书官网登录页...";
-  if (status.status === "logged_in") return `已登录，${status.username || "小红书用户"}`;
+  if (status.status === "logged_in")
+    return `已登录，${status.username || "小红书用户"}`;
   if (status.status === "secondary_required") {
     return status.detail || "请在官网窗口继续完成额外安全校验";
   }
@@ -68,6 +76,7 @@ export function XhsLoginDialog({
 }: XhsLoginDialogProps) {
   const utils = trpc.useUtils();
   const pollingRef = useRef<number | null>(null);
+  const successHandledRef = useRef(false);
   const onOpenChangeRef = useRef(onOpenChange);
   const onSuccessRef = useRef(onSuccess);
 
@@ -99,10 +108,12 @@ export function XhsLoginDialog({
       setStatus(null);
       setLoading(false);
       setError(null);
+      successHandledRef.current = false;
       return;
     }
 
     let disposed = false;
+    successHandledRef.current = false;
 
     const stopPolling = () => {
       if (pollingRef.current) {
@@ -111,17 +122,33 @@ export function XhsLoginDialog({
       }
     };
 
+    const completeLogin = () => {
+      if (successHandledRef.current) return;
+      successHandledRef.current = true;
+      stopPolling();
+      onOpenChangeRef.current(false);
+      onSuccessRef.current?.();
+
+      void Promise.allSettled([
+        utils.auth.me.invalidate(),
+        utils.auth.status.invalidate(),
+      ]).then(results => {
+        const rejected = results.find(result => result.status === "rejected");
+        if (rejected && rejected.status === "rejected") {
+          console.warn("[XHS] refresh login cache failed", rejected.reason);
+        }
+      });
+    };
+
     const syncStatus = async () => {
-      const nextStatus = await fetchJson<LoginStatusResponse>("/api/xhs/login/status");
+      const nextStatus = await fetchJson<LoginStatusResponse>(
+        "/api/xhs/login/status"
+      );
       if (disposed) return;
       setStatus(nextStatus);
 
       if (resolveStatus(nextStatus) === "logged_in") {
-        stopPolling();
-        await utils.auth.me.invalidate();
-        await utils.auth.status.invalidate();
-        onOpenChangeRef.current(false);
-        onSuccessRef.current?.();
+        completeLogin();
       }
     };
 
@@ -130,7 +157,11 @@ export function XhsLoginDialog({
       pollingRef.current = window.setInterval(() => {
         void syncStatus().catch(pollError => {
           if (!disposed) {
-            setError(pollError instanceof Error ? pollError.message : "登录状态检查失败");
+            setError(
+              pollError instanceof Error
+                ? pollError.message
+                : "登录状态检查失败"
+            );
           }
         });
       }, 1000);
@@ -142,15 +173,24 @@ export function XhsLoginDialog({
       setStatus(null);
 
       try {
-        const nextStatus = await fetchJson<LoginStatusResponse>("/api/xhs/login/session/start", {
-          method: "POST",
-        });
+        const nextStatus = await fetchJson<LoginStatusResponse>(
+          "/api/xhs/login/session/start",
+          {
+            method: "POST",
+          }
+        );
         if (disposed) return;
         setStatus(nextStatus);
+        if (resolveStatus(nextStatus) === "logged_in") {
+          completeLogin();
+          return;
+        }
         startPolling();
       } catch (bootError) {
         if (!disposed) {
-          setError(bootError instanceof Error ? bootError.message : "启动登录流程失败");
+          setError(
+            bootError instanceof Error ? bootError.message : "启动登录流程失败"
+          );
         }
       } finally {
         if (!disposed) {
@@ -231,7 +271,9 @@ export function XhsLoginDialog({
               )}
             </div>
             {status?.session_timeout ? (
-              <span className="text-xs text-muted-foreground">有效期：{status.session_timeout}</span>
+              <span className="text-xs text-muted-foreground">
+                有效期：{status.session_timeout}
+              </span>
             ) : null}
           </div>
 
