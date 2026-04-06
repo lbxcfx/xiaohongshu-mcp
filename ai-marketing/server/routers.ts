@@ -25,6 +25,9 @@ import {
   updateTopic,
   deleteTopic,
   deleteTopicsByProject,
+  getTopicPlans,
+  createTopicPlan,
+  deleteTopicPlansByProject,
   getViralAnalyses,
   createViralAnalysis,
   updateViralAnalysis,
@@ -37,18 +40,21 @@ import {
   updateMaterial,
   deleteMaterial,
   getPlatformAdaptations,
+  getPlatformAdaptationsByProject,
   createPlatformAdaptation,
+  getMaterialPublications,
+  upsertMaterialPublication,
   getDashboardStats,
   logUsage,
 } from "./db";
 import { ENV } from "./_core/env";
 import { invokeLLM } from "./_core/llm";
-import { analyzeVideoWithArk } from "./_core/ark";
+import { analyzeVideoWithArk, generateTextWithArk } from "./_core/ark";
 import { createSeedanceTask, querySeedanceTask } from "./_core/seedance";
 import { callDataApi } from "./_core/dataApi";
 import { generateImage } from "./_core/imageGeneration";
 import { downloadWithLux } from "./_core/lux";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, unlink, writeFile } from "node:fs/promises";
 import { extname, join, resolve } from "node:path";
 import {
   deleteXhsCookies,
@@ -73,6 +79,565 @@ function parseEngagementCount(value?: string | null): number {
   }
   const parsed = Number.parseInt(normalized, 10);
   return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function buildCompletedPositioningDocumentV2(positioning: {
+  industry?: string | null;
+  track?: string | null;
+  monetizationMethod?: string | null;
+  targetAudience?: string | null;
+  personaType?: string | null;
+  positioningRecommendation?: string | null;
+}) {
+  return [
+    `业务领域：${positioning.industry || "未填写"}`,
+    `细分赛道：${positioning.track || "未填写"}`,
+    `目标受众：${positioning.targetAudience || "未填写"}`,
+    `账号人设：${positioning.personaType || "未填写"}`,
+    `内容风格/品牌调性：${positioning.positioningRecommendation || "未填写"}`,
+    `商业模式：${positioning.monetizationMethod || "未填写"}`,
+  ].join("\n");
+}
+
+function extractJsonObject(text: string) {
+  const candidates = [
+    text.trim(),
+    text
+      .replace(/^```json\s*/i, "")
+      .replace(/^```\s*/i, "")
+      .replace(/\s*```$/i, "")
+      .trim(),
+  ];
+
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+
+    try {
+      return JSON.parse(candidate) as Record<string, unknown>;
+    } catch {
+      const match = candidate.match(/\{[\s\S]*\}/);
+      if (!match) continue;
+
+      try {
+        return JSON.parse(match[0]) as Record<string, unknown>;
+      } catch {
+        continue;
+      }
+    }
+  }
+
+  return {};
+}
+
+function extractJsonArray(text: string) {
+  const candidates = [
+    text.trim(),
+    text
+      .replace(/^```json\s*/i, "")
+      .replace(/^```\s*/i, "")
+      .replace(/\s*```$/i, "")
+      .trim(),
+  ];
+
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+
+    try {
+      return JSON.parse(candidate) as Array<Record<string, unknown>>;
+    } catch {
+      const match = candidate.match(/\[[\s\S]*\]/);
+      if (!match) continue;
+
+      try {
+        return JSON.parse(match[0]) as Array<Record<string, unknown>>;
+      } catch {
+        continue;
+      }
+    }
+  }
+
+  return [];
+}
+
+async function generateScriptForTopicPlanWithArk(
+  projectId: number,
+  topicPlanId: number
+) {
+  const [allTopicPlans, hubItems, allPositionings, allScripts] =
+    await Promise.all([
+      getTopicPlans(GUEST_USER_ID, projectId),
+      getTopicHubItems(GUEST_USER_ID, projectId),
+      getPositionings(GUEST_USER_ID, projectId),
+      getScripts(GUEST_USER_ID, projectId),
+    ]);
+
+  const topicPlan = allTopicPlans.find(item => item.id === topicPlanId);
+  if (!topicPlan) throw new Error("未找到选题策划结果");
+
+  const hubItem = hubItems.find(item => item.id === topicPlan.hubItemId);
+  if (!hubItem) throw new Error("未找到选题策划对应的源视频");
+
+  const hubTags = (hubItem.tags ?? {}) as Record<string, unknown>;
+  const viralAnalysis = String(hubTags.videoAnalysisResult || "").trim();
+  if (!viralAnalysis) {
+    throw new Error("该源视频尚无爆款因子分析结果");
+  }
+
+  const completedPositioning = allPositionings.find(
+    item => item.status === "completed" && item.positioningRecommendation
+  );
+  if (!completedPositioning) {
+    throw new Error("请先完成账号定位，再生成爆款复刻脚本");
+  }
+
+  const positioningDocument =
+    buildCompletedPositioningDocumentV2(completedPositioning);
+
+  const prompt = `你是专业的To B短视频口播文案创作师，必须严格整合三大核心信息进行文案创作，缺一不可，三大核心信息为：
+
+1.【AI账号定位官】输出的完整账号定位（含业务领域、目标受众、账号人设、内容风格、品牌调性）
+2.【AI爆款因子分析师】输出的爆款因子分析报告（含爆款核心钩子、受众痛点、内容结构、流量逻辑、互动技巧、爆款规律）
+3.【AI定制化选题策划师】生成的最终定制化选题
+
+创作要求
+
+1.严格遵循账号定位：文案语言风格、专业度、价值输出，完全匹配账号人设与受众认知，贴合To B企业营销场景
+2.深度融入爆款因子：全程套用爆款分析报告中的核心钩子、结构、痛点、流量技巧，保障文案具备爆款潜力
+3.紧扣定制选题：核心内容完全围绕最终定制化选题展开，不偏离主题，精准传递选题核心信息
+4.口播适配性：语言口语化、节奏流畅，适合短视频口播表达，开头3秒抓眼球，中间逻辑清晰，结尾引导互动/转化
+5.专业合规：符合To B企业内容规范，无低俗、违规内容，凸显专业度与商业价值
+
+输出要求
+
+以完整正式文档形式输出，文案分段清晰、标注明确，可直接复制用于拍摄，无额外无关内容。
+
+【AI账号定位官输出】
+${positioningDocument}
+
+【AI爆款因子分析师输出】
+源视频标题：${hubItem.title}
+${viralAnalysis}
+
+【AI定制化选题策划师输出】
+最终定制化选题：${topicPlan.title}
+生成依据：${topicPlan.rationale || "无"}`;
+
+  const response = await generateTextWithArk({
+    systemPrompt:
+      "你是专业的To B短视频口播文案创作师。请直接输出完整脚本正文，不要输出额外说明。",
+    prompt,
+  });
+
+  const scriptContent = response.text.trim();
+  if (!scriptContent) {
+    throw new Error("Ark 未返回脚本内容");
+  }
+
+  const existingScript = allScripts.find(
+    item => item.topicPlanId === topicPlan.id
+  );
+  const nextTitle = topicPlan.title;
+
+  if (existingScript) {
+    await updateScript(GUEST_USER_ID, {
+      id: existingScript.id,
+      title: nextTitle,
+      fullScript: scriptContent,
+      status: "draft",
+    });
+    return { id: existingScript.id, script: scriptContent };
+  }
+
+  const createdId = await createScript(GUEST_USER_ID, {
+    projectId,
+    topicPlanId: topicPlan.id,
+    hubItemId: hubItem.id,
+    title: nextTitle,
+    fullScript: scriptContent,
+    platform: "xiaohongshu",
+    status: "draft",
+  });
+
+  return { id: createdId, script: scriptContent };
+}
+
+type XhsPublishDraft = {
+  title: string;
+  content: string;
+  tags: string[];
+};
+
+function normalizeXhsTags(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map(item =>
+      String(item || "")
+        .trim()
+        .replace(/^#+/, "")
+    )
+    .filter(Boolean)
+    .slice(0, 10);
+}
+
+async function ensureXhsDraftForScript(params: {
+  projectId: number;
+  materialId: number;
+  scriptId?: number | null;
+  scriptTitle: string;
+  scriptContent?: string | null;
+}) {
+  const scriptText = (params.scriptContent || params.scriptTitle || "").trim();
+  if (!scriptText) {
+    throw new Error("缺少脚本内容，无法生成小红书发布文案");
+  }
+
+  if (params.scriptId) {
+    const existing = (
+      await getPlatformAdaptations(GUEST_USER_ID, params.scriptId)
+    )
+      .filter(item => item.platform === "xiaohongshu")
+      .find(item => item.title && item.caption);
+    if (existing?.title && existing.caption) {
+      const draft = {
+        title: existing.title,
+        content: existing.caption,
+        tags: normalizeXhsTags(existing.hashtags),
+      };
+      await upsertMaterialPublication(GUEST_USER_ID, {
+        projectId: params.projectId,
+        materialId: params.materialId,
+        scriptId: params.scriptId,
+        platform: "xiaohongshu",
+        status: "draft",
+        title: draft.title,
+        content: draft.content,
+        tags: draft.tags,
+        visibility: "公开可见",
+      });
+      return draft;
+    }
+  }
+
+  const response = await generateTextWithArk({
+    systemPrompt:
+      "你是专业的小红书医美短视频发布运营。请只返回合法 JSON，不要输出额外解释。",
+    prompt: `请根据以下视频脚本，生成可直接发布到小红书的视频笔记文案。
+
+要求：
+1. 标题控制在20字以内，适合小红书搜索和点击。
+2. 正文口语化、专业合规，不承诺疗效，不使用绝对化词语。
+3. 话题标签不超过10个，不需要带#号。
+4. 只返回 JSON：{"title":"标题","content":"正文","tags":["标签1","标签2"]}
+
+视频标题：${params.scriptTitle}
+
+视频脚本：
+${scriptText}`,
+  });
+
+  const parsed = extractJsonObject(response.text);
+  const draft: XhsPublishDraft = {
+    title: String(parsed.title || params.scriptTitle || "小红书视频").trim(),
+    content: String(parsed.content || parsed.caption || scriptText).trim(),
+    tags: normalizeXhsTags(parsed.tags),
+  };
+  if (!draft.title || !draft.content) {
+    throw new Error("小红书发布文案生成失败");
+  }
+
+  if (params.scriptId) {
+    await createPlatformAdaptation(GUEST_USER_ID, {
+      projectId: params.projectId,
+      scriptId: params.scriptId,
+      platform: "xiaohongshu",
+      title: draft.title,
+      caption: draft.content,
+      hashtags: draft.tags,
+      adaptedContent: draft.content,
+      formatNotes: "用于素材智造视频自动发布到小红书",
+    });
+  }
+
+  await upsertMaterialPublication(GUEST_USER_ID, {
+    projectId: params.projectId,
+    materialId: params.materialId,
+    scriptId: params.scriptId ?? null,
+    platform: "xiaohongshu",
+    status: "draft",
+    title: draft.title,
+    content: draft.content,
+    tags: draft.tags,
+    visibility: "公开可见",
+  });
+
+  return draft;
+}
+
+async function resolvePublishVideoPath(params: {
+  projectId: number;
+  materialId: number;
+  fileUrl: string;
+}) {
+  if (params.fileUrl.startsWith("/_local/")) {
+    return {
+      path: resolve(
+        process.cwd(),
+        ".data",
+        params.fileUrl.replace("/_local/", "")
+      ),
+      shouldCleanup: false,
+    };
+  }
+
+  if (!params.fileUrl.startsWith("http")) {
+    throw new Error("不支持的视频文件路径格式");
+  }
+
+  const dir = resolve(
+    process.cwd(),
+    ".data",
+    "xhs-publish",
+    String(params.projectId)
+  );
+  await mkdir(dir, { recursive: true });
+  const filename = `video_${params.materialId}_${Date.now()}.mp4`;
+  const localVideoPath = join(dir, filename);
+  const resp = await fetch(params.fileUrl, {
+    signal: AbortSignal.timeout(300_000),
+  });
+  if (!resp.ok) throw new Error(`视频下载失败 (${resp.status})`);
+  const buf = await resp.arrayBuffer();
+  await writeFile(localVideoPath, Buffer.from(buf));
+  return { path: localVideoPath, shouldCleanup: true };
+}
+
+async function publishMaterialToXhs(input: {
+  projectId: number;
+  materialId: number;
+  title?: string;
+  content?: string;
+  tags?: string[];
+  visibility?: "公开可见" | "仅自己可见" | "仅互关好友可见";
+}) {
+  const [allMaterials, allScripts] = await Promise.all([
+    getMaterials(GUEST_USER_ID, input.projectId),
+    getScripts(GUEST_USER_ID, input.projectId),
+  ]);
+  const material = allMaterials.find(item => item.id === input.materialId);
+  if (!material) throw new Error("未找到素材记录");
+  if (material.status !== "ready")
+    throw new Error("素材尚未生成完成，无法发布");
+  if (!material.fileUrl) throw new Error("该素材没有可用的视频文件");
+
+  const script = material.scriptId
+    ? allScripts.find(item => item.id === material.scriptId)
+    : undefined;
+  const draft =
+    input.title && input.content
+      ? {
+          title: input.title.trim(),
+          content: input.content.trim(),
+          tags: normalizeXhsTags(input.tags),
+        }
+      : await ensureXhsDraftForScript({
+          projectId: input.projectId,
+          materialId: input.materialId,
+          scriptId: material.scriptId,
+          scriptTitle: script?.title || material.title,
+          scriptContent:
+            script?.fullScript || material.prompt || material.title,
+        });
+
+  const visibility = input.visibility ?? "公开可见";
+  await upsertMaterialPublication(GUEST_USER_ID, {
+    projectId: input.projectId,
+    materialId: input.materialId,
+    scriptId: material.scriptId ?? null,
+    platform: "xiaohongshu",
+    status: "publishing",
+    title: draft.title,
+    content: draft.content,
+    tags: draft.tags,
+    visibility,
+  });
+
+  try {
+    const videoPath = await resolvePublishVideoPath({
+      projectId: input.projectId,
+      materialId: input.materialId,
+      fileUrl: material.fileUrl,
+    });
+    try {
+      const publishResp = await fetch(`${ENV.xhsApiUrl}/api/v1/publish_video`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          title: draft.title,
+          content: draft.content,
+          video: videoPath.path,
+          tags: draft.tags,
+          visibility,
+        }),
+        signal: AbortSignal.timeout(600_000),
+      });
+      const result = (await publishResp.json()) as {
+        success?: boolean;
+        data?: { post_id?: string; status?: string };
+        message?: string;
+        error?: string;
+      };
+      if (!publishResp.ok || !result.success) {
+        throw new Error(
+          result.error || result.message || `发布失败 (${publishResp.status})`
+        );
+      }
+
+      await upsertMaterialPublication(GUEST_USER_ID, {
+        projectId: input.projectId,
+        materialId: input.materialId,
+        scriptId: material.scriptId ?? null,
+        platform: "xiaohongshu",
+        status: "published",
+        title: draft.title,
+        content: draft.content,
+        tags: draft.tags,
+        visibility,
+        postId: result.data?.post_id ?? null,
+        publishedAt: new Date(),
+      });
+
+      return {
+        materialId: input.materialId,
+        postId: result.data?.post_id,
+        status: result.data?.status ?? "published",
+        message: result.message ?? "发布成功",
+        draft,
+      };
+    } finally {
+      if (videoPath.shouldCleanup) {
+        await unlink(videoPath.path).catch(() => undefined);
+      }
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "发布失败";
+    await upsertMaterialPublication(GUEST_USER_ID, {
+      projectId: input.projectId,
+      materialId: input.materialId,
+      scriptId: material.scriptId ?? null,
+      platform: "xiaohongshu",
+      status: "failed",
+      title: draft.title,
+      content: draft.content,
+      tags: draft.tags,
+      visibility,
+      errorMessage: message,
+    });
+    throw error;
+  }
+}
+
+async function generateTopicPlansForProject(projectId: number) {
+  const [positionings, hubItems] = await Promise.all([
+    getPositionings(GUEST_USER_ID, projectId),
+    getTopicHubItems(GUEST_USER_ID, projectId),
+  ]);
+
+  const completedPositioning = positionings.find(
+    item => item.status === "completed" && item.positioningRecommendation
+  );
+  if (!completedPositioning?.positioningRecommendation) {
+    throw new Error("请先完成账号定位，再生成选题策划");
+  }
+
+  const sourceVideos = hubItems
+    .filter(item => item.platform === "xiaohongshu")
+    .filter(item => {
+      const tags = (item.tags ?? {}) as Record<string, unknown>;
+      return (
+        tags.videoAnalysisStatus === "completed" &&
+        typeof tags.videoAnalysisResult === "string" &&
+        String(tags.videoAnalysisResult || "").trim().length > 0
+      );
+    })
+    .sort((a, b) => {
+      const aTags = (a.tags ?? {}) as Record<string, unknown>;
+      const bTags = (b.tags ?? {}) as Record<string, unknown>;
+      return Number(bTags.likedCount || 0) - Number(aTags.likedCount || 0);
+    });
+
+  if (sourceVideos.length === 0) {
+    throw new Error("请先在爆款分析中完成视频 AI 分析，再生成选题策划");
+  }
+
+  const generatedPlans: Array<{
+    hubItemId: number;
+    title: string;
+    rationale: string;
+  }> = [];
+
+  for (const item of sourceVideos) {
+    const tags = (item.tags ?? {}) as Record<string, unknown>;
+    const viralAnalysis = String(tags.videoAnalysisResult || "").trim();
+    const prompt = `你是专业的医美小红书选题策划师。
+请根据以下两部分信息，为这个爆款视频生成 1 个适合当前账号继续发布的小红书视频题目。
+
+【账号定位内容】
+${completedPositioning.positioningRecommendation}
+
+【参考爆款视频标题】
+${item.title}
+
+【参考爆款视频的爆款因子分析】
+${viralAnalysis}
+
+要求：
+1. 只生成 1 个题目，必须适合小红书视频。
+2. 题目要延续参考爆款视频里可复制的爆款因子，但必须匹配当前账号定位。
+3. 不要照抄原题目，要做定位适配。
+4. 表达要克制、专业、适合医美/轻医美/护肤内容。
+5. 不要出现夸大承诺、绝对化疗效、违规营销表达。
+6. 额外给出 1 行“生成依据”，说明这个题目是如何结合账号定位与爆款因子得出的。
+
+请严格返回 JSON：
+{
+  "title": "生成的小红书视频题目",
+  "rationale": "生成依据"
+}`;
+
+    const response = await generateTextWithArk({
+      systemPrompt:
+        "你擅长医美内容选题策划。请只返回合法 JSON，不要输出额外文本。",
+      prompt,
+    });
+
+    const parsed = extractJsonObject(response.text);
+    const title = String(parsed.title || "").trim();
+    const rationale = String(parsed.rationale || "").trim();
+    if (!title) {
+      throw new Error(`选题策划生成失败：视频《${item.title}》未返回题目`);
+    }
+
+    generatedPlans.push({
+      hubItemId: item.id,
+      title,
+      rationale,
+    });
+  }
+
+  await deleteTopicPlansByProject(GUEST_USER_ID, projectId);
+
+  const savedPlans = [];
+  for (const plan of generatedPlans) {
+    const saved = await createTopicPlan(GUEST_USER_ID, {
+      projectId,
+      hubItemId: plan.hubItemId,
+      title: plan.title,
+      rationale: plan.rationale,
+    });
+    savedPlans.push(saved);
+  }
+
+  return { plans: savedPlans };
 }
 
 function buildXhsSearchKeyword(industry: string, checklist?: string) {
@@ -1277,6 +1842,134 @@ async function runVideoPositioningAnalysisInBackground(input: {
   }
 }
 
+function buildCompletedPositioningDocument(positioning: {
+  industry?: string | null;
+  track?: string | null;
+  monetizationMethod?: string | null;
+  targetAudience?: string | null;
+  personaType?: string | null;
+  positioningRecommendation?: string | null;
+}) {
+  return [
+    `业务领域：${positioning.industry || "未填写"}`,
+    `细分赛道：${positioning.track || "未填写"}`,
+    `目标受众：${positioning.targetAudience || "未填写"}`,
+    `账号人设：${positioning.personaType || "未填写"}`,
+    `内容风格/品牌调性：${positioning.positioningRecommendation || "未填写"}`,
+    `商业模式：${positioning.monetizationMethod || "未填写"}`,
+  ].join("\n");
+}
+
+async function generateScriptForTopicPlan(
+  projectId: number,
+  topicPlanId: number
+) {
+  const [allTopicPlans, hubItems, allPositionings, allScripts] =
+    await Promise.all([
+      getTopicPlans(GUEST_USER_ID, projectId),
+      getTopicHubItems(GUEST_USER_ID, projectId),
+      getPositionings(GUEST_USER_ID, projectId),
+      getScripts(GUEST_USER_ID, projectId),
+    ]);
+
+  const topicPlan = allTopicPlans.find(item => item.id === topicPlanId);
+  if (!topicPlan) throw new Error("未找到选题策划结果");
+
+  const hubItem = hubItems.find(item => item.id === topicPlan.hubItemId);
+  if (!hubItem) throw new Error("未找到选题策划对应的源视频");
+
+  const hubTags = (hubItem.tags ?? {}) as Record<string, unknown>;
+  const viralAnalysis = String(hubTags.videoAnalysisResult || "").trim();
+  if (!viralAnalysis) {
+    throw new Error("该源视频尚无爆款因子分析结果");
+  }
+
+  const completedPositioning = allPositionings.find(
+    item => item.status === "completed" && item.positioningRecommendation
+  );
+  if (!completedPositioning) {
+    throw new Error("请先完成账号定位，再生成爆款复刻脚本");
+  }
+
+  const positioningDocument =
+    buildCompletedPositioningDocument(completedPositioning);
+
+  const prompt = `你是专业的To B短视频口播文案创作师，必须严格整合三大核心信息进行文案创作，缺一不可，三大核心信息为：
+
+1.【AI账号定位官】输出的完整账号定位（含业务领域、目标受众、账号人设、内容风格、品牌调性）
+2.【AI爆款因子分析师】输出的爆款因子分析报告（含爆款核心钩子、受众痛点、内容结构、流量逻辑、互动技巧、爆款规律）
+3.【AI定制化选题策划师】生成的最终定制化选题
+
+创作要求
+
+1.严格遵循账号定位：文案语言风格、专业度、价值输出，完全匹配账号人设与受众认知，贴合To B企业营销场景
+2.深度融入爆款因子：全程套用爆款分析报告中的核心钩子、结构、痛点、流量技巧，保障文案具备爆款潜力
+3.紧扣定制选题：核心内容完全围绕最终定制选题展开，不偏离主题，精准传递选题核心信息
+4.口播适配性：语言口语化、节奏流畅，适合短视频口播表达，开头3秒抓眼球，中间逻辑清晰，结尾引导互动/转化
+5.专业合规：符合To B企业内容规范，无低俗、违规内容，凸显专业度与商业价值
+
+输出要求
+
+以完整正式文档形式输出，文案分段清晰、标注明确，可直接复制用于拍摄，无额外无关内容。
+
+【AI账号定位官输出】
+${positioningDocument}
+
+【AI爆款因子分析师输出】
+源视频标题：${hubItem.title}
+${viralAnalysis}
+
+【AI定制化选题策划师输出】
+最终定制化选题：${topicPlan.title}
+生成依据：${topicPlan.rationale || "无"}
+`;
+
+  const response = await invokeLLM({
+    messages: [
+      {
+        role: "system",
+        content:
+          "你是专业的To B短视频口播文案创作师。请使用中文输出完整脚本，不要输出与脚本无关的解释。",
+      },
+      { role: "user", content: prompt },
+    ],
+  });
+
+  const scriptContent = String(
+    response.choices[0]?.message?.content || ""
+  ).trim();
+  if (!scriptContent) {
+    throw new Error("Ark 未返回脚本内容");
+  }
+
+  const existingScript = allScripts.find(
+    item => item.topicPlanId === topicPlan.id
+  );
+  const nextTitle = `${topicPlan.title}`;
+
+  if (existingScript) {
+    await updateScript(GUEST_USER_ID, {
+      id: existingScript.id,
+      title: nextTitle,
+      fullScript: scriptContent,
+      status: "draft",
+    });
+    return { id: existingScript.id, script: scriptContent };
+  }
+
+  const createdId = await createScript(GUEST_USER_ID, {
+    projectId,
+    topicPlanId: topicPlan.id,
+    hubItemId: hubItem.id,
+    title: nextTitle,
+    fullScript: scriptContent,
+    platform: "xiaohongshu",
+    status: "draft",
+  });
+
+  return { id: createdId, script: scriptContent };
+}
+
 export const appRouter = router({
   system: systemRouter,
   auth: router({
@@ -2367,6 +3060,113 @@ ${input.checklist ? `关键词清单：${input.checklist}` : ""}
     list: publicProcedure
       .input(z.object({ projectId: z.number() }))
       .query(({ input }) => getTopics(GUEST_USER_ID, input.projectId)),
+    relatedVideos: publicProcedure
+      .input(z.object({ projectId: z.number() }))
+      .query(async ({ input }) => {
+        const [positionings, hubItems] = await Promise.all([
+          getPositionings(GUEST_USER_ID, input.projectId),
+          getTopicHubItems(GUEST_USER_ID, input.projectId),
+        ]);
+
+        const completedPositioning = positionings.find(
+          item => item.status === "completed" && item.positioningRecommendation
+        );
+        if (!completedPositioning?.positioningRecommendation) {
+          return [];
+        }
+
+        const candidateVideos = hubItems
+          .filter(item => item.platform === "xiaohongshu")
+          .map(item => {
+            const tags = (item.tags ?? {}) as Record<string, unknown>;
+            return {
+              id: item.id,
+              title: item.title,
+              authorName: String(tags.authorName || ""),
+              likedCount: Number(tags.likedCount || 0),
+            };
+          });
+
+        if (candidateVideos.length === 0) {
+          return [];
+        }
+
+        const prompt = `你是医美短视频选题分析助手。请根据“账号定位内容”，判断下面哪些视频标题与该账号定位高度相关。
+
+账号定位内容：
+${completedPositioning.positioningRecommendation}
+
+候选视频标题列表：
+${candidateVideos
+  .map(
+    item =>
+      `- id=${item.id}｜标题=${item.title}｜作者=${item.authorName || "未知"}｜点赞=${item.likedCount}`
+  )
+  .join("\n")}
+
+判断规则：
+1. 只依据账号定位与视频标题语义相关性判断。
+2. 与定位方向、目标人群、内容赛道明显相关的，才选中。
+3. 不确定时宁可不选。
+4. 返回的 id 必须来自给定列表。
+
+请严格返回 JSON：
+{
+  "matchedIds": [1, 2],
+  "reasons": [
+    { "id": 1, "reason": "为什么相关" }
+  ]
+}`;
+
+        const response = await invokeLLM({
+          messages: [
+            {
+              role: "system",
+              content:
+                "你擅长医美账号定位与短视频选题相关性判断。只返回合法 JSON，不要输出多余文本。",
+            },
+            { role: "user", content: prompt },
+          ],
+          response_format: { type: "json_object" },
+        });
+
+        const raw = String(response.choices[0]?.message?.content || "{}");
+        let parsed: {
+          matchedIds?: number[];
+          reasons?: Array<{ id: number; reason: string }>;
+        } = {};
+
+        try {
+          parsed = JSON.parse(raw);
+        } catch {
+          parsed = {};
+        }
+
+        const matchedIds = new Set(
+          (parsed.matchedIds || [])
+            .map(value => Number(value))
+            .filter(value => Number.isFinite(value))
+        );
+        const reasonMap = new Map(
+          (parsed.reasons || [])
+            .map(item => [Number(item.id), String(item.reason || "")] as const)
+            .filter(([id]) => Number.isFinite(id))
+        );
+
+        return hubItems
+          .filter(item => matchedIds.has(item.id))
+          .map(item => ({
+            ...item,
+            matchedReason: reasonMap.get(item.id) || "",
+          }))
+          .sort((a, b) => {
+            const aTags = (a.tags ?? {}) as Record<string, unknown>;
+            const bTags = (b.tags ?? {}) as Record<string, unknown>;
+            return (
+              Number(bTags.likedCount || 0) - Number(aTags.likedCount || 0)
+            );
+          });
+      }),
     generate: publicProcedure
       .input(z.object({ projectId: z.number() }))
       .mutation(async ({ input }) => {
@@ -2381,7 +3181,10 @@ ${input.checklist ? `关键词清单：${input.checklist}` : ""}
           p => p.status === "completed" && p.positioningRecommendation
         );
         const positioningBlock = completedPositioning
-          ? `## 账号定位分析\n\n${completedPositioning.positioningRecommendation}\n`
+          ? `## ?????????
+
+${completedPositioning.positioningRecommendation}
+`
           : "";
 
         type HubTags = Record<string, unknown>;
@@ -2397,46 +3200,37 @@ ${input.checklist ? `关键词清单：${input.checklist}` : ""}
         if (analyzedVideos.length > 0) {
           const sections = analyzedVideos.map((item, i) => {
             const tags = (item.tags ?? {}) as HubTags;
-            return `### 爆款视频 ${i + 1}: ${item.title}\n${String(tags.videoAnalysisResult)}`;
+            return `### ?????? ${i + 1}: ${item.title}
+${String(tags.videoAnalysisResult)}`;
           });
-          viralAnalysisBlock = `## 爆款视频因子分析（共${analyzedVideos.length}条）\n\n${sections.join("\n\n---\n\n")}\n`;
+          viralAnalysisBlock = `## 鐖嗘瑙嗛鍥犲瓙鍒嗘瀽锛堝叡${analyzedVideos.length}鏉★級\n\n${sections.join("\n\n---\n\n")}\n`;
         }
 
         if (!positioningBlock && !viralAnalysisBlock) {
-          throw new Error(
-            "请先完成账号定位分析或选题中台的视频爆款因子分析，再生成选题"
-          );
+          throw new Error("??????????????????????????????????????????????");
         }
 
         await deleteTopicsByProject(GUEST_USER_ID, input.projectId);
 
-        const prompt = `你是一位顶级的医美短视频选题策划师，擅长基于账号定位和爆款因子分析，生成可直接执行的高爆款潜质选题。
-
+        const prompt = `?????????????????????????????????????????????????????????????????????????????
 ${positioningBlock}
 ${viralAnalysisBlock}
 
-## 选题生成要求
+## ?????????
 
-请基于以上账号定位信息和爆款视频因子分析结果，生成 10 个高爆款潜质的短视频选题方案。
+??????????????????????????????????????10 ???????????????????????
+??????????????1. **??????**????????????????????????????????2. **??????**??ersona????????????????? traffic????????????????? marketing????????????????3. **??????**???????????????????????????????4. **?????????**??igh / medium / low
+5. **??????**?????????????????????????????????????????????????????????
 
-每个选题必须满足：
-1. **选题标题**：直接可用的视频标题，具备钩子感和点击欲望
-2. **选题类型**：persona（人设型，建立信任感）/ traffic（流量型，泛流量干货）/ marketing（营销型，引导转化）
-3. **内容方向**：具体的拍摄思路、脚本结构、核心话术方向
-4. **爆款潜力评级**：high / medium / low
-5. **选题理由**：结合了哪些爆款因子（钩子类型、痛点、情绪、信任元素等），为什么有爆款潜质
-
-选题分配建议：人设型 3 条 + 流量型 4 条 + 营销型 3 条
-
-以JSON格式返回：
-{
+??????????????? 3 ??+ ?????4 ??+ ?????3 ??
+??SON????????{
   "topics": [
     {
-      "title": "选题标题",
-      "description": "内容方向与拍摄思路",
+      "title": "??????",
+      "description": "??????????????",
       "topicType": "persona|traffic|marketing",
       "viralPotential": "high|medium|low",
-      "rationale": "爆款因子应用分析"
+      "rationale": "????????????"
     }
   ]
 }`;
@@ -2446,7 +3240,7 @@ ${viralAnalysisBlock}
             {
               role: "system",
               content:
-                "你是专业的医美短视频选题策划师，擅长从爆款因子分析中提取可复制公式并生成新选题。请严格按JSON格式返回。",
+                "???????????????????????????????????????????????????????????????????SON????????;",
             },
             { role: "user", content: prompt },
           ],
@@ -2499,7 +3293,24 @@ ${viralAnalysisBlock}
       .mutation(({ input }) => deleteTopic(GUEST_USER_ID, input.id)),
   }),
 
-  // ─── Viral Analysis ────────────────────────────────────────────────────────
+  // ?????? Viral Analysis ────────────────────────────────────────────────────────
+  topicPlans: router({
+    list: publicProcedure
+      .input(z.object({ projectId: z.number() }))
+      .query(({ input }) => getTopicPlans(GUEST_USER_ID, input.projectId)),
+    generate: publicProcedure
+      .input(z.object({ projectId: z.number() }))
+      .mutation(async ({ input }) => {
+        await logUsage(
+          GUEST_USER_ID,
+          input.projectId,
+          "topicPlans",
+          "generate"
+        );
+        return generateTopicPlansForProject(input.projectId);
+      }),
+  }),
+
   viralAnalysis: router({
     list: publicProcedure
       .input(z.object({ projectId: z.number() }))
@@ -2587,116 +3398,61 @@ ${input.accountPositioning ? `账号定位：${input.accountPositioning}` : ""}
     list: publicProcedure
       .input(z.object({ projectId: z.number() }))
       .query(({ input }) => getScripts(GUEST_USER_ID, input.projectId)),
-    generateForTopic: publicProcedure
+    generateForTopicPlan: publicProcedure
       .input(
         z.object({
           projectId: z.number(),
-          topicId: z.number(),
-          hubItemId: z.number(),
+          topicPlanId: z.number(),
         })
       )
       .mutation(async ({ input }) => {
         await logUsage(GUEST_USER_ID, input.projectId, "scripts", "generate");
+        return generateScriptForTopicPlanWithArk(
+          input.projectId,
+          input.topicPlanId
+        );
+      }),
+    generateBatchFromTopicPlans: publicProcedure
+      .input(
+        z.object({
+          projectId: z.number(),
+          regenerateAll: z.boolean().optional(),
+        })
+      )
+      .mutation(async ({ input }) => {
+        await logUsage(
+          GUEST_USER_ID,
+          input.projectId,
+          "scripts",
+          "generateBatch"
+        );
 
-        const [allTopics, hubItems, allPositionings] = await Promise.all([
-          getTopics(GUEST_USER_ID, input.projectId),
-          getTopicHubItems(GUEST_USER_ID, input.projectId),
-          getPositionings(GUEST_USER_ID, input.projectId),
+        const [plans, scripts] = await Promise.all([
+          getTopicPlans(GUEST_USER_ID, input.projectId),
+          getScripts(GUEST_USER_ID, input.projectId),
         ]);
 
-        const topic = allTopics.find(t => t.id === input.topicId);
-        if (!topic) throw new Error("未找到选题");
-
-        const hubItem = hubItems.find(i => i.id === input.hubItemId);
-        type HubTags = Record<string, unknown>;
-        const hubTags = (hubItem?.tags ?? {}) as HubTags;
-        const viralAnalysis = String(hubTags.videoAnalysisResult || "");
-        if (!viralAnalysis) throw new Error("该视频尚无爆款因子分析结果");
-
-        const positioning = allPositionings.find(
-          p => p.status === "completed" && p.positioningRecommendation
+        const existingPlanIds = new Set(
+          scripts
+            .map(item => Number(item.topicPlanId))
+            .filter(value => Number.isFinite(value) && value > 0)
         );
-        const positioningBlock = positioning
-          ? `## 账号定位\n${positioning.positioningRecommendation}\n`
-          : "";
 
-        const prompt = `角色定位
-
-你是专业的医美短视频爆款脚本生成引擎。
-基于上游输出的【可复制爆款因子分析结果】，结合账号人设，自动生成高完播、高互动、合规安全的短视频脚本，可直接拍摄。
-
-核心约束
-
-1. 严格复用可复制强度=高/中的爆款因子，不使用低可复制内容。
-2. 全程遵守医美合规：禁止疗效承诺、禁止绝对化用词、禁止夸大效果。
-3. 脚本时长控制在 15～30秒，适配抖音/小红书/视频号。
-4. 语言口语化、节奏快、情绪强，符合短视频传播逻辑。
-5. 必须保留：强钩子 + 痛点共鸣 + 信任表达 + 清晰结构 + 互动引导。
-
-${positioningBlock}
-
-## 参考爆款视频：${hubItem?.title || ""}
-${viralAnalysis}
-
-## 本次选题
-- 标题：${topic.title}
-- 类型：${topic.topicType === "persona" ? "人设型" : topic.topicType === "marketing" ? "营销型" : "流量型"}
-- 内容方向：${topic.description || ""}
-- 爆款因子应用：${topic.rationale || ""}
-
-## 生成规则
-
-1. 开头3秒必须用高可复制钩子，直接抓住用户。
-2. 前5秒点出核心痛点，快速共鸣。
-3. 中间部分用科普/避坑/原理建立专业信任，不硬广。
-4. 视觉画面建议与口播同步，方便拍摄。
-5. 结尾必须带互动引导或轻转化引导（评论/私信/预约）。
-6. 整段脚本无废话、高密度信息，保证完播率。
-
-## 输出格式（固定结构）
-
-【视频基础信息】
-
-- 适合平台：
-- 预估时长：
-- 适用人设：
-- 核心爆款公式来源：
-
-【脚本正文】
-0-3秒 钩子：
-3-8秒 痛点共鸣：
-8-18秒 专业科普/避坑/方案：
-18-25秒 信任强化/效果描述：
-25-30秒 互动引导：
-
-【画面建议】
-【字幕重点】
-【爆款关键词复用】
-【合规注意事项】`;
-
-        const response = await invokeLLM({
-          messages: [
-            {
-              role: "system",
-              content:
-                "你是专业的医美短视频爆款脚本生成引擎。请基于爆款因子分析结果生成可直接拍摄的短视频脚本。使用中文，结构清晰，内容专业。",
-            },
-            { role: "user", content: prompt },
-          ],
-        });
-
-        const scriptContent = String(
-          response.choices[0]?.message?.content || ""
+        const targetPlans = plans.filter(
+          plan => input.regenerateAll || !existingPlanIds.has(plan.id)
         );
-        const saved = await createScript(GUEST_USER_ID, {
-          projectId: input.projectId,
-          topicId: input.topicId,
-          title: `${topic.title} — ${hubItem?.title || "脚本"}`,
-          fullScript: scriptContent,
-          status: "draft",
-        });
 
-        return { id: saved, script: scriptContent };
+        const results = [];
+        for (const plan of targetPlans) {
+          results.push(
+            await generateScriptForTopicPlanWithArk(input.projectId, plan.id)
+          );
+        }
+
+        return {
+          generatedCount: results.length,
+          ids: results.map(item => item.id),
+        };
       }),
     update: publicProcedure
       .input(
@@ -2706,6 +3462,7 @@ ${viralAnalysis}
             .enum(["draft", "review", "approved", "produced"])
             .optional(),
           fullScript: z.string().optional(),
+          title: z.string().optional(),
         })
       )
       .mutation(({ input }) => updateScript(GUEST_USER_ID, input)),
@@ -3004,6 +3761,11 @@ ${viralAnalysis}
       .query(({ input }) =>
         getPlatformAdaptations(GUEST_USER_ID, input.scriptId)
       ),
+    listByProject: publicProcedure
+      .input(z.object({ projectId: z.number() }))
+      .query(({ input }) =>
+        getPlatformAdaptationsByProject(GUEST_USER_ID, input.projectId)
+      ),
     generate: publicProcedure
       .input(
         z.object({
@@ -3153,22 +3915,6 @@ ${scriptContent}
   }
 ]`;
 
-        const response = await invokeLLM({
-          messages: [
-            {
-              role: "system",
-              content:
-                "你是短视频分镜头策划师，请严格按JSON格式输出，不要有任何额外文字。",
-            },
-            { role: "user", content: prompt },
-          ],
-        });
-
-        const raw = String(response.choices[0]?.message?.content || "");
-        // 提取 JSON 数组
-        const match = raw.match(/\[[\s\S]*\]/);
-        if (!match) throw new Error("分镜头生成失败：无法解析返回结果");
-
         type ShotItem = {
           shotIndex: number;
           timeRange: string;
@@ -3177,7 +3923,40 @@ ${scriptContent}
           visualSuggestion: string;
           voiceOver: string;
         };
-        const shots = JSON.parse(match[0]) as ShotItem[];
+
+        const response = await generateTextWithArk({
+          systemPrompt:
+            "你是短视频分镜头策划师，请严格按 JSON 数组输出，不要有任何额外文字。",
+          prompt,
+        });
+
+        const rawShots = extractJsonArray(response.text);
+        if (rawShots.length === 0) {
+          throw new Error("分镜头生成失败：无法解析返回结果");
+        }
+
+        const shots = rawShots
+          .map((item, index) => ({
+            shotIndex: Number(item.shotIndex || index + 1),
+            timeRange: String(item.timeRange || "").trim(),
+            description: String(item.description || "").trim(),
+            cameraInstruction: String(item.cameraInstruction || "").trim(),
+            visualSuggestion: String(item.visualSuggestion || "").trim(),
+            voiceOver: String(item.voiceOver || "").trim(),
+          }))
+          .filter(
+            item =>
+              item.shotIndex > 0 &&
+              item.timeRange &&
+              item.description &&
+              item.cameraInstruction &&
+              item.visualSuggestion
+          );
+
+        if (shots.length === 0) {
+          throw new Error("分镜头生成失败：返回结果不完整");
+        }
+
         return { shots, scriptTitle: script.title };
       }),
 
@@ -3290,6 +4069,107 @@ ${scriptContent}
       }
     }),
 
+    publications: publicProcedure
+      .input(z.object({ projectId: z.number() }))
+      .query(({ input }) =>
+        getMaterialPublications(GUEST_USER_ID, input.projectId)
+      ),
+
+    prepareDraft: publicProcedure
+      .input(
+        z.object({
+          projectId: z.number(),
+          materialId: z.number(),
+        })
+      )
+      .mutation(async ({ input }) => {
+        const [allMaterials, allScripts] = await Promise.all([
+          getMaterials(GUEST_USER_ID, input.projectId),
+          getScripts(GUEST_USER_ID, input.projectId),
+        ]);
+        const material = allMaterials.find(
+          item => item.id === input.materialId
+        );
+        if (!material) throw new Error("未找到素材记录");
+        const script = material.scriptId
+          ? allScripts.find(item => item.id === material.scriptId)
+          : undefined;
+        const draft = await ensureXhsDraftForScript({
+          projectId: input.projectId,
+          materialId: input.materialId,
+          scriptId: material.scriptId,
+          scriptTitle: script?.title || material.title,
+          scriptContent:
+            script?.fullScript || material.prompt || material.title,
+        });
+        return { materialId: input.materialId, draft };
+      }),
+
+    publishMaterialAuto: publicProcedure
+      .input(
+        z.object({
+          projectId: z.number(),
+          materialId: z.number(),
+          title: z.string().optional(),
+          content: z.string().optional(),
+          tags: z.array(z.string()).optional(),
+          visibility: z
+            .enum(["公开可见", "仅自己可见", "仅互关好友可见"])
+            .default("公开可见"),
+        })
+      )
+      .mutation(async ({ input }) => {
+        await logUsage(
+          GUEST_USER_ID,
+          input.projectId,
+          "platform",
+          "xhs_auto_publish"
+        );
+        return publishMaterialToXhs(input);
+      }),
+
+    batchPublishAuto: publicProcedure
+      .input(
+        z.object({
+          projectId: z.number(),
+          materialIds: z.array(z.number()),
+          visibility: z
+            .enum(["公开可见", "仅自己可见", "仅互关好友可见"])
+            .default("公开可见"),
+        })
+      )
+      .mutation(async ({ input }) => {
+        await logUsage(
+          GUEST_USER_ID,
+          input.projectId,
+          "platform",
+          "xhs_batch_publish"
+        );
+        const results: Array<{
+          materialId: number;
+          success: boolean;
+          postId?: string;
+          error?: string;
+        }> = [];
+        for (const materialId of input.materialIds) {
+          try {
+            const result = await publishMaterialToXhs({
+              projectId: input.projectId,
+              materialId,
+              visibility: input.visibility,
+            });
+            results.push({ materialId, success: true, postId: result.postId });
+          } catch (error) {
+            results.push({
+              materialId,
+              success: false,
+              error: error instanceof Error ? error.message : "发布失败",
+            });
+          }
+        }
+        return { results };
+      }),
+
     // 发布视频到小红书
     publishVideo: publicProcedure
       .input(
@@ -3318,72 +4198,55 @@ ${scriptContent}
         if (!material) throw new Error("未找到素材记录");
         if (!material.fileUrl) throw new Error("该素材没有可用的视频文件");
 
-        // 确定本地视频路径
-        let localVideoPath: string;
-        if (material.fileUrl.startsWith("/_local/")) {
-          // 已经是本地路径
-          localVideoPath = resolve(
-            process.cwd(),
-            ".data",
-            material.fileUrl.replace("/_local/", "")
-          );
-        } else if (material.fileUrl.startsWith("http")) {
-          // 远端 URL（Seedance CDN），下载到本地
-          const dir = resolve(
-            process.cwd(),
-            ".data",
-            "xhs-publish",
-            String(input.projectId)
-          );
-          await mkdir(dir, { recursive: true });
-          const filename = `video_${input.materialId}_${Date.now()}.mp4`;
-          localVideoPath = join(dir, filename);
+        const videoPath = await resolvePublishVideoPath({
+          projectId: input.projectId,
+          materialId: input.materialId,
+          fileUrl: material.fileUrl,
+        });
 
-          const resp = await fetch(material.fileUrl, {
-            signal: AbortSignal.timeout(300_000),
-          });
-          if (!resp.ok) throw new Error(`视频下载失败 (${resp.status})`);
-          const buf = await resp.arrayBuffer();
-          await writeFile(localVideoPath, Buffer.from(buf));
-        } else {
-          throw new Error("不支持的视频文件路径格式");
-        }
+        try {
+          // 调用 XHS 发布视频 API
+          const publishResp = await fetch(
+            `${ENV.xhsApiUrl}/api/v1/publish_video`,
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                title: input.title,
+                content: input.content,
+                video: videoPath.path,
+                tags: input.tags ?? [],
+                visibility: input.visibility,
+              }),
+              signal: AbortSignal.timeout(600_000), // 视频发布可能较慢，给 10 分钟
+            }
+          );
 
-        // 调用 XHS 发布视频 API
-        const publishResp = await fetch(
-          `${ENV.xhsApiUrl}/api/v1/publish_video`,
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              title: input.title,
-              content: input.content,
-              video: localVideoPath,
-              tags: input.tags ?? [],
-              visibility: input.visibility,
-            }),
-            signal: AbortSignal.timeout(600_000), // 视频发布可能较慢，给 10 分钟
+          const result = (await publishResp.json()) as {
+            success?: boolean;
+            data?: { post_id?: string; status?: string };
+            message?: string;
+            error?: string;
+          };
+
+          if (!publishResp.ok || !result.success) {
+            throw new Error(
+              result.error ||
+                result.message ||
+                `发布失败 (${publishResp.status})`
+            );
           }
-        );
 
-        const result = (await publishResp.json()) as {
-          success?: boolean;
-          data?: { post_id?: string; status?: string };
-          message?: string;
-          error?: string;
-        };
-
-        if (!publishResp.ok || !result.success) {
-          throw new Error(
-            result.error || result.message || `发布失败 (${publishResp.status})`
-          );
+          return {
+            postId: result.data?.post_id,
+            status: result.data?.status ?? "published",
+            message: result.message ?? "发布成功",
+          };
+        } finally {
+          if (videoPath.shouldCleanup) {
+            await unlink(videoPath.path).catch(() => undefined);
+          }
         }
-
-        return {
-          postId: result.data?.post_id,
-          status: result.data?.status ?? "published",
-          message: result.message ?? "发布成功",
-        };
       }),
   }),
 });

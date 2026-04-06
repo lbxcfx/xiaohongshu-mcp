@@ -32,6 +32,7 @@ vi.mock("./db", () => ({
   getPositionings: vi.fn().mockResolvedValue([]),
   createPositioning: vi.fn().mockResolvedValue(1),
   updatePositioning: vi.fn().mockResolvedValue({ success: true }),
+  deletePositioningsByProject: vi.fn().mockResolvedValue({ success: true }),
   getTopicHubItems: vi.fn().mockResolvedValue([]),
   createTopicHubItem: vi.fn().mockResolvedValue({
     id: 1,

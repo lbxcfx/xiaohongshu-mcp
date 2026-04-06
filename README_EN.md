@@ -432,10 +432,11 @@ First time requires manual login to save RedNote login status.
 ./xiaohongshu-login-darwin-arm64
 ```
 
-**Using Source Code:**
+**Using Current Service:**
 
-```bash
-go run cmd/login/main.go
+```text
+Start the current services, then open:
+http://localhost:3000/xhs-login
 ```
 
 ### 1.3. Start MCP Service

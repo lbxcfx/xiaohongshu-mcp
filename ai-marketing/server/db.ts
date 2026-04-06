@@ -10,19 +10,23 @@ import {
   positionings,
   topicHubItems,
   topics,
+  topicPlans,
   viralAnalyses,
   scripts,
   materials,
   platformAdaptations,
+  materialPublications,
   usageStats,
   type InsertProject,
   type InsertPositioning,
   type InsertTopicHubItem,
   type InsertTopic,
+  type InsertTopicPlan,
   type InsertViralAnalysis,
   type InsertScript,
   type InsertMaterial,
   type InsertPlatformAdaptation,
+  type InsertMaterialPublication,
 } from "../drizzle/schema";
 import { ENV } from "./_core/env";
 
@@ -94,7 +98,9 @@ type SqliteScriptRow = {
   projectId: number;
   userId: number;
   topicId: number | null;
+  topicPlanId: number | null;
   analysisId: number | null;
+  hubItemId: number | null;
   title: string;
   hookType: string | null;
   hookContent: string | null;
@@ -118,6 +124,17 @@ type SqliteTopicRow = {
   viralPotential: ViralPotential | null;
   rationale: string | null;
   status: TopicStatus;
+  createdAt: string;
+  updatedAt: string;
+};
+
+type SqliteTopicPlanRow = {
+  id: number;
+  projectId: number;
+  userId: number;
+  hubItemId: number;
+  title: string;
+  rationale: string | null;
   createdAt: string;
   updatedAt: string;
 };
@@ -197,12 +214,26 @@ function getSqliteDb() {
     )
   `);
   _sqliteDb.exec(`
+    CREATE TABLE IF NOT EXISTS topic_plans (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      projectId INTEGER NOT NULL,
+      userId INTEGER NOT NULL,
+      hubItemId INTEGER NOT NULL,
+      title TEXT NOT NULL,
+      rationale TEXT,
+      createdAt TEXT NOT NULL,
+      updatedAt TEXT NOT NULL
+    )
+  `);
+  _sqliteDb.exec(`
     CREATE TABLE IF NOT EXISTS scripts (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       projectId INTEGER NOT NULL,
       userId INTEGER NOT NULL,
       topicId INTEGER,
+      topicPlanId INTEGER,
       analysisId INTEGER,
+      hubItemId INTEGER,
       title TEXT NOT NULL,
       hookType TEXT,
       hookContent TEXT,
@@ -216,6 +247,17 @@ function getSqliteDb() {
       updatedAt TEXT NOT NULL
     )
   `);
+  const scriptColumns = (
+    _sqliteDb.prepare("PRAGMA table_info(scripts)").all() as Array<{
+      name: string;
+    }>
+  ).map(column => column.name);
+  if (!scriptColumns.includes("topicPlanId")) {
+    _sqliteDb.exec("ALTER TABLE scripts ADD COLUMN topicPlanId INTEGER");
+  }
+  if (!scriptColumns.includes("hubItemId")) {
+    _sqliteDb.exec("ALTER TABLE scripts ADD COLUMN hubItemId INTEGER");
+  }
   _sqliteDb.exec(`
     CREATE TABLE IF NOT EXISTS materials (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -236,6 +278,42 @@ function getSqliteDb() {
       prompt TEXT,
       createdAt TEXT DEFAULT (datetime('now')),
       updatedAt TEXT DEFAULT (datetime('now'))
+    )
+  `);
+  _sqliteDb.exec(`
+    CREATE TABLE IF NOT EXISTS platform_adaptations (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      projectId INTEGER NOT NULL,
+      userId INTEGER NOT NULL,
+      scriptId INTEGER NOT NULL,
+      platform TEXT NOT NULL,
+      title TEXT,
+      caption TEXT,
+      hashtags TEXT,
+      adaptedContent TEXT,
+      formatNotes TEXT,
+      createdAt TEXT NOT NULL,
+      updatedAt TEXT NOT NULL
+    )
+  `);
+  _sqliteDb.exec(`
+    CREATE TABLE IF NOT EXISTS material_publications (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      projectId INTEGER NOT NULL,
+      userId INTEGER NOT NULL,
+      materialId INTEGER NOT NULL,
+      scriptId INTEGER,
+      platform TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'draft',
+      title TEXT,
+      content TEXT,
+      tags TEXT,
+      visibility TEXT,
+      postId TEXT,
+      errorMessage TEXT,
+      publishedAt TEXT,
+      createdAt TEXT NOT NULL,
+      updatedAt TEXT NOT NULL
     )
   `);
   return _sqliteDb;
@@ -988,6 +1066,102 @@ export async function deleteTopicsByProject(userId: number, projectId: number) {
   return { success: true };
 }
 
+function mapSqliteTopicPlan(row: SqliteTopicPlanRow | undefined | null) {
+  if (!row) return null;
+  return {
+    id: Number(row.id),
+    projectId: Number(row.projectId),
+    userId: Number(row.userId),
+    hubItemId: Number(row.hubItemId),
+    title: row.title,
+    rationale: row.rationale,
+    createdAt: new Date(row.createdAt),
+    updatedAt: new Date(row.updatedAt),
+  };
+}
+
+export async function getTopicPlans(userId: number, projectId: number) {
+  const db = await getDb();
+  if (!db) {
+    const sqlite = getSqliteDb();
+    const rows = sqlite
+      .prepare(
+        `SELECT id, projectId, userId, hubItemId, title, rationale, createdAt, updatedAt
+         FROM topic_plans
+         WHERE userId = ? AND projectId = ?
+         ORDER BY datetime(createdAt) DESC, id DESC`
+      )
+      .all(userId, projectId) as SqliteTopicPlanRow[];
+    return rows.map(row => mapSqliteTopicPlan(row)!);
+  }
+  return db
+    .select()
+    .from(topicPlans)
+    .where(
+      and(eq(topicPlans.userId, userId), eq(topicPlans.projectId, projectId))
+    )
+    .orderBy(desc(topicPlans.createdAt));
+}
+
+export async function createTopicPlan(
+  userId: number,
+  data: Omit<InsertTopicPlan, "userId">
+) {
+  const db = await getDb();
+  if (!db) {
+    const sqlite = getSqliteDb();
+    const now = new Date().toISOString();
+    const result = sqlite
+      .prepare(
+        `INSERT INTO topic_plans (projectId, userId, hubItemId, title, rationale, createdAt, updatedAt)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        data.projectId,
+        userId,
+        data.hubItemId,
+        data.title,
+        data.rationale ?? null,
+        now,
+        now
+      );
+    const row = sqlite
+      .prepare("SELECT * FROM topic_plans WHERE id = ? LIMIT 1")
+      .get(Number(result.lastInsertRowid)) as SqliteTopicPlanRow | undefined;
+    const topicPlan = mapSqliteTopicPlan(row);
+    if (!topicPlan) throw new Error("Failed to create topic plan in sqlite");
+    return topicPlan;
+  }
+  const result = await db.insert(topicPlans).values({ ...data, userId });
+  const id = (result as unknown as { insertId: number }).insertId;
+  const rows = await db
+    .select()
+    .from(topicPlans)
+    .where(eq(topicPlans.id, id))
+    .limit(1);
+  return rows[0];
+}
+
+export async function deleteTopicPlansByProject(
+  userId: number,
+  projectId: number
+) {
+  const db = await getDb();
+  if (!db) {
+    const sqlite = getSqliteDb();
+    sqlite
+      .prepare("DELETE FROM topic_plans WHERE projectId = ? AND userId = ?")
+      .run(projectId, userId);
+    return { success: true };
+  }
+  await db
+    .delete(topicPlans)
+    .where(
+      and(eq(topicPlans.projectId, projectId), eq(topicPlans.userId, userId))
+    );
+  return { success: true };
+}
+
 // ─── Viral Analyses ────────────────────────────────────────────────────────────
 export async function getViralAnalyses(userId: number, projectId: number) {
   const db = await getDb();
@@ -1042,7 +1216,9 @@ function mapSqliteScript(row: SqliteScriptRow | undefined | null) {
     projectId: Number(row.projectId),
     userId: Number(row.userId),
     topicId: row.topicId != null ? Number(row.topicId) : null,
+    topicPlanId: row.topicPlanId != null ? Number(row.topicPlanId) : null,
     analysisId: row.analysisId != null ? Number(row.analysisId) : null,
+    hubItemId: row.hubItemId != null ? Number(row.hubItemId) : null,
     title: row.title,
     hookType: row.hookType,
     hookContent: row.hookContent,
@@ -1085,14 +1261,16 @@ export async function createScript(
     const now = new Date().toISOString();
     const result = sqlite
       .prepare(
-        `INSERT INTO scripts (projectId, userId, topicId, analysisId, title, hookType, hookContent, mainContent, endingContent, fullScript, platform, duration, status, createdAt, updatedAt)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        `INSERT INTO scripts (projectId, userId, topicId, topicPlanId, analysisId, hubItemId, title, hookType, hookContent, mainContent, endingContent, fullScript, platform, duration, status, createdAt, updatedAt)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         data.projectId,
         userId,
         data.topicId ?? null,
+        data.topicPlanId ?? null,
         data.analysisId ?? null,
+        data.hubItemId ?? null,
         data.title,
         data.hookType ?? null,
         data.hookContent ?? null,
@@ -1117,6 +1295,7 @@ export async function updateScript(
     id: number;
     status?: "draft" | "review" | "approved" | "produced";
     fullScript?: string;
+    title?: string;
   }
 ) {
   const db = await getDb();
@@ -1131,6 +1310,10 @@ export async function updateScript(
     if (data.fullScript !== undefined) {
       fields.push("fullScript = ?");
       values.push(data.fullScript);
+    }
+    if (data.title !== undefined) {
+      fields.push("title = ?");
+      values.push(data.title);
     }
     fields.push("updatedAt = ?");
     values.push(new Date().toISOString());
@@ -1188,6 +1371,40 @@ type SqliteMaterialRow = {
   updatedAt: string;
 };
 
+type SqlitePlatformAdaptationRow = {
+  id: number;
+  projectId: number;
+  userId: number;
+  scriptId: number;
+  platform: string;
+  title: string | null;
+  caption: string | null;
+  hashtags: string | null;
+  adaptedContent: string | null;
+  formatNotes: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+type SqliteMaterialPublicationRow = {
+  id: number;
+  projectId: number;
+  userId: number;
+  materialId: number;
+  scriptId: number | null;
+  platform: string;
+  status: string;
+  title: string | null;
+  content: string | null;
+  tags: string | null;
+  visibility: string | null;
+  postId: string | null;
+  errorMessage: string | null;
+  publishedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
 function mapSqliteMaterial(row: SqliteMaterialRow | undefined | null) {
   if (!row) return null;
   return {
@@ -1211,6 +1428,55 @@ function mapSqliteMaterial(row: SqliteMaterialRow | undefined | null) {
     seedanceTaskId: row.seedanceTaskId,
     referenceImageUrl: row.referenceImageUrl,
     prompt: row.prompt,
+    createdAt: new Date(row.createdAt),
+    updatedAt: new Date(row.updatedAt),
+  };
+}
+
+function mapSqlitePlatformAdaptation(
+  row: SqlitePlatformAdaptationRow | undefined | null
+) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    projectId: row.projectId,
+    userId: row.userId,
+    scriptId: row.scriptId,
+    platform: row.platform as
+      | "xiaohongshu"
+      | "douyin"
+      | "instagram"
+      | "tiktok"
+      | "youtube",
+    title: row.title,
+    caption: row.caption,
+    hashtags: parseSqliteJson(row.hashtags) as string[] | null,
+    adaptedContent: row.adaptedContent,
+    formatNotes: row.formatNotes,
+    createdAt: new Date(row.createdAt),
+    updatedAt: new Date(row.updatedAt),
+  };
+}
+
+function mapSqliteMaterialPublication(
+  row: SqliteMaterialPublicationRow | undefined | null
+) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    projectId: row.projectId,
+    userId: row.userId,
+    materialId: row.materialId,
+    scriptId: row.scriptId,
+    platform: row.platform as "xiaohongshu",
+    status: row.status as "draft" | "publishing" | "published" | "failed",
+    title: row.title,
+    content: row.content,
+    tags: parseSqliteJson(row.tags) as string[] | null,
+    visibility: row.visibility,
+    postId: row.postId,
+    errorMessage: row.errorMessage,
+    publishedAt: row.publishedAt ? new Date(row.publishedAt) : null,
     createdAt: new Date(row.createdAt),
     updatedAt: new Date(row.updatedAt),
   };
@@ -1300,7 +1566,7 @@ export async function updateMaterial(
     const sqlite = getSqliteDb();
     const { id, ...rest } = data;
     const sets: string[] = [];
-    const vals: unknown[] = [];
+    const vals: Array<string | number | null> = [];
     if (rest.status !== undefined) {
       sets.push("status = ?");
       vals.push(rest.status);
@@ -1366,7 +1632,17 @@ export async function deleteMaterial(userId: number, id: number) {
 // ─── Platform Adaptations ──────────────────────────────────────────────────────
 export async function getPlatformAdaptations(userId: number, scriptId: number) {
   const db = await getDb();
-  if (!db) return [];
+  if (!db) {
+    const sqlite = getSqliteDb();
+    const rows = sqlite
+      .prepare(
+        `SELECT * FROM platform_adaptations
+         WHERE userId = ? AND scriptId = ?
+         ORDER BY datetime(createdAt) DESC, id DESC`
+      )
+      .all(userId, scriptId) as SqlitePlatformAdaptationRow[];
+    return rows.map(row => mapSqlitePlatformAdaptation(row)!);
+  }
   return db
     .select()
     .from(platformAdaptations)
@@ -1379,15 +1655,203 @@ export async function getPlatformAdaptations(userId: number, scriptId: number) {
     .orderBy(desc(platformAdaptations.createdAt));
 }
 
+export async function getPlatformAdaptationsByProject(
+  userId: number,
+  projectId: number
+) {
+  const db = await getDb();
+  if (!db) {
+    const sqlite = getSqliteDb();
+    const rows = sqlite
+      .prepare(
+        `SELECT * FROM platform_adaptations
+         WHERE userId = ? AND projectId = ?
+         ORDER BY datetime(createdAt) DESC, id DESC`
+      )
+      .all(userId, projectId) as SqlitePlatformAdaptationRow[];
+    return rows.map(row => mapSqlitePlatformAdaptation(row)!);
+  }
+  return db
+    .select()
+    .from(platformAdaptations)
+    .where(
+      and(
+        eq(platformAdaptations.userId, userId),
+        eq(platformAdaptations.projectId, projectId)
+      )
+    )
+    .orderBy(desc(platformAdaptations.createdAt));
+}
+
 export async function createPlatformAdaptation(
   userId: number,
   data: Omit<InsertPlatformAdaptation, "userId">
 ) {
   const db = await getDb();
-  if (!db) throw new Error("Database not available");
+  if (!db) {
+    const sqlite = getSqliteDb();
+    const now = new Date().toISOString();
+    const result = sqlite
+      .prepare(
+        `INSERT INTO platform_adaptations (
+          projectId, userId, scriptId, platform, title, caption, hashtags,
+          adaptedContent, formatNotes, createdAt, updatedAt
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        data.projectId,
+        userId,
+        data.scriptId,
+        data.platform,
+        data.title ?? null,
+        data.caption ?? null,
+        data.hashtags ? JSON.stringify(data.hashtags) : null,
+        data.adaptedContent ?? null,
+        data.formatNotes ?? null,
+        now,
+        now
+      );
+    return Number(
+      (result as { lastInsertRowid: number | bigint }).lastInsertRowid
+    );
+  }
   const result = await db
     .insert(platformAdaptations)
     .values({ ...data, userId });
+  return (result as unknown as { insertId: number }).insertId;
+}
+
+export async function getMaterialPublications(
+  userId: number,
+  projectId: number
+) {
+  const db = await getDb();
+  if (!db) {
+    const sqlite = getSqliteDb();
+    const rows = sqlite
+      .prepare(
+        `SELECT * FROM material_publications
+         WHERE userId = ? AND projectId = ?
+         ORDER BY datetime(createdAt) DESC, id DESC`
+      )
+      .all(userId, projectId) as SqliteMaterialPublicationRow[];
+    return rows.map(row => mapSqliteMaterialPublication(row)!);
+  }
+  return db
+    .select()
+    .from(materialPublications)
+    .where(
+      and(
+        eq(materialPublications.userId, userId),
+        eq(materialPublications.projectId, projectId)
+      )
+    )
+    .orderBy(desc(materialPublications.createdAt));
+}
+
+export async function upsertMaterialPublication(
+  userId: number,
+  data: Omit<InsertMaterialPublication, "userId"> & {
+    materialId: number;
+    platform: "xiaohongshu";
+  }
+) {
+  const db = await getDb();
+  if (!db) {
+    const sqlite = getSqliteDb();
+    const existing = sqlite
+      .prepare(
+        `SELECT id FROM material_publications
+         WHERE userId = ? AND materialId = ? AND platform = ?
+         LIMIT 1`
+      )
+      .get(userId, data.materialId, data.platform) as
+      | { id: number }
+      | undefined;
+    const now = new Date().toISOString();
+
+    if (existing) {
+      sqlite
+        .prepare(
+          `UPDATE material_publications
+           SET projectId = ?, scriptId = ?, status = ?, title = ?, content = ?, tags = ?,
+               visibility = ?, postId = ?, errorMessage = ?, publishedAt = ?, updatedAt = ?
+           WHERE id = ?`
+        )
+        .run(
+          data.projectId,
+          data.scriptId ?? null,
+          data.status ?? "draft",
+          data.title ?? null,
+          data.content ?? null,
+          data.tags ? JSON.stringify(data.tags) : null,
+          data.visibility ?? null,
+          data.postId ?? null,
+          data.errorMessage ?? null,
+          data.publishedAt ? new Date(data.publishedAt).toISOString() : null,
+          now,
+          existing.id
+        );
+      return existing.id;
+    }
+
+    const result = sqlite
+      .prepare(
+        `INSERT INTO material_publications (
+          projectId, userId, materialId, scriptId, platform, status, title, content,
+          tags, visibility, postId, errorMessage, publishedAt, createdAt, updatedAt
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        data.projectId,
+        userId,
+        data.materialId,
+        data.scriptId ?? null,
+        data.platform,
+        data.status ?? "draft",
+        data.title ?? null,
+        data.content ?? null,
+        data.tags ? JSON.stringify(data.tags) : null,
+        data.visibility ?? null,
+        data.postId ?? null,
+        data.errorMessage ?? null,
+        data.publishedAt ? new Date(data.publishedAt).toISOString() : null,
+        now,
+        now
+      );
+    return Number(
+      (result as { lastInsertRowid: number | bigint }).lastInsertRowid
+    );
+  }
+
+  const existing = await db
+    .select({ id: materialPublications.id })
+    .from(materialPublications)
+    .where(
+      and(
+        eq(materialPublications.userId, userId),
+        eq(materialPublications.materialId, data.materialId),
+        eq(materialPublications.platform, data.platform)
+      )
+    )
+    .limit(1);
+
+  if (existing[0]) {
+    await db
+      .update(materialPublications)
+      .set({ ...data } as Record<string, unknown>)
+      .where(
+        and(
+          eq(materialPublications.id, existing[0].id),
+          eq(materialPublications.userId, userId)
+        )
+      );
+    return existing[0].id;
+  }
+
+  const result = await db
+    .insert(materialPublications)
+    .values({ ...data, userId } as InsertMaterialPublication);
   return (result as unknown as { insertId: number }).insertId;
 }
 

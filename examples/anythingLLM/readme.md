@@ -25,7 +25,7 @@ AnythingLLM 是一款all-in-one 多模态 AI 客户端，支持**workflow**定�
 
 ```bash
 # 登录小红书账号
-go run cmd/login/main.go
+http://localhost:3000/xhs-login
 ```
 
 ### 1.2 启动 MCP 服务
@@ -120,4 +120,3 @@ macOS（Desktop）的路径：
 ## ✅ 总结
 
 通过以上步骤，您就能在 AnythingLLM 中成功接入并使用 **xiaohongshu-mcp** 服务，实现 **本地笔记 → 润色 → 自动化发布到小红书** 的完整闭环工作流 🚀
-

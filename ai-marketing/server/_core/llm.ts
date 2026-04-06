@@ -1,3 +1,5 @@
+import { request as httpRequest } from "node:http";
+import { request as httpsRequest } from "node:https";
 import { ENV } from "./env";
 
 export type Role = "system" | "user" | "assistant" | "tool" | "function";
@@ -19,7 +21,12 @@ export type FileContent = {
   type: "file_url";
   file_url: {
     url: string;
-    mime_type?: "audio/mpeg" | "audio/wav" | "application/pdf" | "audio/mp4" | "video/mp4" ;
+    mime_type?:
+      | "audio/mpeg"
+      | "audio/wav"
+      | "application/pdf"
+      | "audio/mp4"
+      | "video/mp4";
   };
 };
 
@@ -265,6 +272,74 @@ const normalizeResponseFormat = ({
   };
 };
 
+type LlmHttpResponse = {
+  statusCode: number;
+  statusMessage: string;
+  bodyText: string;
+};
+
+function requestLlm(
+  urlText: string,
+  init: {
+    method?: string;
+    headers?: Record<string, string>;
+    body?: string;
+    timeoutMs: number;
+  }
+) {
+  return new Promise<LlmHttpResponse>((resolve, reject) => {
+    const url = new URL(urlText);
+    const requestImpl = url.protocol === "https:" ? httpsRequest : httpRequest;
+    const req = requestImpl(
+      url,
+      {
+        method: init.method ?? "GET",
+        headers: init.headers,
+      },
+      res => {
+        const chunks: Buffer[] = [];
+
+        res.on("data", chunk => {
+          chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+        });
+
+        res.on("end", () => {
+          clearTimeout(timer);
+          resolve({
+            statusCode: res.statusCode ?? 0,
+            statusMessage: res.statusMessage ?? "",
+            bodyText: Buffer.concat(chunks).toString("utf-8"),
+          });
+        });
+      }
+    );
+
+    const timer = setTimeout(() => {
+      req.destroy(new Error(`LLM request timeout after ${init.timeoutMs}ms`));
+    }, init.timeoutMs);
+
+    req.on("error", error => {
+      clearTimeout(timer);
+      reject(error);
+    });
+
+    if (init.body) {
+      req.write(init.body);
+    }
+
+    req.end();
+  });
+}
+
+function wrapLlmError(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error);
+  if (/timeout/i.test(message)) {
+    return new Error("LLM 请求超时，请稍后重试");
+  }
+
+  return error instanceof Error ? error : new Error(message);
+}
+
 export async function invokeLLM(params: InvokeParams): Promise<InvokeResult> {
   assertApiKey();
 
@@ -296,10 +371,10 @@ export async function invokeLLM(params: InvokeParams): Promise<InvokeResult> {
     payload.tool_choice = normalizedToolChoice;
   }
 
-  payload.max_tokens = 32768
+  payload.max_tokens = 32768;
   payload.thinking = {
-    "budget_tokens": 128
-  }
+    budget_tokens: 128,
+  };
 
   const normalizedResponseFormat = normalizeResponseFormat({
     responseFormat,
@@ -312,21 +387,27 @@ export async function invokeLLM(params: InvokeParams): Promise<InvokeResult> {
     payload.response_format = normalizedResponseFormat;
   }
 
-  const response = await fetch(resolveApiUrl(), {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      authorization: `Bearer ${ENV.forgeApiKey}`,
-    },
-    body: JSON.stringify(payload),
-  });
+  try {
+    const bodyText = JSON.stringify(payload);
+    const response = await requestLlm(resolveApiUrl(), {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${ENV.forgeApiKey}`,
+        "content-length": String(Buffer.byteLength(bodyText)),
+      },
+      body: bodyText,
+      timeoutMs: ENV.forgeRequestTimeoutMs,
+    });
 
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(
-      `LLM invoke failed: ${response.status} ${response.statusText} – ${errorText}`
-    );
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw new Error(
+        `LLM invoke failed: ${response.statusCode} ${response.statusMessage} - ${response.bodyText}`
+      );
+    }
+
+    return JSON.parse(response.bodyText) as InvokeResult;
+  } catch (error) {
+    throw wrapLlmError(error);
   }
-
-  return (await response.json()) as InvokeResult;
 }

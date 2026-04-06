@@ -138,7 +138,7 @@ export default function ViralAnalysis({ projectId }: Props) {
         <div>
           <h1 className="flex items-center gap-2 text-2xl font-bold text-foreground">
             <Brain className="h-6 w-6 text-amber-400" />
-            视频爆款因子分析
+            爆款分析
           </h1>
           <p className="mt-1 text-sm text-muted-foreground">
             展示已触发 AI分析 的视频，以及对应的 Ark 爆款因子分析结果。

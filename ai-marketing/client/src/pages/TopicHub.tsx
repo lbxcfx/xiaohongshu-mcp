@@ -225,7 +225,7 @@ export default function TopicHub({ projectId }: Props) {
       <div>
         <h1 className="flex items-center gap-2 text-2xl font-bold text-foreground">
           <TrendingUp className="h-6 w-6 text-rose-500" />
-          选题信息中心
+          选题中台
         </h1>
         <p className="mt-0.5 text-sm text-muted-foreground">
           搜索结果仅展示作品列表，不自动下载。请对需要深入处理的视频手动点击

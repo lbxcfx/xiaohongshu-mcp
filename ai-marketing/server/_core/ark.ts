@@ -308,6 +308,54 @@ async function createArkResponse(input: {
   }
 }
 
+async function createArkTextResponse(input: {
+  prompt: string;
+  systemPrompt?: string;
+  model: string;
+}) {
+  const promptText = input.systemPrompt?.trim()
+    ? `${input.systemPrompt.trim()}\n\n${input.prompt}`
+    : input.prompt;
+
+  try {
+    const payload = JSON.stringify({
+      model: input.model,
+      input: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "input_text",
+              text: promptText,
+            },
+          ],
+        },
+      ],
+    });
+
+    const resp = await requestArk(`${getArkBaseUrl()}/responses`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${ENV.arkApiKey}`,
+        "Content-Type": "application/json",
+        "Content-Length": String(Buffer.byteLength(payload)),
+      },
+      body: payload,
+      timeoutMs: ENV.arkResponseTimeoutMs,
+    });
+
+    if (resp.statusCode < 200 || resp.statusCode >= 300) {
+      throw new Error(
+        `Ark responses failed (${resp.statusCode} ${resp.statusMessage}): ${resp.bodyText}`
+      );
+    }
+
+    return JSON.parse(resp.bodyText) as ArkResponse;
+  } catch (error) {
+    throw wrapArkError(error, "文本生成");
+  }
+}
+
 export async function analyzeVideoWithArk(input: {
   prompt: string;
   filePath: string;
@@ -390,6 +438,30 @@ export async function analyzeVideoWithArk(input: {
   return {
     text,
     fileId,
+    raw: response,
+  };
+}
+
+export async function generateTextWithArk(input: {
+  prompt: string;
+  systemPrompt?: string;
+  model?: string;
+}) {
+  assertArkApiKey();
+
+  const response = await createArkTextResponse({
+    prompt: input.prompt,
+    systemPrompt: input.systemPrompt,
+    model: input.model || ENV.arkModel,
+  });
+
+  const text = extractArkText(response);
+  if (!text) {
+    throw new Error("Ark did not return text");
+  }
+
+  return {
+    text,
     raw: response,
   };
 }

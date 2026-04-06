@@ -452,7 +452,7 @@ Windows 遇到问题首先看这里：[Windows 安装指南](./docs/windows_guid
 **使用源码**：
 
 ```bash
-go run cmd/login/main.go
+http://localhost:3000/xhs-login
 ```
 
 ### 1.3. 启动 MCP 服务

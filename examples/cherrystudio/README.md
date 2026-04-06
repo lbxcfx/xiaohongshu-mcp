@@ -23,7 +23,7 @@ Cherry Studio 是目前最热门的 AI 客户端之一，它简单易用且支�
 
 ```bash
 # 登录小红书账号
-go run cmd/login/main.go
+http://localhost:3000/xhs-login
 ```
 
 #### 1.2 启动 MCP 服务

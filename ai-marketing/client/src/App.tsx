@@ -11,6 +11,7 @@ import ProjectDetail from "./pages/ProjectDetail";
 import Positioning from "./pages/Positioning";
 import TopicHub from "./pages/TopicHub";
 import TopicGeneration from "./pages/TopicGeneration";
+import TopicPlanning from "./pages/TopicPlanning";
 import ViralAnalysis from "./pages/ViralAnalysis";
 import ScriptDirector from "./pages/ScriptDirector";
 import MaterialGeneration from "./pages/MaterialGeneration";
@@ -34,56 +35,63 @@ function AppRouter() {
         </DashboardLayout>
       </Route>
       <Route path="/projects/:id">
-        {(params) => (
+        {params => (
           <DashboardLayout>
             <ProjectDetail id={params.id} />
           </DashboardLayout>
         )}
       </Route>
       <Route path="/projects/:id/positioning">
-        {(params) => (
+        {params => (
           <DashboardLayout>
             <Positioning projectId={params.id} />
           </DashboardLayout>
         )}
       </Route>
       <Route path="/projects/:id/topic-hub">
-        {(params) => (
+        {params => (
           <DashboardLayout>
             <TopicHub projectId={params.id} />
           </DashboardLayout>
         )}
       </Route>
       <Route path="/projects/:id/topics">
-        {(params) => (
+        {params => (
           <DashboardLayout>
-            <TopicGeneration projectId={params.id} />
+            <TopicGeneration projectId={params.id} pageTitle="选题生成" />
+          </DashboardLayout>
+        )}
+      </Route>
+      <Route path="/projects/:id/topic-planning">
+        {params => (
+          <DashboardLayout>
+            <TopicPlanning projectId={params.id} />
           </DashboardLayout>
         )}
       </Route>
       <Route path="/projects/:id/viral-analysis">
-        {(params) => (
+        {params => (
           <DashboardLayout>
             <ViralAnalysis projectId={params.id} />
           </DashboardLayout>
         )}
       </Route>
       <Route path="/projects/:id/scripts">
-        {(params) => (
+        {params => (
           <DashboardLayout>
             <ScriptDirector projectId={params.id} />
           </DashboardLayout>
         )}
       </Route>
       <Route path="/projects/:id/materials">
-        {(params) => (
+        {params => (
           <DashboardLayout>
             <MaterialGeneration projectId={params.id} />
           </DashboardLayout>
         )}
       </Route>
       <Route path="/projects/:id/platform">
-        {(params) => (
+        {params => (
           <DashboardLayout>
             <PlatformAdaptation projectId={params.id} />
           </DashboardLayout>

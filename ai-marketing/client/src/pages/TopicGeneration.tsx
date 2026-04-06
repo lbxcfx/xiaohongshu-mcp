@@ -1,28 +1,26 @@
-import { useMemo } from "react";
+import { type ElementType, useEffect, useMemo, useState } from "react";
 import { Streamdown } from "streamdown";
 import {
   AlertTriangle,
   CheckCircle2,
   ChevronDown,
   ChevronUp,
+  ExternalLink,
+  Heart,
   Loader2,
+  MessageCircle,
   ShoppingBag,
+  Share2,
   Sparkles,
   Target,
   TrendingUp,
   Users,
-  Video,
 } from "lucide-react";
 import { toast } from "sonner";
+import type { inferRouterOutputs } from "@trpc/server";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import {
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
 import {
   Select,
   SelectContent,
@@ -31,15 +29,33 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { trpc } from "@/lib/trpc";
-import { useState } from "react";
+import type { AppRouter } from "../../../server/routers";
 
 interface Props {
   projectId: string;
+  pageTitle?: string;
 }
+
+type TopicHubTagMeta = {
+  sourceLabel?: string;
+  coverUrl?: string;
+  coverDownloadPath?: string;
+  authorName?: string;
+  likedCount?: number;
+  commentCount?: number;
+  sharedCount?: number;
+  duration?: number;
+  videoDownloadStatus?: "idle" | "pending" | "success" | "failed" | "skipped";
+  videoAnalysisStatus?: "pending" | "analyzing" | "completed" | "failed";
+  [key: string]: unknown;
+};
+
+type RouterOutputs = inferRouterOutputs<AppRouter>;
+type RelatedVideoItem = RouterOutputs["topics"]["relatedVideos"][number];
 
 const TOPIC_TYPE_META: Record<
   string,
-  { icon: React.ElementType; label: string; color: string; bg: string }
+  { icon: ElementType; label: string; color: string; bg: string }
 > = {
   persona: {
     icon: Users,
@@ -74,94 +90,179 @@ const STATUS_LABELS: Record<string, string> = {
   published: "已发布",
 };
 
-type HubTags = {
-  videoAnalysisStatus?: string;
-  videoAnalysisResult?: string;
-  likedCount?: number;
-  authorName?: string;
-  [key: string]: unknown;
-};
+function formatCount(value?: number) {
+  if (!value) return "0";
+  if (value >= 10000) return `${(value / 10000).toFixed(1)}w`;
+  return String(value);
+}
 
-export default function TopicGeneration({ projectId }: Props) {
+function formatDuration(seconds?: number) {
+  if (!seconds) return undefined;
+  const mins = Math.floor(seconds / 60);
+  const secs = seconds % 60;
+  return `${mins}:${secs.toString().padStart(2, "0")}`;
+}
+
+function normalizeTopicHubContent(content?: string | null) {
+  if (!content) return undefined;
+  return content.replace(/^\?+/, "关键词：").trim();
+}
+
+function toLocalAssetUrl(filePath?: string) {
+  if (!filePath) return undefined;
+  const normalized = filePath.replace(/\\/g, "/");
+  const marker = "/.data/";
+  const markerIndex = normalized.indexOf(marker);
+  if (markerIndex < 0) return undefined;
+  return `/_local/${normalized.slice(markerIndex + marker.length)}`;
+}
+
+function getLikedCount(item: { tags?: unknown }) {
+  const tags = (item.tags ?? {}) as TopicHubTagMeta;
+  return Number(tags.likedCount ?? 0);
+}
+
+export default function TopicGeneration({
+  projectId,
+  pageTitle = "选题生成",
+}: Props) {
   const pid = Number.parseInt(projectId, 10);
   const utils = trpc.useUtils();
 
   const [expandedPositioning, setExpandedPositioning] = useState(false);
-  const [selectedAnalysis, setSelectedAnalysis] = useState<{
-    title: string;
-    result: string;
-  } | null>(null);
+  const [pollingEnabled, setPollingEnabled] = useState(false);
 
   const { data: positionings } = trpc.positioning.list.useQuery({
     projectId: pid,
   });
-  const { data: hubItems } = trpc.topicHub.list.useQuery({ projectId: pid });
+  const { data: hubItems } = trpc.topicHub.list.useQuery(
+    { projectId: pid },
+    { refetchInterval: pollingEnabled ? 5000 : false }
+  );
+  const { data: relatedVideos, isLoading: relatedVideosLoading } =
+    trpc.topics.relatedVideos.useQuery({ projectId: pid });
   const { data: topics, isLoading: topicsLoading } = trpc.topics.list.useQuery({
     projectId: pid,
   });
 
   const generateMutation = trpc.topics.generate.useMutation({
-    onSuccess: () => {
-      utils.topics.list.invalidate({ projectId: pid });
-      toast.success("已生成 10 条选题！");
+    onSuccess: async () => {
+      await utils.topics.list.invalidate({ projectId: pid });
+      toast.success("已生成 10 条选题");
     },
-    onError: error => toast.error(error.message || "生成失败，请重试"),
+    onError: error => toast.error(error.message || "选题生成失败"),
   });
+
   const updateMutation = trpc.topics.update.useMutation({
     onSuccess: () => utils.topics.list.invalidate({ projectId: pid }),
   });
+
   const deleteMutation = trpc.topics.delete.useMutation({
-    onSuccess: () => {
-      utils.topics.list.invalidate({ projectId: pid });
-      toast.success("已删除");
+    onSuccess: async () => {
+      await utils.topics.list.invalidate({ projectId: pid });
+      toast.success("已删除选题");
+    },
+  });
+
+  const analyzeMutation = trpc.topicHub.requestVideoAnalysis.useMutation({
+    onSuccess: async () => {
+      await Promise.all([
+        utils.topicHub.list.invalidate({ projectId: pid }),
+        utils.topics.relatedVideos.invalidate({ projectId: pid }),
+      ]);
+      toast.success("已加入下载和 AI 分析队列");
+      setPollingEnabled(true);
+    },
+    onError: error => {
+      toast.error(error.message || "AI 分析触发失败");
     },
   });
 
   const completedPositioning = useMemo(
     () =>
       positionings?.find(
-        p => p.status === "completed" && p.positioningRecommendation
-      ),
+        item => item.status === "completed" && item.positioningRecommendation
+      ) ?? null,
     [positionings]
   );
 
-  const analyzedVideos = useMemo(
-    () =>
-      (hubItems ?? []).filter(item => {
-        const tags = (item.tags ?? {}) as HubTags;
-        return (
-          tags.videoAnalysisStatus === "completed" &&
-          typeof tags.videoAnalysisResult === "string"
-        );
-      }),
-    [hubItems]
-  );
+  const filteredVideos = useMemo(() => {
+    const latestHubItemMap = new Map(
+      (hubItems ?? []).map(item => [item.id, item])
+    );
 
-  const hasData = !!completedPositioning || analyzedVideos.length > 0;
+    return (relatedVideos ?? [])
+      .map(item => {
+        const latest = latestHubItemMap.get(item.id);
+        return {
+          ...(latest ?? item),
+          matchedReason: item.matchedReason || "",
+        } as RelatedVideoItem & { matchedReason?: string };
+      })
+      .sort(
+        (a, b) =>
+          getLikedCount(b) - getLikedCount(a) ||
+          (b.engagementScore ?? 0) - (a.engagementScore ?? 0)
+      );
+  }, [hubItems, relatedVideos]);
+
+  useEffect(() => {
+    const hasActive = filteredVideos.some(item => {
+      const meta = (item.tags ?? {}) as TopicHubTagMeta;
+      return (
+        meta.videoDownloadStatus === "pending" ||
+        meta.videoAnalysisStatus === "pending" ||
+        meta.videoAnalysisStatus === "analyzing"
+      );
+    });
+    setPollingEnabled(hasActive);
+  }, [filteredVideos]);
+
+  const stats = useMemo(() => {
+    let analyzed = 0;
+    let processing = 0;
+    for (const item of filteredVideos) {
+      const meta = (item.tags ?? {}) as TopicHubTagMeta;
+      if (meta.videoAnalysisStatus === "completed") analyzed++;
+      if (
+        meta.videoDownloadStatus === "pending" ||
+        meta.videoAnalysisStatus === "pending" ||
+        meta.videoAnalysisStatus === "analyzing"
+      ) {
+        processing++;
+      }
+    }
+    return { total: filteredVideos.length, analyzed, processing };
+  }, [filteredVideos]);
 
   const topicTypeStats = useMemo(() => {
-    const stats = { persona: 0, traffic: 0, marketing: 0 };
-    for (const t of topics ?? []) {
-      if (t.topicType in stats) stats[t.topicType as keyof typeof stats]++;
+    const summary = { persona: 0, traffic: 0, marketing: 0 };
+    for (const topic of topics ?? []) {
+      if (topic.topicType in summary) {
+        summary[topic.topicType as keyof typeof summary]++;
+      }
     }
-    return stats;
+    return summary;
   }, [topics]);
+
+  function openViralAnalysisPage() {
+    window.location.assign(`/projects/${pid}/viral-analysis`);
+  }
 
   return (
     <div className="space-y-6">
       <div>
         <h1 className="flex items-center gap-2 text-2xl font-bold text-foreground">
           <Sparkles className="h-6 w-6 text-pink-400" />
-          AI 智能选题
+          {pageTitle}
         </h1>
         <p className="mt-1 text-sm text-muted-foreground">
-          基于账号定位 + 爆款视频因子分析，AI 自动生成高爆款潜质选题
+          从选题中台已搜索的视频里，使用 Ark
+          大模型根据账号定位内容做相关性判断，只展示匹配的视频。
         </p>
       </div>
 
-      {/* 数据源概览 */}
       <div className="grid gap-4 md:grid-cols-2">
-        {/* 账号定位卡片 */}
         <Card className="border-border bg-card">
           <CardHeader className="pb-2">
             <CardTitle className="flex items-center justify-between text-sm font-medium">
@@ -183,25 +284,22 @@ export default function TopicGeneration({ projectId }: Props) {
                   className="border-amber-500/30 text-amber-400"
                 >
                   <AlertTriangle className="mr-1 h-3 w-3" />
-                  未完成
+                  待完成
                 </Badge>
               )}
             </CardTitle>
           </CardHeader>
           <CardContent>
             {completedPositioning ? (
-              <div>
-                <p className="line-clamp-3 text-xs leading-relaxed text-muted-foreground">
-                  {completedPositioning.positioningRecommendation?.slice(0, 200)}
-                  ...
+              <div className="space-y-3">
+                <p className="line-clamp-4 text-xs leading-relaxed text-muted-foreground">
+                  {completedPositioning.positioningRecommendation || ""}
                 </p>
                 <Button
                   variant="ghost"
                   size="sm"
-                  className="mt-2 h-7 px-2 text-xs text-primary"
-                  onClick={() =>
-                    setExpandedPositioning(!expandedPositioning)
-                  }
+                  className="h-7 px-2 text-xs text-primary"
+                  onClick={() => setExpandedPositioning(value => !value)}
                 >
                   {expandedPositioning ? (
                     <>
@@ -211,102 +309,61 @@ export default function TopicGeneration({ projectId }: Props) {
                   ) : (
                     <>
                       <ChevronDown className="mr-1 h-3 w-3" />
-                      查看完整定位
+                      展开定位内容
                     </>
                   )}
                 </Button>
-                {expandedPositioning && (
-                  <div className="mt-3 max-h-64 overflow-y-auto rounded-xl border border-border/50 bg-muted/20 p-4">
-                    <div className="prose prose-sm prose-invert max-w-none text-xs leading-relaxed text-foreground/80">
+                {expandedPositioning ? (
+                  <div className="rounded-2xl border border-border/50 bg-muted/20 p-4">
+                    <div className="prose prose-sm prose-invert max-w-none text-xs leading-relaxed text-foreground/85">
                       <Streamdown>
                         {completedPositioning.positioningRecommendation || ""}
                       </Streamdown>
                     </div>
                   </div>
-                )}
+                ) : null}
               </div>
             ) : (
               <p className="text-xs text-muted-foreground">
-                请先前往「账号定位」页面完成定位分析
+                请先在“账号定位”页面完成分析，再回到这里查看匹配结果。
               </p>
             )}
           </CardContent>
         </Card>
 
-        {/* 爆款因子分析卡片 */}
         <Card className="border-border bg-card">
           <CardHeader className="pb-2">
             <CardTitle className="flex items-center justify-between text-sm font-medium">
               <span className="flex items-center gap-2 text-foreground">
-                <Video className="h-4 w-4 text-rose-400" />
-                爆款视频因子分析
+                <TrendingUp className="h-4 w-4 text-rose-400" />
+                相关视频池
               </span>
-              <Badge variant="outline">
-                {analyzedVideos.length} 条已分析
-              </Badge>
+              <Badge variant="outline">{stats.total} 条</Badge>
             </CardTitle>
           </CardHeader>
-          <CardContent>
-            {analyzedVideos.length > 0 ? (
-              <div className="space-y-2">
-                {analyzedVideos.slice(0, 5).map(item => {
-                  const tags = (item.tags ?? {}) as HubTags;
-                  return (
-                    <div
-                      key={item.id}
-                      className="flex cursor-pointer items-center gap-2 rounded-lg border border-border/50 bg-muted/20 px-3 py-2 transition-colors hover:border-primary/30 hover:bg-muted/40"
-                      onClick={() =>
-                        setSelectedAnalysis({
-                          title: item.title,
-                          result: String(tags.videoAnalysisResult || ""),
-                        })
-                      }
-                    >
-                      <Sparkles className="h-3 w-3 shrink-0 text-emerald-400" />
-                      <span className="min-w-0 flex-1 truncate text-xs text-foreground">
-                        {item.title}
-                      </span>
-                      <span className="shrink-0 text-xs text-muted-foreground">
-                        {tags.authorName || ""}
-                      </span>
-                    </div>
-                  );
-                })}
-                {analyzedVideos.length > 5 && (
-                  <p className="text-xs text-muted-foreground">
-                    还有 {analyzedVideos.length - 5} 条分析结果...
-                  </p>
-                )}
-              </div>
-            ) : (
-              <p className="text-xs text-muted-foreground">
-                请先前往「选题中台」搜索视频并等待爆款因子分析完成
-              </p>
-            )}
+          <CardContent className="space-y-3 text-xs text-muted-foreground">
+            <p>来源：选题中台已经搜索出来的视频。</p>
+            <p>筛选方式：Ark 大模型对视频标题与账号定位内容做相关性判断。</p>
+            <div className="flex flex-wrap gap-2">
+              <Badge variant="secondary">按点赞量排序</Badge>
+              <Badge variant="secondary">已分析 {stats.analyzed}</Badge>
+              <Badge variant="secondary">处理中 {stats.processing}</Badge>
+            </div>
           </CardContent>
         </Card>
       </div>
 
-      {/* 生成按钮 */}
       <Card className="border-border bg-card">
-        <CardContent className="flex items-center justify-between p-4">
+        <CardContent className="flex flex-col gap-4 p-4 md:flex-row md:items-center md:justify-between">
           <div className="space-y-1">
-            <p className="text-sm font-medium text-foreground">
-              一键生成 10 条选题
-            </p>
+            <p className="text-sm font-medium text-foreground">AI 选题生成</p>
             <p className="text-xs text-muted-foreground">
-              {completedPositioning ? "✓ 账号定位" : "✗ 账号定位"} ·{" "}
-              {analyzedVideos.length > 0
-                ? `✓ ${analyzedVideos.length} 条爆款分析`
-                : "✗ 爆款分析"}
-              {hasData
-                ? " — 数据就绪，可生成选题"
-                : " — 请先完成至少一项数据准备"}
+              相关视频用于人工判断和参考，选题生成入口保持不变。
             </p>
           </div>
           <Button
             onClick={() => generateMutation.mutate({ projectId: pid })}
-            disabled={!hasData || generateMutation.isPending}
+            disabled={!completedPositioning || generateMutation.isPending}
             className="glow-purple h-10 px-6"
           >
             {generateMutation.isPending ? (
@@ -324,7 +381,191 @@ export default function TopicGeneration({ projectId }: Props) {
         </CardContent>
       </Card>
 
-      {/* 选题列表 */}
+      <div className="space-y-3">
+        <div className="flex items-center justify-between gap-3">
+          <div className="flex items-center gap-3">
+            <h2 className="text-sm font-medium text-foreground">相关视频</h2>
+            <Badge variant="outline">{stats.total}</Badge>
+          </div>
+          <p className="text-xs text-muted-foreground">
+            展示样式与选题中台保持一致
+          </p>
+        </div>
+
+        {relatedVideosLoading ? (
+          <div className="grid gap-4 md:grid-cols-3 xl:grid-cols-5">
+            {[1, 2, 3, 4, 5].map(item => (
+              <div key={item} className="h-96 rounded-3xl shimmer" />
+            ))}
+          </div>
+        ) : !completedPositioning ? (
+          <Card className="border-border bg-card">
+            <CardContent className="py-16 text-center text-sm text-muted-foreground">
+              请先完成账号定位。
+            </CardContent>
+          </Card>
+        ) : filteredVideos.length === 0 ? (
+          <Card className="border-border bg-card">
+            <CardContent className="py-16 text-center text-sm text-muted-foreground">
+              当前还没有筛选出与账号定位匹配的视频。请先到选题中台搜索更多作品，再返回这里查看。
+            </CardContent>
+          </Card>
+        ) : (
+          <div className="grid gap-4 md:grid-cols-3 xl:grid-cols-5">
+            {filteredVideos.map(item => {
+              const meta = (item.tags ?? {}) as TopicHubTagMeta;
+              const localCover = toLocalAssetUrl(meta.coverDownloadPath);
+              const cover = localCover || meta.coverUrl;
+              const duration = formatDuration(meta.duration);
+              const isBusy =
+                analyzeMutation.isPending &&
+                analyzeMutation.variables?.id === item.id;
+              const isActive =
+                meta.videoDownloadStatus === "pending" ||
+                meta.videoAnalysisStatus === "pending" ||
+                meta.videoAnalysisStatus === "analyzing";
+              const canViewResult =
+                meta.videoAnalysisStatus === "completed" ||
+                meta.videoAnalysisStatus === "failed";
+
+              return (
+                <Card
+                  key={item.id}
+                  className="overflow-hidden rounded-3xl border-border bg-card"
+                >
+                  <div className="relative aspect-[3/4] overflow-hidden bg-muted">
+                    {cover ? (
+                      <img
+                        src={cover}
+                        alt={item.title}
+                        className="h-full w-full object-cover"
+                      />
+                    ) : (
+                      <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
+                        暂无封面
+                      </div>
+                    )}
+
+                    {duration ? (
+                      <div className="absolute bottom-3 right-3 rounded-full bg-black/70 px-2 py-1 text-xs text-white">
+                        {duration}
+                      </div>
+                    ) : null}
+
+                    {meta.videoAnalysisStatus === "completed" ? (
+                      <div className="absolute right-3 top-3 rounded-full bg-emerald-500/90 px-2 py-1 text-xs text-white">
+                        已分析
+                      </div>
+                    ) : null}
+
+                    {meta.videoAnalysisStatus === "failed" ? (
+                      <div className="absolute right-3 top-3 rounded-full bg-red-500/90 px-2 py-1 text-xs text-white">
+                        失败
+                      </div>
+                    ) : null}
+
+                    {isActive ? (
+                      <div className="absolute right-3 top-3 flex items-center gap-1 rounded-full bg-amber-500/90 px-2 py-1 text-xs text-white">
+                        <Loader2 className="h-3 w-3 animate-spin" />
+                        处理中
+                      </div>
+                    ) : null}
+                  </div>
+
+                  <CardContent className="space-y-3 p-4">
+                    <div className="flex items-center justify-between gap-2">
+                      <Badge variant="secondary">
+                        {meta.sourceLabel || "小红书"}
+                      </Badge>
+                      <span className="text-xs text-muted-foreground">
+                        热度值 {item.engagementScore ?? 0}
+                      </span>
+                    </div>
+
+                    <div>
+                      <p className="line-clamp-2 text-sm font-medium text-foreground">
+                        {item.title}
+                      </p>
+                      <p className="mt-1 text-xs text-muted-foreground">
+                        {meta.authorName || "小红书作者"}
+                      </p>
+                      {normalizeTopicHubContent(item.content) ? (
+                        <p className="mt-2 line-clamp-2 text-xs text-muted-foreground">
+                          {normalizeTopicHubContent(item.content)}
+                        </p>
+                      ) : null}
+                      {item.matchedReason ? (
+                        <p className="mt-2 line-clamp-3 text-xs leading-relaxed text-primary/80">
+                          匹配原因：{item.matchedReason}
+                        </p>
+                      ) : null}
+                    </div>
+
+                    <div className="flex items-center gap-4 text-xs text-muted-foreground">
+                      <span className="flex items-center gap-1">
+                        <Heart className="h-3.5 w-3.5" />
+                        {formatCount(meta.likedCount)}
+                      </span>
+                      <span className="flex items-center gap-1">
+                        <MessageCircle className="h-3.5 w-3.5" />
+                        {formatCount(meta.commentCount)}
+                      </span>
+                      <span className="flex items-center gap-1">
+                        <Share2 className="h-3.5 w-3.5" />
+                        {formatCount(meta.sharedCount)}
+                      </span>
+                    </div>
+
+                    <div className="flex flex-wrap gap-2">
+                      {item.url ? (
+                        <a
+                          href={item.url}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="inline-flex items-center gap-1 rounded-full border border-border px-3 py-1 text-xs text-foreground transition-colors hover:border-primary hover:text-primary"
+                        >
+                          <ExternalLink className="h-3.5 w-3.5" />
+                          原视频
+                        </a>
+                      ) : null}
+
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant={canViewResult ? "outline" : "default"}
+                        className="h-7 rounded-full px-3 text-xs"
+                        onClick={() => {
+                          if (canViewResult) {
+                            openViralAnalysisPage();
+                            return;
+                          }
+                          analyzeMutation.mutate({
+                            id: item.id,
+                            projectId: pid,
+                          });
+                        }}
+                        disabled={isBusy || isActive}
+                      >
+                        {isBusy || isActive ? (
+                          <>
+                            <Loader2 className="mr-1 h-3.5 w-3.5 animate-spin" />
+                            处理中
+                          </>
+                        ) : canViewResult ? (
+                          "查看分析"
+                        ) : (
+                          "AI分析"
+                        )}
+                      </Button>
+                    </div>
+                  </CardContent>
+                </Card>
+              );
+            })}
+          </div>
+        )}
+      </div>
+
       {topicsLoading ? (
         <div className="space-y-3">
           {[1, 2, 3].map(i => (
@@ -334,16 +575,14 @@ export default function TopicGeneration({ projectId }: Props) {
       ) : (topics?.length ?? 0) === 0 ? (
         <div className="py-16 text-center text-muted-foreground">
           <Sparkles className="mx-auto mb-3 h-10 w-10 opacity-30" />
-          <p>还没有选题，点击上方按钮生成</p>
+          <p>还没有选题，点击上方按钮生成。</p>
         </div>
       ) : (
-        <>
-          <div className="flex items-center gap-3">
-            <h2 className="text-sm font-medium text-foreground">
-              已生成选题
-            </h2>
+        <div className="space-y-3">
+          <div className="flex flex-wrap items-center gap-3">
+            <h2 className="text-sm font-medium text-foreground">已生成选题</h2>
             <Badge variant="outline">{topics?.length}</Badge>
-            {topicTypeStats.persona > 0 && (
+            {topicTypeStats.persona > 0 ? (
               <Badge
                 variant="outline"
                 className="border-purple-400/30 text-purple-400"
@@ -351,8 +590,8 @@ export default function TopicGeneration({ projectId }: Props) {
                 <Users className="mr-1 h-3 w-3" />
                 人设型 {topicTypeStats.persona}
               </Badge>
-            )}
-            {topicTypeStats.traffic > 0 && (
+            ) : null}
+            {topicTypeStats.traffic > 0 ? (
               <Badge
                 variant="outline"
                 className="border-cyan-400/30 text-cyan-400"
@@ -360,8 +599,8 @@ export default function TopicGeneration({ projectId }: Props) {
                 <TrendingUp className="mr-1 h-3 w-3" />
                 流量型 {topicTypeStats.traffic}
               </Badge>
-            )}
-            {topicTypeStats.marketing > 0 && (
+            ) : null}
+            {topicTypeStats.marketing > 0 ? (
               <Badge
                 variant="outline"
                 className="border-green-400/30 text-green-400"
@@ -369,127 +608,108 @@ export default function TopicGeneration({ projectId }: Props) {
                 <ShoppingBag className="mr-1 h-3 w-3" />
                 营销型 {topicTypeStats.marketing}
               </Badge>
-            )}
+            ) : null}
           </div>
 
-          <div className="space-y-3">
-            {topics?.map(topic => {
-              const typeInfo =
-                TOPIC_TYPE_META[topic.topicType || "traffic"] ??
-                TOPIC_TYPE_META.traffic;
-              const viralInfo =
-                VIRAL_META[topic.viralPotential || "medium"] ??
-                VIRAL_META.medium;
-              const TypeIcon = typeInfo.icon;
-              return (
-                <Card
-                  key={topic.id}
-                  className="border-border bg-card transition-all hover:border-primary/30"
-                >
-                  <CardContent className="p-4">
-                    <div className="flex items-start gap-3">
-                      <div
-                        className={`mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-xl ${typeInfo.bg}`}
-                      >
-                        <TypeIcon className={`h-4 w-4 ${typeInfo.color}`} />
-                      </div>
-                      <div className="min-w-0 flex-1">
-                        <div className="flex items-start justify-between gap-2">
-                          <h3 className="text-sm font-semibold leading-snug text-foreground">
-                            {topic.title}
-                          </h3>
-                          <div className="flex shrink-0 items-center gap-1.5">
-                            <span
-                              className={`rounded-full px-2 py-0.5 text-xs ${viralInfo.color}`}
-                            >
-                              {viralInfo.label}
-                            </span>
-                            <span
-                              className={`rounded-full px-2 py-0.5 text-xs ${typeInfo.bg} ${typeInfo.color}`}
-                            >
-                              {typeInfo.label}
-                            </span>
-                          </div>
-                        </div>
-                        {topic.description && (
-                          <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
-                            {topic.description}
-                          </p>
-                        )}
-                        {topic.rationale && (
-                          <p className="mt-1.5 text-xs italic text-primary/70">
-                            爆款因子：{topic.rationale}
-                          </p>
-                        )}
-                        <div className="mt-3 flex items-center gap-2">
-                          <Select
-                            value={topic.status || "draft"}
-                            onValueChange={v =>
-                              updateMutation.mutate({
-                                id: topic.id,
-                                status: v as
-                                  | "draft"
-                                  | "selected"
-                                  | "in_production"
-                                  | "published",
-                              })
-                            }
+          {topics?.map(topic => {
+            const typeInfo =
+              TOPIC_TYPE_META[topic.topicType || "traffic"] ??
+              TOPIC_TYPE_META.traffic;
+            const viralInfo =
+              VIRAL_META[topic.viralPotential || "medium"] ?? VIRAL_META.medium;
+            const TypeIcon = typeInfo.icon;
+
+            return (
+              <Card
+                key={topic.id}
+                className="border-border bg-card transition-all hover:border-primary/30"
+              >
+                <CardContent className="p-4">
+                  <div className="flex items-start gap-3">
+                    <div
+                      className={`mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-xl ${typeInfo.bg}`}
+                    >
+                      <TypeIcon className={`h-4 w-4 ${typeInfo.color}`} />
+                    </div>
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-start justify-between gap-2">
+                        <h3 className="text-sm font-semibold leading-snug text-foreground">
+                          {topic.title}
+                        </h3>
+                        <div className="flex shrink-0 items-center gap-1.5">
+                          <span
+                            className={`rounded-full px-2 py-0.5 text-xs ${viralInfo.color}`}
                           >
-                            <SelectTrigger className="h-7 w-28 border-border bg-input text-xs text-foreground">
-                              <SelectValue />
-                            </SelectTrigger>
-                            <SelectContent className="border-border bg-popover">
-                              {Object.entries(STATUS_LABELS).map(([v, l]) => (
+                            {viralInfo.label}
+                          </span>
+                          <span
+                            className={`rounded-full px-2 py-0.5 text-xs ${typeInfo.bg} ${typeInfo.color}`}
+                          >
+                            {typeInfo.label}
+                          </span>
+                        </div>
+                      </div>
+                      {topic.description ? (
+                        <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+                          {topic.description}
+                        </p>
+                      ) : null}
+                      {topic.rationale ? (
+                        <p className="mt-1.5 text-xs italic text-primary/70">
+                          爆款因子：{topic.rationale}
+                        </p>
+                      ) : null}
+                      <div className="mt-3 flex items-center gap-2">
+                        <Select
+                          value={topic.status || "draft"}
+                          onValueChange={value =>
+                            updateMutation.mutate({
+                              id: topic.id,
+                              status: value as
+                                | "draft"
+                                | "selected"
+                                | "in_production"
+                                | "published",
+                            })
+                          }
+                        >
+                          <SelectTrigger className="h-7 w-28 border-border bg-input text-xs text-foreground">
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent className="border-border bg-popover">
+                            {Object.entries(STATUS_LABELS).map(
+                              ([value, label]) => (
                                 <SelectItem
-                                  key={v}
-                                  value={v}
+                                  key={value}
+                                  value={value}
                                   className="text-xs text-foreground"
                                 >
-                                  {l}
+                                  {label}
                                 </SelectItem>
-                              ))}
-                            </SelectContent>
-                          </Select>
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            onClick={() =>
-                              deleteMutation.mutate({ id: topic.id })
-                            }
-                            className="h-7 px-2 text-xs text-muted-foreground hover:text-destructive"
-                          >
-                            删除
-                          </Button>
-                        </div>
+                              )
+                            )}
+                          </SelectContent>
+                        </Select>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className="h-7 px-2 text-xs text-destructive hover:text-destructive"
+                          onClick={() =>
+                            deleteMutation.mutate({ id: topic.id })
+                          }
+                          disabled={deleteMutation.isPending}
+                        >
+                          删除
+                        </Button>
                       </div>
                     </div>
-                  </CardContent>
-                </Card>
-              );
-            })}
-          </div>
-        </>
+                  </div>
+                </CardContent>
+              </Card>
+            );
+          })}
+        </div>
       )}
-
-      {/* 爆款分析详情 Dialog */}
-      <Dialog
-        open={!!selectedAnalysis}
-        onOpenChange={open => {
-          if (!open) setSelectedAnalysis(null);
-        }}
-      >
-        <DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-4xl">
-          <DialogHeader>
-            <DialogTitle className="flex items-center gap-2 text-lg">
-              <Sparkles className="h-5 w-5 text-primary" />
-              {selectedAnalysis?.title}
-            </DialogTitle>
-          </DialogHeader>
-          <div className="prose prose-sm prose-invert max-w-none text-sm leading-relaxed text-foreground/90">
-            <Streamdown>{selectedAnalysis?.result || ""}</Streamdown>
-          </div>
-        </DialogContent>
-      </Dialog>
     </div>
   );
 }

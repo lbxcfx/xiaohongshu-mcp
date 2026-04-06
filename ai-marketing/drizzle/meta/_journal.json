@@ -15,6 +15,13 @@
       "when": 1772470388443,
       "tag": "0001_safe_ben_parker",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "5",
+      "when": 1775450122960,
+      "tag": "0002_faulty_vulcan",
+      "breakpoints": true
     }
   ]
 }

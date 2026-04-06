@@ -32,7 +32,9 @@ export const projects = mysqlTable("projects", {
   description: text("description"),
   industry: varchar("industry", { length: 128 }),
   platform: varchar("platform", { length: 128 }),
-  status: mysqlEnum("status", ["active", "archived"]).default("active").notNull(),
+  status: mysqlEnum("status", ["active", "archived"])
+    .default("active")
+    .notNull(),
   createdAt: timestamp("createdAt").defaultNow().notNull(),
   updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
 });
@@ -55,7 +57,9 @@ export const positionings = mysqlTable("positionings", {
   analysisResult: json("analysisResult"),
   positioningRecommendation: text("positioningRecommendation"),
   viralAccountInsights: json("viralAccountInsights"),
-  status: mysqlEnum("status", ["pending", "analyzing", "completed", "failed"]).default("pending").notNull(),
+  status: mysqlEnum("status", ["pending", "analyzing", "completed", "failed"])
+    .default("pending")
+    .notNull(),
   createdAt: timestamp("createdAt").defaultNow().notNull(),
   updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
 });
@@ -68,7 +72,12 @@ export const topicHubItems = mysqlTable("topic_hub_items", {
   id: int("id").autoincrement().primaryKey(),
   projectId: int("projectId").notNull(),
   userId: int("userId").notNull(),
-  type: mysqlEnum("type", ["trending", "viral_post", "high_conversion", "manual"]).notNull(),
+  type: mysqlEnum("type", [
+    "trending",
+    "viral_post",
+    "high_conversion",
+    "manual",
+  ]).notNull(),
   platform: varchar("platform", { length: 64 }),
   title: varchar("title", { length: 512 }).notNull(),
   content: text("content"),
@@ -89,16 +98,45 @@ export const topics = mysqlTable("topics", {
   userId: int("userId").notNull(),
   title: varchar("title", { length: 512 }).notNull(),
   description: text("description"),
-  topicType: mysqlEnum("topicType", ["persona", "traffic", "marketing"]).notNull(),
-  viralPotential: mysqlEnum("viralPotential", ["high", "medium", "low"]).default("medium"),
+  topicType: mysqlEnum("topicType", [
+    "persona",
+    "traffic",
+    "marketing",
+  ]).notNull(),
+  viralPotential: mysqlEnum("viralPotential", [
+    "high",
+    "medium",
+    "low",
+  ]).default("medium"),
   rationale: text("rationale"),
-  status: mysqlEnum("status", ["draft", "selected", "in_production", "published"]).default("draft").notNull(),
+  status: mysqlEnum("status", [
+    "draft",
+    "selected",
+    "in_production",
+    "published",
+  ])
+    .default("draft")
+    .notNull(),
   createdAt: timestamp("createdAt").defaultNow().notNull(),
   updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
 });
 
 export type Topic = typeof topics.$inferSelect;
 export type InsertTopic = typeof topics.$inferInsert;
+
+export const topicPlans = mysqlTable("topic_plans", {
+  id: int("id").autoincrement().primaryKey(),
+  projectId: int("projectId").notNull(),
+  userId: int("userId").notNull(),
+  hubItemId: int("hubItemId").notNull(),
+  title: varchar("title", { length: 512 }).notNull(),
+  rationale: text("rationale"),
+  createdAt: timestamp("createdAt").defaultNow().notNull(),
+  updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
+});
+
+export type TopicPlan = typeof topicPlans.$inferSelect;
+export type InsertTopicPlan = typeof topicPlans.$inferInsert;
 
 // ─── Viral Factor Analyses ────────────────────────────────────────────────────
 export const viralAnalyses = mysqlTable("viral_analyses", {
@@ -122,7 +160,9 @@ export const viralAnalyses = mysqlTable("viral_analyses", {
   viralFormula: text("viralFormula"),
   conversionFormula: text("conversionFormula"),
   fullAnalysis: json("fullAnalysis"),
-  status: mysqlEnum("status", ["pending", "analyzing", "completed", "failed"]).default("pending").notNull(),
+  status: mysqlEnum("status", ["pending", "analyzing", "completed", "failed"])
+    .default("pending")
+    .notNull(),
   createdAt: timestamp("createdAt").defaultNow().notNull(),
   updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
 });
@@ -136,16 +176,24 @@ export const scripts = mysqlTable("scripts", {
   projectId: int("projectId").notNull(),
   userId: int("userId").notNull(),
   topicId: int("topicId"),
+  topicPlanId: int("topicPlanId"),
   analysisId: int("analysisId"),
+  hubItemId: int("hubItemId"),
   title: varchar("title", { length: 512 }).notNull(),
-  hookType: mysqlEnum("hookType", ["camp_split", "anti_cognition", "curiosity"]),
+  hookType: mysqlEnum("hookType", [
+    "camp_split",
+    "anti_cognition",
+    "curiosity",
+  ]),
   hookContent: text("hookContent"),
   mainContent: text("mainContent"),
   endingContent: text("endingContent"),
   fullScript: text("fullScript"),
   platform: varchar("platform", { length: 64 }),
   duration: int("duration"),
-  status: mysqlEnum("status", ["draft", "review", "approved", "produced"]).default("draft").notNull(),
+  status: mysqlEnum("status", ["draft", "review", "approved", "produced"])
+    .default("draft")
+    .notNull(),
   createdAt: timestamp("createdAt").defaultNow().notNull(),
   updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
 });
@@ -159,7 +207,12 @@ export const materials = mysqlTable("materials", {
   projectId: int("projectId").notNull(),
   userId: int("userId").notNull(),
   scriptId: int("scriptId"),
-  type: mysqlEnum("type", ["real_person", "digital_avatar", "before_after", "other"]).notNull(),
+  type: mysqlEnum("type", [
+    "real_person",
+    "digital_avatar",
+    "before_after",
+    "other",
+  ]).notNull(),
   title: varchar("title", { length: 255 }).notNull(),
   fileUrl: text("fileUrl"),
   thumbnailUrl: text("thumbnailUrl"),
@@ -167,7 +220,12 @@ export const materials = mysqlTable("materials", {
   bodyPart: varchar("bodyPart", { length: 128 }),
   treatmentType: varchar("treatmentType", { length: 128 }),
   style: varchar("style", { length: 128 }),
-  status: mysqlEnum("status", ["uploading", "processing", "ready", "failed"]).default("uploading").notNull(),
+  status: mysqlEnum("status", ["uploading", "processing", "ready", "failed"])
+    .default("uploading")
+    .notNull(),
+  seedanceTaskId: varchar("seedanceTaskId", { length: 128 }),
+  referenceImageUrl: text("referenceImageUrl"),
+  prompt: text("prompt"),
   createdAt: timestamp("createdAt").defaultNow().notNull(),
   updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
 });
@@ -181,7 +239,13 @@ export const platformAdaptations = mysqlTable("platform_adaptations", {
   projectId: int("projectId").notNull(),
   userId: int("userId").notNull(),
   scriptId: int("scriptId").notNull(),
-  platform: mysqlEnum("platform", ["xiaohongshu", "douyin", "instagram", "tiktok", "youtube"]).notNull(),
+  platform: mysqlEnum("platform", [
+    "xiaohongshu",
+    "douyin",
+    "instagram",
+    "tiktok",
+    "youtube",
+  ]).notNull(),
   title: text("title"),
   caption: text("caption"),
   hashtags: json("hashtags"),
@@ -195,6 +259,31 @@ export type PlatformAdaptation = typeof platformAdaptations.$inferSelect;
 export type InsertPlatformAdaptation = typeof platformAdaptations.$inferInsert;
 
 // ─── Usage Stats ──────────────────────────────────────────────────────────────
+export const materialPublications = mysqlTable("material_publications", {
+  id: int("id").autoincrement().primaryKey(),
+  projectId: int("projectId").notNull(),
+  userId: int("userId").notNull(),
+  materialId: int("materialId").notNull(),
+  scriptId: int("scriptId"),
+  platform: mysqlEnum("platform", ["xiaohongshu"]).notNull(),
+  status: mysqlEnum("status", ["draft", "publishing", "published", "failed"])
+    .default("draft")
+    .notNull(),
+  title: text("title"),
+  content: text("content"),
+  tags: json("tags"),
+  visibility: varchar("visibility", { length: 32 }),
+  postId: varchar("postId", { length: 128 }),
+  errorMessage: text("errorMessage"),
+  publishedAt: timestamp("publishedAt"),
+  createdAt: timestamp("createdAt").defaultNow().notNull(),
+  updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
+});
+
+export type MaterialPublication = typeof materialPublications.$inferSelect;
+export type InsertMaterialPublication =
+  typeof materialPublications.$inferInsert;
+
 export const usageStats = mysqlTable("usage_stats", {
   id: int("id").autoincrement().primaryKey(),
   userId: int("userId").notNull(),

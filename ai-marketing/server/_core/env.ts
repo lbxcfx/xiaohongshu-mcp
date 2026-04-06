@@ -8,6 +8,9 @@ export const ENV = {
   isProduction: process.env.NODE_ENV === "production",
   forgeApiUrl: process.env.BUILT_IN_FORGE_API_URL ?? "",
   forgeApiKey: process.env.BUILT_IN_FORGE_API_KEY ?? "",
+  forgeRequestTimeoutMs: Number(
+    process.env.FORGE_REQUEST_TIMEOUT_MS ?? "600000"
+  ),
   arkBaseUrl:
     process.env.ARK_BASE_URL ?? "https://ark.cn-beijing.volces.com/api/v3",
   arkApiKey: process.env.ARK_API_KEY ?? "",
