@@ -33,6 +33,7 @@ type TopicHubTagMeta = {
   duration?: number;
   videoAnalysisStatus?: "pending" | "analyzing" | "completed" | "failed";
   videoAnalysisResult?: string;
+  topicGenerationExcluded?: boolean;
   [key: string]: unknown;
 };
 
@@ -97,6 +98,7 @@ export default function TopicPlanning({ projectId }: Props) {
       .filter(item => {
         const tags = (item.tags ?? {}) as TopicHubTagMeta;
         return (
+          !tags.topicGenerationExcluded &&
           tags.videoAnalysisStatus === "completed" &&
           typeof tags.videoAnalysisResult === "string" &&
           String(tags.videoAnalysisResult || "").trim().length > 0

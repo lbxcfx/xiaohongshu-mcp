@@ -6,7 +6,6 @@ import path from "node:path";
 import { mkdirSync } from "node:fs";
 import multer from "multer";
 import { createExpressMiddleware } from "@trpc/server/adapters/express";
-import { registerOAuthRoutes } from "./oauth";
 import { appRouter, ensureTopicHubVideoPipelineStarted } from "../routers";
 import { createContext } from "./context";
 import { serveStatic, setupVite } from "./vite";
@@ -87,8 +86,6 @@ async function startServer() {
     res.json({ success: true, url });
   });
 
-  // OAuth callback under /api/oauth/callback
-  registerOAuthRoutes(app);
   app.get("/api/xhs/login/qrcode", async (_req, res) => {
     try {
       const data = await getXhsLoginQrcode();

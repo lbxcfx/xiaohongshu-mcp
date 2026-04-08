@@ -34,6 +34,7 @@ type TopicHubTagMeta = {
   videoAnalysisQueuedAt?: string;
   videoAnalysisStartedAt?: string;
   videoAnalysisFinishedAt?: string;
+  topicGenerationExcluded?: boolean;
 };
 
 function toLocalAssetUrl(filePath?: string) {
@@ -115,7 +116,7 @@ export default function ViralAnalysis({ projectId }: Props) {
       .filter(item => item.platform === "xiaohongshu")
       .filter(item => {
         const meta = (item.tags ?? {}) as TopicHubTagMeta;
-        return hasRequestedAnalysis(meta);
+        return !meta.topicGenerationExcluded && hasRequestedAnalysis(meta);
       })
       .sort((a, b) => b.id - a.id);
   }, [items]);

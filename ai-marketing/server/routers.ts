@@ -279,6 +279,56 @@ function normalizeXhsTags(value: unknown): string[] {
     .slice(0, 10);
 }
 
+function hasRequestedTopicHubVideoAnalysis(tags: Record<string, unknown>) {
+  const downloadStatus = String(tags.videoDownloadStatus || "");
+  const analysisStatus = String(tags.videoAnalysisStatus || "");
+
+  return Boolean(
+    tags.videoDownloadQueuedAt ||
+      tags.videoAnalysisQueuedAt ||
+      tags.videoAnalysisStartedAt ||
+      tags.videoAnalysisFinishedAt ||
+      (downloadStatus && downloadStatus !== "idle") ||
+      analysisStatus
+  );
+}
+
+function isTopicGenerationExcluded(tags: Record<string, unknown>) {
+  return tags.topicGenerationExcluded === true;
+}
+
+function extractMatchedTopicHubVideoIds(value: Record<string, unknown>) {
+  const ids = new Set<number>();
+
+  const collectId = (candidate: unknown) => {
+    const id = Number(candidate);
+    if (Number.isFinite(id)) ids.add(id);
+  };
+
+  const collectItems = (items: unknown) => {
+    if (!Array.isArray(items)) return;
+    items.forEach(item => {
+      if (typeof item !== "object" || item === null) return;
+      collectId((item as Record<string, unknown>).id);
+    });
+  };
+
+  if (Array.isArray(value.matchedIds)) {
+    value.matchedIds.forEach(collectId);
+  }
+  if (Array.isArray(value.selectedIds)) {
+    value.selectedIds.forEach(collectId);
+  }
+  if (Array.isArray(value.videoIds)) {
+    value.videoIds.forEach(collectId);
+  }
+  collectItems(value.videos);
+  collectItems(value.selectedVideos);
+  collectItems(value.filteredVideos);
+
+  return ids;
+}
+
 async function ensureXhsDraftForScript(params: {
   projectId: number;
   materialId: number;
@@ -708,6 +758,7 @@ async function generateTopicPlansForProject(projectId: number) {
     .filter(item => {
       const tags = (item.tags ?? {}) as Record<string, unknown>;
       return (
+        !isTopicGenerationExcluded(tags) &&
         tags.videoAnalysisStatus === "completed" &&
         typeof tags.videoAnalysisResult === "string" &&
         String(tags.videoAnalysisResult || "").trim().length > 0
@@ -3229,23 +3280,60 @@ ${input.checklist ? `关键词清单：${input.checklist}` : ""}
           return [];
         }
 
-        const candidateVideos = hubItems
-          .filter(item => item.platform === "xiaohongshu")
-          .map(item => {
-            const tags = (item.tags ?? {}) as Record<string, unknown>;
-            return {
-              id: item.id,
-              title: item.title,
-              authorName: String(tags.authorName || ""),
-              likedCount: Number(tags.likedCount || 0),
-            };
-          });
+        const videoItems = hubItems.filter(item => {
+          const tags = (item.tags ?? {}) as Record<string, unknown>;
+          return (
+            item.platform === "xiaohongshu" && !isTopicGenerationExcluded(tags)
+          );
+        });
+        const requestedVideos = videoItems.filter(item =>
+          hasRequestedTopicHubVideoAnalysis(
+            (item.tags ?? {}) as Record<string, unknown>
+          )
+        );
+        const requestedVideoIds = new Set(requestedVideos.map(item => item.id));
+        const candidateSource =
+          requestedVideos.length > 0
+            ? videoItems.filter(item => !requestedVideoIds.has(item.id))
+            : videoItems;
+        const candidateVideos = candidateSource.map(item => {
+          const tags = (item.tags ?? {}) as Record<string, unknown>;
+          return {
+            id: item.id,
+            title: item.title,
+            authorName: String(tags.authorName || ""),
+            likedCount: Number(tags.likedCount || 0),
+          };
+        });
 
         if (candidateVideos.length === 0) {
-          return [];
+          return requestedVideos
+            .map(item => ({
+              ...item,
+              matchedReason: "已手动加入 AI 分析",
+              matchSource: "manual" as const,
+            }))
+            .sort((a, b) => {
+              const aTags = (a.tags ?? {}) as Record<string, unknown>;
+              const bTags = (b.tags ?? {}) as Record<string, unknown>;
+              return (
+                Number(bTags.likedCount || 0) - Number(aTags.likedCount || 0)
+              );
+            });
         }
 
-        const prompt = `你是医美短视频选题分析助手。请根据“账号定位内容”，判断下面哪些视频标题与该账号定位高度相关。
+        const prompt = `你是专业的To B企业级AI内容选题匹配专家，需严格按照既定筛选标准，结合【账号定位】输出的完整账号定位结果，对【选题中台】抓取的爆款视频题目进行精准筛选，剔除不合适视频，仅保留适配账号的优质视频。
+
+内置筛选标准为，账号定位内容与视频题目进行匹配，符合下面标准：
+
+1. 核心匹配度：视频所属行业、垂类、核心受众，必须与账号定位的业务领域、目标客户群体完全契合，无偏差
+2. 调性适配性：视频内容风格、表达形式、价值导向，完全符合账号定位的人设、内容调性与品牌定位
+3. 合规实用性：剔除低俗、泛娱乐、敏感争议、无商业价值、无法落地拍摄、与账号业务无关的选题
+4. 长期价值：优先保留能解决目标客户痛点、传递专业价值、贴合企业营销目标，可持续产出的选题
+
+输出要求
+
+仅输出筛选后的视频。
 
 账号定位内容：
 ${completedPositioning.positioningRecommendation}
@@ -3258,11 +3346,9 @@ ${candidateVideos
   )
   .join("\n")}
 
-判断规则：
-1. 只依据账号定位与视频标题语义相关性判断。
-2. 与定位方向、目标人群、内容赛道明显相关的，才选中。
-3. 不确定时宁可不选。
-4. 返回的 id 必须来自给定列表。
+${requestedVideos.length > 0 ? "说明：用户已经在选题中台手动点击 AI分析 的视频已直接保留，本次只筛选上述剩余候选视频。" : "说明：用户尚未在选题中台手动点击任何 AI分析，本次需要从上述全部候选视频中筛选。"}
+
+返回的 id 必须来自候选视频标题列表。
 
 请严格返回 JSON：
 {
@@ -3272,47 +3358,36 @@ ${candidateVideos
   ]
 }`;
 
-        const response = await invokeLLM({
-          messages: [
-            {
-              role: "system",
-              content:
-                "你擅长医美账号定位与短视频选题相关性判断。只返回合法 JSON，不要输出多余文本。",
-            },
-            { role: "user", content: prompt },
-          ],
-          response_format: { type: "json_object" },
+        const response = await generateTextWithArk({
+          systemPrompt:
+            "你是专业的To B企业级AI内容选题匹配专家。请只返回合法 JSON，不要输出多余文本。",
+          prompt,
         });
 
-        const raw = String(response.choices[0]?.message?.content || "{}");
-        let parsed: {
-          matchedIds?: number[];
-          reasons?: Array<{ id: number; reason: string }>;
-        } = {};
+        const raw = response.text;
+        const parsed = extractJsonObject(raw);
 
-        try {
-          parsed = JSON.parse(raw);
-        } catch {
-          parsed = {};
-        }
-
-        const matchedIds = new Set(
-          (parsed.matchedIds || [])
-            .map(value => Number(value))
-            .filter(value => Number.isFinite(value))
-        );
+        const matchedIds = extractMatchedTopicHubVideoIds(parsed);
         const reasonMap = new Map(
-          (parsed.reasons || [])
+          (Array.isArray(parsed.reasons) ? parsed.reasons : [])
             .map(item => [Number(item.id), String(item.reason || "")] as const)
             .filter(([id]) => Number.isFinite(id))
         );
+        const selectedCandidateVideos = candidateSource.filter(item =>
+          matchedIds.has(item.id)
+        );
 
-        return hubItems
-          .filter(item => matchedIds.has(item.id))
-          .map(item => ({
-            ...item,
-            matchedReason: reasonMap.get(item.id) || "",
-          }))
+        return [...requestedVideos, ...selectedCandidateVideos]
+          .map(item => {
+            const isManual = requestedVideoIds.has(item.id);
+            return {
+              ...item,
+              matchedReason: isManual
+                ? "已手动加入 AI 分析"
+                : reasonMap.get(item.id) || "",
+              matchSource: isManual ? ("manual" as const) : ("ai" as const),
+            };
+          })
           .sort((a, b) => {
             const aTags = (a.tags ?? {}) as Record<string, unknown>;
             const bTags = (b.tags ?? {}) as Record<string, unknown>;
@@ -3335,74 +3410,85 @@ ${candidateVideos
           p => p.status === "completed" && p.positioningRecommendation
         );
         const positioningBlock = completedPositioning
-          ? `## ?????????
+          ? `## 账号定位分析
 
 ${completedPositioning.positioningRecommendation}
 `
           : "";
 
         type HubTags = Record<string, unknown>;
-        const analyzedVideos = hubItems.filter(item => {
+        const sourceVideos = hubItems.filter(item => {
           const tags = (item.tags ?? {}) as HubTags;
+          if (item.platform !== "xiaohongshu") return false;
+          if (isTopicGenerationExcluded(tags)) return false;
           return (
             tags.videoAnalysisStatus === "completed" &&
-            typeof tags.videoAnalysisResult === "string"
+            typeof tags.videoAnalysisResult === "string" &&
+            String(tags.videoAnalysisResult || "").trim().length > 0
           );
         });
 
-        let viralAnalysisBlock = "";
-        if (analyzedVideos.length > 0) {
-          const sections = analyzedVideos.map((item, i) => {
+        let sourceVideoBlock = "";
+        if (sourceVideos.length > 0) {
+          const sections = sourceVideos.map((item, i) => {
             const tags = (item.tags ?? {}) as HubTags;
-            return `### ?????? ${i + 1}: ${item.title}
-${String(tags.videoAnalysisResult)}`;
+            const analysis = String(tags.videoAnalysisResult || "").trim();
+            return [
+              `### 视频 ${i + 1}: ${item.title}`,
+              analysis
+                ? `爆款因子分析：\n${analysis}`
+                : "爆款因子分析：暂无，按标题和账号定位判断。",
+            ].join("\n");
           });
-          viralAnalysisBlock = `## 鐖嗘瑙嗛鍥犲瓙鍒嗘瀽锛堝叡${analyzedVideos.length}鏉★級\n\n${sections.join("\n\n---\n\n")}\n`;
+          sourceVideoBlock = `## 筛选后的视频（共${sourceVideos.length}条）\n\n${sections.join("\n\n---\n\n")}\n`;
         }
 
-        if (!positioningBlock && !viralAnalysisBlock) {
-          throw new Error("??????????????????????????????????????????????");
+        if (!completedPositioning?.positioningRecommendation) {
+          throw new Error("请先完成账号定位，再生成选题");
+        }
+        if (!sourceVideoBlock) {
+          throw new Error("请先在选题生成页保留至少一个适配视频后再生成选题");
         }
 
         await deleteTopicsByProject(GUEST_USER_ID, input.projectId);
 
-        const prompt = `?????????????????????????????????????????????????????????????????????????????
+        const prompt = `你是一位顶级的医美短视频选题策划师，擅长基于账号定位和筛选后的视频题目/爆款因子分析，生成可直接执行的高爆款潜质选题。
 ${positioningBlock}
-${viralAnalysisBlock}
+${sourceVideoBlock}
 
-## ?????????
+## 选题生成要求
 
-??????????????????????????????????????10 ???????????????????????
-??????????????1. **??????**????????????????????????????????2. **??????**??ersona????????????????? traffic????????????????? marketing????????????????3. **??????**???????????????????????????????4. **?????????**??igh / medium / low
-5. **??????**?????????????????????????????????????????????????????????
+请基于以上账号定位信息和筛选后的视频，生成 10 个高爆款潜质的短视频选题方案。
 
-??????????????? 3 ??+ ?????4 ??+ ?????3 ??
-??SON????????{
+每个选题必须满足：
+1. **选题标题**：直接可用的视频标题，具备钩子感和点击欲望
+2. **选题类型**：persona（人设型，建立信任感）/ traffic（流量型，泛流量干货）/ marketing（营销型，引导转化）
+3. **内容方向**：具体的拍摄思路、脚本结构、核心话术方向
+4. **爆款潜力评级**：high / medium / low
+5. **选题理由**：说明参考了哪些筛选视频、账号定位和爆款因子，为什么有爆款潜质
+
+选题分配建议：人设型 3 条 + 流量型 4 条 + 营销型 3 条
+
+以 JSON 格式返回：
+{
   "topics": [
     {
-      "title": "??????",
-      "description": "??????????????",
+      "title": "选题标题",
+      "description": "内容方向与拍摄思路",
       "topicType": "persona|traffic|marketing",
       "viralPotential": "high|medium|low",
-      "rationale": "????????????"
+      "rationale": "账号定位与筛选视频的应用分析"
     }
   ]
 }`;
 
-        const response = await invokeLLM({
-          messages: [
-            {
-              role: "system",
-              content:
-                "???????????????????????????????????????????????????????????????????SON????????;",
-            },
-            { role: "user", content: prompt },
-          ],
-          response_format: { type: "json_object" },
+        const response = await generateTextWithArk({
+          systemPrompt:
+            "你是专业的医美短视频选题策划师，擅长从账号定位和筛选视频中提取可复制公式并生成新选题。请只返回合法 JSON，不要输出多余文本。",
+          prompt,
         });
 
-        const content = String(response.choices[0]?.message?.content || "{}");
-        let parsed: {
+        const parsed = extractJsonObject(response.text) as {
           topics?: Array<{
             title: string;
             description: string;
@@ -3410,12 +3496,7 @@ ${viralAnalysisBlock}
             viralPotential: "high" | "medium" | "low";
             rationale: string;
           }>;
-        } = {};
-        try {
-          parsed = JSON.parse(content);
-        } catch {
-          parsed = { topics: [] };
-        }
+        };
 
         const savedTopics = [];
         for (const topic of (parsed.topics || []).slice(0, 10)) {
@@ -3431,6 +3512,102 @@ ${viralAnalysisBlock}
         }
         return { topics: savedTopics };
       }),
+    startViralAnalysis: publicProcedure
+      .input(
+        z.object({
+          projectId: z.number(),
+          videoIds: z.array(z.number()).min(1),
+        })
+      )
+      .mutation(async ({ input }) => {
+        const videoIds = new Set(input.videoIds);
+        const items = await getTopicHubItems(GUEST_USER_ID, input.projectId);
+        const sourceVideos = items.filter(item => {
+          const tags = (item.tags ?? {}) as Record<string, unknown>;
+          return (
+            videoIds.has(item.id) &&
+            item.platform === "xiaohongshu" &&
+            !isTopicGenerationExcluded(tags)
+          );
+        });
+
+        if (sourceVideos.length === 0) {
+          throw new Error("没有可提交到爆款分析的视频");
+        }
+
+        let queuedCount = 0;
+        let skippedCount = 0;
+        const errors: string[] = [];
+
+        for (const item of sourceVideos) {
+          const tags = (item.tags ?? {}) as Record<string, unknown>;
+          const filePath = String(tags.videoDownloadPath || "");
+          const noteId = String(tags.noteId || "");
+          const noteUrl = String(item.url || "");
+          const analysisStatus = String(tags.videoAnalysisStatus || "");
+          const downloadStatus = String(tags.videoDownloadStatus || "");
+
+          if (
+            downloadStatus === "pending" ||
+            analysisStatus === "pending" ||
+            analysisStatus === "analyzing" ||
+            analysisStatus === "completed"
+          ) {
+            skippedCount += 1;
+            continue;
+          }
+
+          if (!filePath && (!noteId || !noteUrl)) {
+            errors.push(`视频《${item.title}》缺少链接信息，无法触发分析`);
+            continue;
+          }
+
+          const now = new Date().toISOString();
+          await updateTopicHubItemTags(GUEST_USER_ID, {
+            id: item.id,
+            tags: {
+              ...tags,
+              videoDownloadStatus: filePath ? "success" : "pending",
+              videoDownloadAttempts: filePath
+                ? Number(tags.videoDownloadAttempts ?? 0)
+                : downloadStatus === "failed"
+                  ? Number(tags.videoDownloadAttempts ?? 0)
+                  : 0,
+              videoDownloadError: undefined,
+              videoDownloadQueuedAt: filePath
+                ? tags.videoDownloadQueuedAt
+                : now,
+              videoDownloadStartedAt: filePath
+                ? tags.videoDownloadStartedAt
+                : undefined,
+              videoDownloadFinishedAt: filePath
+                ? tags.videoDownloadFinishedAt
+                : undefined,
+              videoAnalysisStatus: filePath ? "pending" : undefined,
+              videoAnalysisError: undefined,
+              videoAnalysisResult: undefined,
+              videoAnalysisFileId: undefined,
+              videoAnalysisQueuedAt: filePath ? now : undefined,
+              videoAnalysisStartedAt: undefined,
+              videoAnalysisFinishedAt: undefined,
+            },
+          });
+          queuedCount += 1;
+        }
+
+        void pumpTopicHubVideoPipeline();
+
+        if (queuedCount === 0 && skippedCount === 0 && errors.length > 0) {
+          throw new Error(errors[0]);
+        }
+
+        return {
+          queuedCount,
+          skippedCount,
+          failedCount: errors.length,
+          errors,
+        };
+      }),
     update: publicProcedure
       .input(
         z.object({
@@ -3445,6 +3622,25 @@ ${viralAnalysisBlock}
     delete: publicProcedure
       .input(z.object({ id: z.number() }))
       .mutation(({ input }) => deleteTopic(GUEST_USER_ID, input.id)),
+    excludeRelatedVideo: publicProcedure
+      .input(z.object({ projectId: z.number(), id: z.number() }))
+      .mutation(async ({ input }) => {
+        const items = await getTopicHubItems(GUEST_USER_ID, input.projectId);
+        const item = items.find(video => video.id === input.id);
+        if (!item) throw new Error("未找到该视频");
+
+        const tags = (item.tags ?? {}) as Record<string, unknown>;
+        await updateTopicHubItemTags(GUEST_USER_ID, {
+          id: item.id,
+          tags: {
+            ...tags,
+            topicGenerationExcluded: true,
+            topicGenerationExcludedAt: new Date().toISOString(),
+          },
+        });
+
+        return { success: true } as const;
+      }),
   }),
 
   // ?????? Viral Analysis ────────────────────────────────────────────────────────

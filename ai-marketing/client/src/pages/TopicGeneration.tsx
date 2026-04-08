@@ -47,11 +47,16 @@ type TopicHubTagMeta = {
   duration?: number;
   videoDownloadStatus?: "idle" | "pending" | "success" | "failed" | "skipped";
   videoAnalysisStatus?: "pending" | "analyzing" | "completed" | "failed";
+  topicGenerationExcluded?: boolean;
   [key: string]: unknown;
 };
 
 type RouterOutputs = inferRouterOutputs<AppRouter>;
 type RelatedVideoItem = RouterOutputs["topics"]["relatedVideos"][number];
+type FilteredVideoItem = RelatedVideoItem & {
+  matchedReason?: string;
+  matchSource?: "manual" | "ai";
+};
 
 const TOPIC_TYPE_META: Record<
   string,
@@ -131,6 +136,8 @@ export default function TopicGeneration({
 
   const [expandedPositioning, setExpandedPositioning] = useState(false);
   const [pollingEnabled, setPollingEnabled] = useState(false);
+  const [hasRequestedRelatedMatch, setHasRequestedRelatedMatch] =
+    useState(false);
 
   const { data: positionings } = trpc.positioning.list.useQuery({
     projectId: pid,
@@ -139,18 +146,38 @@ export default function TopicGeneration({
     { projectId: pid },
     { refetchInterval: pollingEnabled ? 5000 : false }
   );
-  const { data: relatedVideos, isLoading: relatedVideosLoading } =
-    trpc.topics.relatedVideos.useQuery({ projectId: pid });
+  const {
+    data: relatedVideos,
+    isFetching: relatedVideosLoading,
+    refetch: refetchRelatedVideos,
+  } = trpc.topics.relatedVideos.useQuery(
+    { projectId: pid },
+    { enabled: false, retry: false }
+  );
   const { data: topics, isLoading: topicsLoading } = trpc.topics.list.useQuery({
     projectId: pid,
   });
 
-  const generateMutation = trpc.topics.generate.useMutation({
+  const startViralAnalysisMutation = trpc.topics.startViralAnalysis.useMutation(
+    {
+      onSuccess: async () => {
+        await utils.topicHub.list.invalidate({ projectId: pid });
+        toast.success("已加入爆款分析队列");
+        window.location.assign(`/projects/${pid}/viral-analysis`);
+      },
+      onError: error => toast.error(error.message || "加入爆款分析失败"),
+    }
+  );
+
+  const excludeVideoMutation = trpc.topics.excludeRelatedVideo.useMutation({
     onSuccess: async () => {
-      await utils.topics.list.invalidate({ projectId: pid });
-      toast.success("已生成 10 条选题");
+      await Promise.all([
+        utils.topics.relatedVideos.invalidate({ projectId: pid }),
+        utils.topicHub.list.invalidate({ projectId: pid }),
+      ]);
+      toast.success("已从选题生成中移除");
     },
-    onError: error => toast.error(error.message || "选题生成失败"),
+    onError: error => toast.error(error.message || "移除失败"),
   });
 
   const updateMutation = trpc.topics.update.useMutation({
@@ -164,20 +191,6 @@ export default function TopicGeneration({
     },
   });
 
-  const analyzeMutation = trpc.topicHub.requestVideoAnalysis.useMutation({
-    onSuccess: async () => {
-      await Promise.all([
-        utils.topicHub.list.invalidate({ projectId: pid }),
-        utils.topics.relatedVideos.invalidate({ projectId: pid }),
-      ]);
-      toast.success("已加入下载和 AI 分析队列");
-      setPollingEnabled(true);
-    },
-    onError: error => {
-      toast.error(error.message || "AI 分析触发失败");
-    },
-  });
-
   const completedPositioning = useMemo(
     () =>
       positionings?.find(
@@ -185,6 +198,22 @@ export default function TopicGeneration({
       ) ?? null,
     [positionings]
   );
+
+  async function handleMatchRelatedVideos() {
+    if (!completedPositioning) {
+      toast.error("请先完成账号定位");
+      return;
+    }
+
+    setHasRequestedRelatedMatch(true);
+    const result = await refetchRelatedVideos();
+    if (result.error) {
+      toast.error(result.error.message || "视频匹配失败");
+      return;
+    }
+
+    toast.success(`已筛选出 ${result.data?.length ?? 0} 条视频`);
+  }
 
   const filteredVideos = useMemo(() => {
     const latestHubItemMap = new Map(
@@ -197,7 +226,12 @@ export default function TopicGeneration({
         return {
           ...(latest ?? item),
           matchedReason: item.matchedReason || "",
-        } as RelatedVideoItem & { matchedReason?: string };
+          matchSource: item.matchSource,
+        } as FilteredVideoItem;
+      })
+      .filter(item => {
+        const meta = (item.tags ?? {}) as TopicHubTagMeta;
+        return !meta.topicGenerationExcluded;
       })
       .sort(
         (a, b) =>
@@ -221,9 +255,13 @@ export default function TopicGeneration({
   const stats = useMemo(() => {
     let analyzed = 0;
     let processing = 0;
+    let manual = 0;
+    let ai = 0;
     for (const item of filteredVideos) {
       const meta = (item.tags ?? {}) as TopicHubTagMeta;
       if (meta.videoAnalysisStatus === "completed") analyzed++;
+      if (item.matchSource === "manual") manual++;
+      if (item.matchSource === "ai") ai++;
       if (
         meta.videoDownloadStatus === "pending" ||
         meta.videoAnalysisStatus === "pending" ||
@@ -232,7 +270,7 @@ export default function TopicGeneration({
         processing++;
       }
     }
-    return { total: filteredVideos.length, analyzed, processing };
+    return { total: filteredVideos.length, analyzed, processing, manual, ai };
   }, [filteredVideos]);
 
   const topicTypeStats = useMemo(() => {
@@ -244,10 +282,6 @@ export default function TopicGeneration({
     }
     return summary;
   }, [topics]);
-
-  function openViralAnalysisPage() {
-    window.location.assign(`/projects/${pid}/viral-analysis`);
-  }
 
   return (
     <div className="space-y-6">
@@ -343,9 +377,14 @@ export default function TopicGeneration({
           </CardHeader>
           <CardContent className="space-y-3 text-xs text-muted-foreground">
             <p>来源：选题中台已经搜索出来的视频。</p>
-            <p>筛选方式：Ark 大模型对视频标题与账号定位内容做相关性判断。</p>
+            <p>
+              筛选方式：手动点击过 AI分析 的视频直接保留，其余视频由 Ark
+              大模型根据账号定位和标题筛选。
+            </p>
             <div className="flex flex-wrap gap-2">
               <Badge variant="secondary">按点赞量排序</Badge>
+              <Badge variant="secondary">手动分析 {stats.manual}</Badge>
+              <Badge variant="secondary">AI筛选 {stats.ai}</Badge>
               <Badge variant="secondary">已分析 {stats.analyzed}</Badge>
               <Badge variant="secondary">处理中 {stats.processing}</Badge>
             </div>
@@ -358,26 +397,53 @@ export default function TopicGeneration({
           <div className="space-y-1">
             <p className="text-sm font-medium text-foreground">AI 选题生成</p>
             <p className="text-xs text-muted-foreground">
-              相关视频用于人工判断和参考，选题生成入口保持不变。
+              点击后先匹配账号定位与视频题目；确认保留结果后，再提交到爆款分析。
             </p>
           </div>
-          <Button
-            onClick={() => generateMutation.mutate({ projectId: pid })}
-            disabled={!completedPositioning || generateMutation.isPending}
-            className="glow-purple h-10 px-6"
-          >
-            {generateMutation.isPending ? (
-              <>
-                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                生成中...
-              </>
-            ) : (
-              <>
-                <Sparkles className="mr-2 h-4 w-4" />
-                AI 生成选题
-              </>
-            )}
-          </Button>
+          <div className="flex flex-wrap gap-2">
+            <Button
+              onClick={() => {
+                void handleMatchRelatedVideos();
+              }}
+              disabled={!completedPositioning || relatedVideosLoading}
+              className="glow-purple h-10 px-6"
+            >
+              {relatedVideosLoading ? (
+                <>
+                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                  匹配中...
+                </>
+              ) : (
+                <>
+                  <Sparkles className="mr-2 h-4 w-4" />
+                  AI 生成选题
+                </>
+              )}
+            </Button>
+            <Button
+              variant="outline"
+              onClick={() =>
+                startViralAnalysisMutation.mutate({
+                  projectId: pid,
+                  videoIds: filteredVideos.map(item => item.id),
+                })
+              }
+              disabled={
+                filteredVideos.length === 0 ||
+                startViralAnalysisMutation.isPending
+              }
+              className="h-10 px-6"
+            >
+              {startViralAnalysisMutation.isPending ? (
+                <>
+                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                  提交中...
+                </>
+              ) : (
+                "提交爆款分析"
+              )}
+            </Button>
+          </div>
         </CardContent>
       </Card>
 
@@ -404,6 +470,12 @@ export default function TopicGeneration({
               请先完成账号定位。
             </CardContent>
           </Card>
+        ) : !hasRequestedRelatedMatch ? (
+          <Card className="border-border bg-card">
+            <CardContent className="py-16 text-center text-sm text-muted-foreground">
+              点击上方 AI 生成选题，先进行账号定位与视频题目匹配。
+            </CardContent>
+          </Card>
         ) : filteredVideos.length === 0 ? (
           <Card className="border-border bg-card">
             <CardContent className="py-16 text-center text-sm text-muted-foreground">
@@ -417,16 +489,13 @@ export default function TopicGeneration({
               const localCover = toLocalAssetUrl(meta.coverDownloadPath);
               const cover = localCover || meta.coverUrl;
               const duration = formatDuration(meta.duration);
-              const isBusy =
-                analyzeMutation.isPending &&
-                analyzeMutation.variables?.id === item.id;
               const isActive =
                 meta.videoDownloadStatus === "pending" ||
                 meta.videoAnalysisStatus === "pending" ||
                 meta.videoAnalysisStatus === "analyzing";
-              const canViewResult =
-                meta.videoAnalysisStatus === "completed" ||
-                meta.videoAnalysisStatus === "failed";
+              const isRemoving =
+                excludeVideoMutation.isPending &&
+                excludeVideoMutation.variables?.id === item.id;
 
               return (
                 <Card
@@ -474,9 +543,26 @@ export default function TopicGeneration({
 
                   <CardContent className="space-y-3 p-4">
                     <div className="flex items-center justify-between gap-2">
-                      <Badge variant="secondary">
-                        {meta.sourceLabel || "小红书"}
-                      </Badge>
+                      <div className="flex flex-wrap gap-1.5">
+                        <Badge variant="secondary">
+                          {meta.sourceLabel || "小红书"}
+                        </Badge>
+                        {item.matchSource === "manual" ? (
+                          <Badge
+                            variant="outline"
+                            className="border-emerald-500/30 text-emerald-400"
+                          >
+                            手动分析
+                          </Badge>
+                        ) : item.matchSource === "ai" ? (
+                          <Badge
+                            variant="outline"
+                            className="border-primary/30 text-primary"
+                          >
+                            AI筛选
+                          </Badge>
+                        ) : null}
+                      </div>
                       <span className="text-xs text-muted-foreground">
                         热度值 {item.engagementScore ?? 0}
                       </span>
@@ -532,29 +618,23 @@ export default function TopicGeneration({
                       <Button
                         type="button"
                         size="sm"
-                        variant={canViewResult ? "outline" : "default"}
-                        className="h-7 rounded-full px-3 text-xs"
-                        onClick={() => {
-                          if (canViewResult) {
-                            openViralAnalysisPage();
-                            return;
-                          }
-                          analyzeMutation.mutate({
+                        variant="ghost"
+                        className="h-7 px-2 text-xs text-destructive hover:text-destructive"
+                        onClick={() =>
+                          excludeVideoMutation.mutate({
                             id: item.id,
                             projectId: pid,
-                          });
-                        }}
-                        disabled={isBusy || isActive}
+                          })
+                        }
+                        disabled={isRemoving}
                       >
-                        {isBusy || isActive ? (
+                        {isRemoving ? (
                           <>
                             <Loader2 className="mr-1 h-3.5 w-3.5 animate-spin" />
-                            处理中
+                            移除中
                           </>
-                        ) : canViewResult ? (
-                          "查看分析"
                         ) : (
-                          "AI分析"
+                          "删除"
                         )}
                       </Button>
                     </div>
