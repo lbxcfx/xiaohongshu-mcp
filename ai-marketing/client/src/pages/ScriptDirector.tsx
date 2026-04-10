@@ -4,7 +4,6 @@ import {
   BookOpen,
   Check,
   Copy,
-  ExternalLink,
   Heart,
   Loader2,
   MessageCircle,
@@ -40,6 +39,7 @@ interface Props {
 type HubTags = {
   coverUrl?: string;
   coverDownloadPath?: string;
+  videoDownloadPath?: string;
   authorName?: string;
   likedCount?: number;
   commentCount?: number;
@@ -338,15 +338,19 @@ export default function ScriptDirector({ projectId }: Props) {
                             {formatCount(tags.sharedCount)}
                           </span>
                         </div>
-                        {hubItem?.url ? (
+                        {toLocalAssetUrl(
+                          tags.videoDownloadPath as string | undefined
+                        ) ? (
                           <a
-                            href={hubItem.url}
+                            href={toLocalAssetUrl(
+                              tags.videoDownloadPath as string | undefined
+                            )}
                             target="_blank"
                             rel="noreferrer"
-                            className="inline-flex items-center gap-1 rounded-full border border-border/60 px-2.5 py-0.5 text-xs text-muted-foreground transition-colors hover:border-primary hover:text-primary"
+                            className="inline-flex items-center gap-1 rounded-full border border-primary/30 bg-primary/5 px-2.5 py-0.5 text-xs text-primary transition-colors hover:bg-primary/10"
                           >
-                            <ExternalLink className="h-3 w-3" />
-                            原视频
+                            <Video className="h-3 w-3" />
+                            本地视频
                           </a>
                         ) : null}
                       </div>

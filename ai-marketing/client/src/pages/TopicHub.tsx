@@ -126,16 +126,6 @@ export default function TopicHub({ projectId }: Props) {
     },
   });
 
-  const deleteMutation = trpc.topicHub.delete.useMutation({
-    onSuccess: async () => {
-      await utils.topicHub.list.invalidate({ projectId: pid });
-      toast.success("已删除");
-    },
-    onError: () => {
-      toast.error("删除失败");
-    },
-  });
-
   const analyzeMutation = trpc.topicHub.requestVideoAnalysis.useMutation({
     onSuccess: async () => {
       await utils.topicHub.list.invalidate({ projectId: pid });
@@ -578,16 +568,6 @@ export default function TopicHub({ projectId }: Props) {
                         ) : (
                           "AI分析"
                         )}
-                      </Button>
-
-                      <Button
-                        type="button"
-                        size="sm"
-                        variant="ghost"
-                        className="h-7 px-2 text-xs text-muted-foreground"
-                        onClick={() => deleteMutation.mutate({ id: item.id })}
-                      >
-                        删除
                       </Button>
                     </div>
                   </CardContent>
