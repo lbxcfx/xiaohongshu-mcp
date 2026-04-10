@@ -11,6 +11,11 @@ export async function setupVite(app: Express, server: Server) {
     middlewareMode: true,
     hmr: { server },
     allowedHosts: true as const,
+    // WSL 下 Windows 文件系统 inotify 不可靠，使用轮询确保 HMR 生效
+    watch: {
+      usePolling: true,
+      interval: 300,
+    },
   };
 
   const vite = await createViteServer({

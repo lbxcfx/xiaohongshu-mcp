@@ -193,7 +193,7 @@ async function generateScriptForTopicPlanWithArk(
   const positioningDocument =
     buildCompletedPositioningDocumentV2(completedPositioning);
 
-  const prompt = `你是专业的To B短视频口播文案创作师，必须严格整合三大核心信息进行文案创作，缺一不可，三大核心信息为：
+  const prompt = `你是专业的短视频口播文案创作师，必须严格整合三大核心信息进行文案创作，缺一不可：
 
 1.【AI账号定位官】输出的完整账号定位（含业务领域、目标受众、账号人设、内容风格、品牌调性）
 2.【AI爆款因子分析师】输出的爆款因子分析报告（含爆款核心钩子、受众痛点、内容结构、流量逻辑、互动技巧、爆款规律）
@@ -201,15 +201,32 @@ async function generateScriptForTopicPlanWithArk(
 
 创作要求
 
-1.严格遵循账号定位：文案语言风格、专业度、价值输出，完全匹配账号人设与受众认知，贴合To B企业营销场景
-2.深度融入爆款因子：全程套用爆款分析报告中的核心钩子、结构、痛点、流量技巧，保障文案具备爆款潜力
-3.紧扣定制选题：核心内容完全围绕最终定制化选题展开，不偏离主题，精准传递选题核心信息
-4.口播适配性：语言口语化、节奏流畅，适合短视频口播表达，开头3秒抓眼球，中间逻辑清晰，结尾引导互动/转化
-5.专业合规：符合To B企业内容规范，无低俗、违规内容，凸显专业度与商业价值
+1.严格遵循账号定位：文案语言风格、专业度、价值输出，完全匹配账号人设与受众认知
+2.深度融入爆款因子：全程套用爆款分析报告中的核心钩子、结构、痛点、流量技巧
+3.紧扣定制选题：核心内容完全围绕最终定制化选题展开，不偏离主题
+4.口播适配性：语言口语化、节奏流畅，开头3秒抓眼球，中间逻辑清晰，结尾引导互动/转化
+5.专业合规：无低俗、违规内容，凸显专业度与商业价值
 
-输出要求
+输出格式（严格遵守，不得改变结构）
 
-以完整正式文档形式输出，文案分段清晰、标注明确，可直接复制用于拍摄，无额外无关内容。
+# 《选题标题》短视频口播脚本
+
+**【基本信息】**
+- 时长：约XX秒
+- 适配平台：小红书/抖音/视频号
+- 封面建议：[一句话描述封面画面和文字]
+
+---
+
+| 序号 | 画面/场景提示 | 口播文案 | 字幕提示 |
+| ---- | ---- | ---- | ---- |
+| 1（0-Xs 黄金钩子） | [画面描述] | [口播内容，口语化] | [字幕文字] |
+| 2（Xs-Xs 痛点唤醒） | [画面描述] | [口播内容] | [字幕文字] |
+| 3（Xs-Xs 内容展开） | [画面描述] | [口播内容] | [字幕文字] |
+...（按内容逻辑分段，通常6-9个场景段落）...
+| N（总结/互动引导） | [画面描述] | [口播内容，引导评论/关注/转化] | [字幕文字] |
+
+注意：口播文案列要口语化，适合直接对着镜头说；序号列需标注时间节点和段落主题。
 
 【AI账号定位官输出】
 ${positioningDocument}
@@ -285,11 +302,11 @@ function hasRequestedTopicHubVideoAnalysis(tags: Record<string, unknown>) {
 
   return Boolean(
     tags.videoDownloadQueuedAt ||
-      tags.videoAnalysisQueuedAt ||
-      tags.videoAnalysisStartedAt ||
-      tags.videoAnalysisFinishedAt ||
-      (downloadStatus && downloadStatus !== "idle") ||
-      analysisStatus
+    tags.videoAnalysisQueuedAt ||
+    tags.videoAnalysisStartedAt ||
+    tags.videoAnalysisFinishedAt ||
+    (downloadStatus && downloadStatus !== "idle") ||
+    analysisStatus
   );
 }
 

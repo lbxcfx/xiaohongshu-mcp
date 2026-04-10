@@ -27,5 +27,10 @@ export default defineConfig({
       strict: true,
       deny: ["**/.*"],
     },
+    watch: {
+      // WSL 下 Windows 文件系统 inotify 不可靠，使用轮询
+      usePolling: true,
+      interval: 300,
+    },
   },
 });

@@ -2,17 +2,21 @@ import { useEffect, useMemo, useState } from "react";
 import { Streamdown } from "streamdown";
 import {
   AlertTriangle,
+  ArrowRight,
   Brain,
-  ExternalLink,
   Loader2,
   RefreshCw,
   Sparkles,
+  TrendingUp,
+  Video,
 } from "lucide-react";
 import { toast } from "sonner";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
+import { EmptyState } from "@/components/EmptyState";
 import { trpc } from "@/lib/trpc";
+import { useLocation } from "wouter";
 
 interface Props {
   projectId: string;
@@ -21,6 +25,7 @@ interface Props {
 type TopicHubTagMeta = {
   coverUrl?: string;
   coverDownloadPath?: string;
+  videoDownloadPath?: string;
   authorName?: string;
   duration?: number;
   videoDownloadStatus?: "idle" | "pending" | "success" | "failed" | "skipped";
@@ -82,11 +87,11 @@ function getStatusClass(meta: TopicHubTagMeta) {
 function hasRequestedAnalysis(meta: TopicHubTagMeta) {
   return Boolean(
     meta.videoDownloadQueuedAt ||
-      meta.videoDownloadStartedAt ||
-      meta.videoDownloadFinishedAt ||
-      meta.videoAnalysisQueuedAt ||
-      meta.videoAnalysisStartedAt ||
-      meta.videoAnalysisFinishedAt
+    meta.videoDownloadStartedAt ||
+    meta.videoDownloadFinishedAt ||
+    meta.videoAnalysisQueuedAt ||
+    meta.videoAnalysisStartedAt ||
+    meta.videoAnalysisFinishedAt
   );
 }
 
@@ -94,6 +99,7 @@ export default function ViralAnalysis({ projectId }: Props) {
   const pid = Number.parseInt(projectId, 10);
   const utils = trpc.useUtils();
   const [pollingEnabled, setPollingEnabled] = useState(false);
+  const [, setLocation] = useLocation();
 
   const { data: items, isLoading } = trpc.topicHub.list.useQuery(
     { projectId: pid },
@@ -162,12 +168,18 @@ export default function ViralAnalysis({ projectId }: Props) {
           ))}
         </div>
       ) : analysisItems.length === 0 ? (
-        <Card className="border-border bg-card">
-          <CardContent className="py-16 text-center text-sm text-muted-foreground">
-            还没有触发 AI分析 的视频。请先前往 Topic Hub 页面点击视频下方的
-            `AI分析`。
-          </CardContent>
-        </Card>
+        <EmptyState
+          icon={Brain}
+          iconColor="text-amber-400"
+          iconBg="bg-amber-400/10"
+          title="还没有爆款分析视频"
+          description="前往选题中台，点击视频下方的「AI分析」触发分析，完成后会在此展示爆款因子结果。"
+          action={{
+            label: "前往选题中台",
+            icon: ArrowRight,
+            onClick: () => setLocation(`/projects/${pid}/topic-hub`),
+          }}
+        />
       ) : (
         <div className="space-y-4">
           {analysisItems.map(item => {
@@ -226,15 +238,15 @@ export default function ViralAnalysis({ projectId }: Props) {
                         </div>
 
                         <div className="flex flex-wrap gap-2">
-                          {item.url ? (
+                          {toLocalAssetUrl(meta.videoDownloadPath) ? (
                             <a
-                              href={item.url}
+                              href={toLocalAssetUrl(meta.videoDownloadPath)}
                               target="_blank"
                               rel="noreferrer"
-                              className="inline-flex items-center gap-1 rounded-full border border-border px-3 py-1 text-xs text-foreground transition-colors hover:border-primary hover:text-primary"
+                              className="inline-flex items-center gap-1 rounded-full border border-primary/30 bg-primary/5 px-3 py-1 text-xs text-primary transition-colors hover:bg-primary/10"
                             >
-                              <ExternalLink className="h-3.5 w-3.5" />
-                              原视频
+                              <Video className="h-3.5 w-3.5" />
+                              本地视频
                             </a>
                           ) : null}
 

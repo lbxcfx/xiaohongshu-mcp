@@ -53,7 +53,7 @@ export default function Projects() {
   const projectList = projects ?? [];
 
   const createMutation = trpc.projects.create.useMutation({
-    onSuccess: async (project) => {
+    onSuccess: async project => {
       await utils.projects.list.invalidate();
       setOpen(false);
       setForm(emptyForm);
@@ -116,7 +116,7 @@ export default function Projects() {
                 <Input
                   placeholder="例如：美业账号运营项目"
                   value={form.name}
-                  onChange={(e) => setForm({ ...form, name: e.target.value })}
+                  onChange={e => setForm({ ...form, name: e.target.value })}
                   className="bg-input border-border text-foreground"
                 />
               </div>
@@ -126,7 +126,7 @@ export default function Projects() {
                 <Textarea
                   placeholder="简要描述项目目标和背景..."
                   value={form.description}
-                  onChange={(e) =>
+                  onChange={e =>
                     setForm({ ...form, description: e.target.value })
                   }
                   className="bg-input border-border text-foreground resize-none"
@@ -140,7 +140,7 @@ export default function Projects() {
                   <Input
                     placeholder="例如：医美/美妆/健康"
                     value={form.industry}
-                    onChange={(e) =>
+                    onChange={e =>
                       setForm({ ...form, industry: e.target.value })
                     }
                     className="bg-input border-border text-foreground"
@@ -152,7 +152,7 @@ export default function Projects() {
                   <Input
                     placeholder="例如：小红书/抖音"
                     value={form.platform}
-                    onChange={(e) =>
+                    onChange={e =>
                       setForm({ ...form, platform: e.target.value })
                     }
                     className="bg-input border-border text-foreground"
@@ -174,7 +174,7 @@ export default function Projects() {
 
       {isLoading ? (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-          {[1, 2, 3].map((item) => (
+          {[1, 2, 3].map(item => (
             <div key={item} className="h-40 rounded-xl shimmer" />
           ))}
         </div>
@@ -196,7 +196,7 @@ export default function Projects() {
         </div>
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-          {projectList.map((project) => (
+          {projectList.map(project => (
             <Card
               key={project.id}
               className="bg-card border-border hover:border-primary/40 transition-all group cursor-pointer"
@@ -207,7 +207,7 @@ export default function Projects() {
                   <div className="flex-1 min-w-0">
                     <button
                       type="button"
-                      onClick={(e) => {
+                      onClick={e => {
                         e.stopPropagation();
                         openProject(project.id);
                       }}
@@ -229,7 +229,7 @@ export default function Projects() {
                   <DropdownMenu>
                     <DropdownMenuTrigger
                       asChild
-                      onClick={(e) => e.stopPropagation()}
+                      onClick={e => e.stopPropagation()}
                     >
                       <Button
                         variant="ghost"
@@ -245,7 +245,7 @@ export default function Projects() {
                       className="bg-popover border-border"
                     >
                       <DropdownMenuItem
-                        onClick={(e) => {
+                        onClick={e => {
                           e.stopPropagation();
                           archiveMutation.mutate({
                             id: project.id,
@@ -259,7 +259,7 @@ export default function Projects() {
                       </DropdownMenuItem>
 
                       <DropdownMenuItem
-                        onClick={(e) => {
+                        onClick={e => {
                           e.stopPropagation();
                           deleteMutation.mutate({ id: project.id });
                         }}
@@ -303,6 +303,21 @@ export default function Projects() {
               </CardContent>
             </Card>
           ))}
+
+          {/* 新建项目引导卡 */}
+          <Card
+            className="border-2 border-dashed border-border/50 bg-transparent hover:border-primary/50 hover:bg-primary/5 cursor-pointer transition-all group"
+            onClick={() => setOpen(true)}
+          >
+            <CardContent className="p-5 flex flex-col items-center justify-center min-h-[160px] gap-3">
+              <div className="w-12 h-12 rounded-2xl bg-muted/50 flex items-center justify-center group-hover:bg-primary/10 transition-colors">
+                <Plus className="w-6 h-6 text-muted-foreground group-hover:text-primary transition-colors" />
+              </div>
+              <span className="text-sm font-medium text-muted-foreground group-hover:text-primary transition-colors">
+                新建项目
+              </span>
+            </CardContent>
+          </Card>
         </div>
       )}
     </div>

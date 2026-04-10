@@ -14,6 +14,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import { trpc } from "@/lib/trpc";
 import { cn } from "@/lib/utils";
@@ -350,33 +351,29 @@ export default function Positioning({ projectId }: Props) {
         </h1>
       </section>
 
-      <section className="grid gap-3 md:grid-cols-2">
-        <Button
-          type="button"
-          variant={resultMode === "manual" ? "default" : "outline"}
-          className={cn(
-            "h-12 rounded-2xl text-sm",
-            resultMode !== "manual" &&
-              "border-border/70 bg-background/30 hover:bg-background/50"
-          )}
-          onClick={() => setResultMode("manual")}
+      <section>
+        <Tabs
+          value={resultMode}
+          onValueChange={v => setResultMode(v as ResultMode)}
+          className="w-full"
         >
-          <Sparkles className="h-4 w-4" />
-          手动定位
-        </Button>
-        <Button
-          type="button"
-          variant={resultMode === "video" ? "default" : "outline"}
-          className={cn(
-            "h-12 rounded-2xl text-sm",
-            resultMode !== "video" &&
-              "border-border/70 bg-background/30 hover:bg-background/50"
-          )}
-          onClick={() => setResultMode("video")}
-        >
-          <Video className="h-4 w-4" />
-          视频反推
-        </Button>
+          <TabsList className="h-11 w-full rounded-2xl bg-muted/50 p-1">
+            <TabsTrigger
+              value="manual"
+              className="flex-1 rounded-xl text-sm data-[state=active]:bg-primary data-[state=active]:text-primary-foreground data-[state=active]:shadow-sm"
+            >
+              <Sparkles className="mr-2 h-4 w-4" />
+              手动定位
+            </TabsTrigger>
+            <TabsTrigger
+              value="video"
+              className="flex-1 rounded-xl text-sm data-[state=active]:bg-primary data-[state=active]:text-primary-foreground data-[state=active]:shadow-sm"
+            >
+              <Video className="mr-2 h-4 w-4" />
+              视频反推
+            </TabsTrigger>
+          </TabsList>
+        </Tabs>
       </section>
 
       <section className="grid gap-6 xl:grid-cols-[minmax(0,0.95fr)_minmax(0,1.05fr)]">

@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 import { toast } from "sonner";
 import { trpc } from "@/lib/trpc";
+import { cn } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -13,19 +14,34 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { Textarea } from "@/components/ui/textarea";
+import { Separator } from "@/components/ui/separator";
 import {
   AlertCircle,
   CheckCircle,
   ExternalLink,
-  Hash,
   Loader2,
+  Plus,
   RefreshCw,
   Send,
   Share2,
-  Sparkles,
   Video,
 } from "lucide-react";
+
+// 候选话题标签（按场景分组）
+const PRESET_TAG_GROUPS = [
+  {
+    label: "医美护肤",
+    tags: ["医美", "护肤", "皮肤管理", "变美", "美白", "抗衰", "祛斑", "提升"],
+  },
+  {
+    label: "内容形式",
+    tags: ["干货分享", "测评", "好物推荐", "种草", "教程", "日记", "真实体验"],
+  },
+  {
+    label: "人群场景",
+    tags: ["敏感肌", "油皮", "混合肌", "男士护肤", "熟龄肌", "学生党"],
+  },
+];
 
 interface Props {
   projectId: string;
@@ -87,7 +103,6 @@ export default function PlatformAdaptation({ projectId }: Props) {
   const utils = trpc.useUtils();
   const [drafts, setDrafts] = useState<Record<number, DraftState>>({});
   const [tagInputs, setTagInputs] = useState<Record<number, string>>({});
-  const [preparingId, setPreparingId] = useState<number | null>(null);
   const [publishingId, setPublishingId] = useState<number | null>(null);
 
   const { data: scripts } = trpc.scripts.list.useQuery({ projectId: pid });
@@ -105,24 +120,6 @@ export default function PlatformAdaptation({ projectId }: Props) {
     trpc.xhsPublish.loginStatus.useQuery(undefined, {
       refetchInterval: false,
     });
-
-  const prepareDraftMutation = trpc.xhsPublish.prepareDraft.useMutation({
-    onSuccess: async data => {
-      setDrafts(prev => ({
-        ...prev,
-        [data.materialId]: {
-          title: data.draft.title,
-          content: data.draft.content,
-          tags: data.draft.tags,
-          visibility: "公开可见",
-        },
-      }));
-      await utils.xhsPublish.publications.invalidate({ projectId: pid });
-      toast.success("小红书发布草稿已生成");
-    },
-    onError: error => toast.error(error.message || "草稿生成失败"),
-    onSettled: () => setPreparingId(null),
-  });
 
   const publishMutation = trpc.xhsPublish.publishMaterialAuto.useMutation({
     onSuccess: async data => {
@@ -194,7 +191,7 @@ export default function PlatformAdaptation({ projectId }: Props) {
     if (row.publication?.title || row.publication?.content) {
       return {
         title: row.publication.title || row.script?.title || row.material.title,
-        content: row.publication.content || row.script?.fullScript || "",
+        content: "",
         tags: normalizeTags(row.publication.tags),
         visibility:
           (row.publication.visibility as DraftState["visibility"]) ||
@@ -204,14 +201,14 @@ export default function PlatformAdaptation({ projectId }: Props) {
     if (row.adaptation?.title || row.adaptation?.caption) {
       return {
         title: row.adaptation.title || row.script?.title || row.material.title,
-        content: row.adaptation.caption || row.script?.fullScript || "",
+        content: "",
         tags: normalizeTags(row.adaptation.hashtags),
         visibility: "公开可见",
       };
     }
     return {
       title: row.script?.title || row.material.title,
-      content: row.script?.fullScript || "",
+      content: "",
       tags: ["医美", "护肤", "变美"],
       visibility: "公开可见",
     };
@@ -243,14 +240,6 @@ export default function PlatformAdaptation({ projectId }: Props) {
       tags: Array.from(new Set([...draft.tags, nextTag])),
     });
     setTagInputs(prev => ({ ...prev, [row.material.id]: "" }));
-  }
-
-  function handlePrepareDraft(row: (typeof rows)[number]) {
-    setPreparingId(row.material.id);
-    prepareDraftMutation.mutate({
-      projectId: pid,
-      materialId: row.material.id,
-    });
   }
 
   function handlePublish(row: (typeof rows)[number]) {
@@ -413,18 +402,6 @@ export default function PlatformAdaptation({ projectId }: Props) {
                       </div>
                       <div className="flex flex-wrap gap-2">
                         <Button
-                          variant="outline"
-                          disabled={preparingId === row.material.id}
-                          onClick={() => handlePrepareDraft(row)}
-                        >
-                          {preparingId === row.material.id ? (
-                            <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                          ) : (
-                            <Sparkles className="mr-2 h-4 w-4" />
-                          )}
-                          生成发布草稿
-                        </Button>
-                        <Button
                           disabled={
                             !isReady || publishingId === row.material.id
                           }
@@ -486,31 +463,100 @@ export default function PlatformAdaptation({ projectId }: Props) {
                       </div>
                     </div>
 
-                    <div className="space-y-2">
-                      <Label className="text-xs text-muted-foreground">
-                        发布正文
-                      </Label>
-                      <Textarea
-                        rows={5}
-                        value={draft.content}
-                        onChange={event =>
-                          updateDraft(row.material.id, {
-                            ...draft,
-                            content: event.target.value,
-                          })
-                        }
-                        placeholder="点击生成发布草稿，或直接自动发布时由后端生成。"
-                      />
-                    </div>
+                    <Separator className="opacity-50" />
 
-                    <div className="space-y-2">
-                      <Label className="text-xs text-muted-foreground">
-                        话题标签
-                      </Label>
+                    <div className="space-y-3">
+                      <div className="flex items-center justify-between">
+                        <Label className="text-xs text-muted-foreground">
+                          话题标签
+                          <span className="ml-1.5 text-muted-foreground/50">
+                            最多 10 个，点击候选标签快速添加
+                          </span>
+                        </Label>
+                        {draft.tags.length > 0 && (
+                          <span className="text-xs text-muted-foreground/60">
+                            已选 {draft.tags.length}/10
+                          </span>
+                        )}
+                      </div>
+
+                      {/* 候选标签 */}
+                      <div className="space-y-2 rounded-xl bg-muted/30 p-3">
+                        {PRESET_TAG_GROUPS.map(group => (
+                          <div key={group.label} className="space-y-1.5">
+                            <p className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground/50">
+                              {group.label}
+                            </p>
+                            <div className="flex flex-wrap gap-1.5">
+                              {group.tags.map(tag => {
+                                const selected = draft.tags.includes(tag);
+                                const limitReached = draft.tags.length >= 10;
+                                return (
+                                  <button
+                                    key={tag}
+                                    type="button"
+                                    disabled={!selected && limitReached}
+                                    onClick={() => {
+                                      if (selected) {
+                                        updateDraft(row.material.id, {
+                                          ...draft,
+                                          tags: draft.tags.filter(
+                                            t => t !== tag
+                                          ),
+                                        });
+                                      } else if (!limitReached) {
+                                        updateDraft(row.material.id, {
+                                          ...draft,
+                                          tags: [...draft.tags, tag],
+                                        });
+                                      }
+                                    }}
+                                    className={cn(
+                                      "rounded-full border px-2.5 py-0.5 text-xs transition-colors",
+                                      selected
+                                        ? "border-primary/40 bg-primary/15 text-primary"
+                                        : limitReached
+                                          ? "cursor-not-allowed border-border/30 bg-muted/20 text-muted-foreground/40"
+                                          : "border-border/50 bg-muted/40 text-muted-foreground hover:border-border hover:bg-muted hover:text-foreground"
+                                    )}
+                                  >
+                                    #{tag}
+                                  </button>
+                                );
+                              })}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+
+                      {/* 已选标签 */}
+                      {draft.tags.length > 0 && (
+                        <div className="flex flex-wrap gap-1.5">
+                          {draft.tags.map(tag => (
+                            <Badge
+                              key={tag}
+                              className="cursor-pointer gap-1 rounded-full border-primary/30 bg-primary/10 pr-1.5 text-xs text-primary hover:bg-primary/20"
+                              onClick={() =>
+                                updateDraft(row.material.id, {
+                                  ...draft,
+                                  tags: draft.tags.filter(item => item !== tag),
+                                })
+                              }
+                            >
+                              #{tag}
+                              <span className="opacity-60">×</span>
+                            </Badge>
+                          ))}
+                        </div>
+                      )}
+
+                      {/* 自定义标签输入 */}
                       <div className="flex gap-2">
                         <Input
                           value={tagInputs[row.material.id] || ""}
-                          placeholder="输入标签后添加，不需要#"
+                          placeholder="自定义标签，无需加 #"
+                          className="h-8 text-sm"
+                          disabled={draft.tags.length >= 10}
                           onChange={event =>
                             setTagInputs(prev => ({
                               ...prev,
@@ -524,30 +570,17 @@ export default function PlatformAdaptation({ projectId }: Props) {
                             }
                           }}
                         />
-                        <Button variant="outline" onClick={() => addTag(row)}>
-                          <Hash className="mr-1 h-4 w-4" />
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          className="h-8 shrink-0"
+                          disabled={draft.tags.length >= 10}
+                          onClick={() => addTag(row)}
+                        >
+                          <Plus className="mr-1 h-3.5 w-3.5" />
                           添加
                         </Button>
                       </div>
-                      {draft.tags.length > 0 && (
-                        <div className="flex flex-wrap gap-2">
-                          {draft.tags.map(tag => (
-                            <Badge
-                              key={tag}
-                              variant="secondary"
-                              className="cursor-pointer"
-                              onClick={() =>
-                                updateDraft(row.material.id, {
-                                  ...draft,
-                                  tags: draft.tags.filter(item => item !== tag),
-                                })
-                              }
-                            >
-                              #{tag} ×
-                            </Badge>
-                          ))}
-                        </div>
-                      )}
                     </div>
                   </div>
                 </CardContent>

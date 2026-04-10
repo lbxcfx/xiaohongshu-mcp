@@ -2,9 +2,9 @@ import { useMemo, useState } from "react";
 import { Streamdown } from "streamdown";
 import {
   AlertTriangle,
+  ArrowRight,
   Brain,
   CheckCircle2,
-  ExternalLink,
   Heart,
   Loader2,
   MessageCircle,
@@ -12,12 +12,15 @@ import {
   Share2,
   Sparkles,
   Target,
+  Video,
 } from "lucide-react";
 import { toast } from "sonner";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { EmptyState } from "@/components/EmptyState";
 import { trpc } from "@/lib/trpc";
+import { useLocation } from "wouter";
 
 interface Props {
   projectId: string;
@@ -26,6 +29,7 @@ interface Props {
 type TopicHubTagMeta = {
   coverUrl?: string;
   coverDownloadPath?: string;
+  videoDownloadPath?: string;
   authorName?: string;
   likedCount?: number;
   commentCount?: number;
@@ -63,6 +67,7 @@ export default function TopicPlanning({ projectId }: Props) {
   const pid = Number.parseInt(projectId, 10);
   const utils = trpc.useUtils();
   const [expandedPositioning, setExpandedPositioning] = useState(false);
+  const [, setLocation] = useLocation();
 
   const { data: positionings } = trpc.positioning.list.useQuery({
     projectId: pid,
@@ -261,25 +266,39 @@ export default function TopicPlanning({ projectId }: Props) {
           ))}
         </div>
       ) : !completedPositioning ? (
-        <Card className="border-border bg-card">
-          <CardContent className="py-16 text-center text-sm text-muted-foreground">
-            请先完成账号定位。
-          </CardContent>
-        </Card>
+        <EmptyState
+          icon={Target}
+          iconColor="text-primary"
+          iconBg="bg-primary/10"
+          title="需要先完成账号定位"
+          description="选题策划需要结合账号定位信息才能生成，请先完成账号定位再回到这里。"
+          action={{
+            label: "前往账号定位",
+            icon: ArrowRight,
+            onClick: () => setLocation(`/projects/${pid}/positioning`),
+          }}
+        />
       ) : sourceVideos.length === 0 ? (
-        <Card className="border-border bg-card">
-          <CardContent className="py-16 text-center text-sm text-muted-foreground">
-            当前还没有可用于选题策划的爆款分析视频。请先到爆款分析页完成视频 AI
-            分析。
-          </CardContent>
-        </Card>
+        <EmptyState
+          icon={Brain}
+          iconColor="text-orange-400"
+          iconBg="bg-orange-400/10"
+          title="还没有可用的爆款分析视频"
+          description="选题策划需要基于完整的爆款分析结果，请先在爆款分析页完成视频 AI 分析。"
+          action={{
+            label: "前往爆款分析",
+            icon: ArrowRight,
+            onClick: () => setLocation(`/projects/${pid}/viral-analysis`),
+          }}
+        />
       ) : plans && plans.length === 0 ? (
-        <Card className="border-border bg-card">
-          <CardContent className="py-16 text-center text-sm text-muted-foreground">
-            已找到 {sourceVideos.length}{" "}
-            条可用爆款视频，点击右上角“一键生成题目”即可生成选题策划。
-          </CardContent>
-        </Card>
+        <EmptyState
+          icon={Sparkles}
+          iconColor="text-orange-400"
+          iconBg="bg-orange-400/10"
+          title="准备好生成选题策划了"
+          description={`已找到 ${sourceVideos.length} 条爆款视频，点击右上角「一键生成题目」即可批量生成选题策划。`}
+        />
       ) : (
         <div className="space-y-4">
           {sourceVideos.map(item => {
@@ -349,15 +368,15 @@ export default function TopicPlanning({ projectId }: Props) {
                           </span>
                         </div>
 
-                        {item.url ? (
+                        {toLocalAssetUrl(meta.videoDownloadPath) ? (
                           <a
-                            href={item.url}
+                            href={toLocalAssetUrl(meta.videoDownloadPath)}
                             target="_blank"
                             rel="noreferrer"
-                            className="inline-flex items-center gap-1 rounded-full border border-border px-3 py-1 text-xs text-foreground transition-colors hover:border-primary hover:text-primary"
+                            className="inline-flex items-center gap-1 rounded-full border border-primary/30 bg-primary/5 px-3 py-1 text-xs text-primary transition-colors hover:bg-primary/10"
                           >
-                            <ExternalLink className="h-3.5 w-3.5" />
-                            原视频
+                            <Video className="h-3.5 w-3.5" />
+                            本地视频
                           </a>
                         ) : null}
                       </div>

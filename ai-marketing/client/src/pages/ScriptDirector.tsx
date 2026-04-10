@@ -11,13 +11,12 @@ import {
   RefreshCw,
   Share2,
   Sparkles,
-  Target,
   Video,
 } from "lucide-react";
 import { toast } from "sonner";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardContent } from "@/components/ui/card";
 import {
   Dialog,
   DialogContent,
@@ -31,6 +30,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { Separator } from "@/components/ui/separator";
 import { trpc } from "@/lib/trpc";
 
 interface Props {
@@ -61,6 +61,28 @@ function formatCount(value?: number) {
   if (!value) return "0";
   if (value >= 10000) return `${(value / 10000).toFixed(1)}w`;
   return String(value);
+}
+
+// 从 Markdown 脚本中提取纯文本预览（去掉表格、标题符号、加粗等）
+function extractPreview(markdown: string, maxLen = 280): string {
+  const lines = markdown
+    .split("\n")
+    .map(l => l.trim())
+    .filter(
+      l =>
+        l.length > 0 &&
+        !l.startsWith("|") && // 表格行
+        !l.startsWith("#") && // 标题行
+        !/^[-*]{3,}$/.test(l) // 分隔线
+    );
+  const text = lines
+    .join(" ")
+    .replace(/\*\*?([^*]+)\*\*?/g, "$1")
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+    .replace(/`[^`]+`/g, "")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+  return text.length > maxLen ? `${text.slice(0, maxLen)}...` : text;
 }
 
 function formatDuration(seconds?: number) {
@@ -239,41 +261,6 @@ export default function ScriptDirector({ projectId }: Props) {
         </div>
       </div>
 
-      <div className="grid gap-4 md:grid-cols-3">
-        <Card className="border-border bg-card md:col-span-2">
-          <CardHeader className="pb-2">
-            <CardTitle className="flex items-center gap-2 text-sm font-medium text-foreground">
-              <Target className="h-4 w-4 text-primary" />
-              生成依据
-            </CardTitle>
-          </CardHeader>
-          <CardContent className="space-y-2 text-xs text-muted-foreground">
-            <p>1. 使用账号定位内容，统一脚本的人设、受众和品牌调性。</p>
-            <p>
-              2. 使用源视频的爆款因子分析结果，复用钩子、结构、痛点和互动逻辑。
-            </p>
-            <p>3. 使用选题策划生成的最终题目，确保脚本紧扣当前要拍的主题。</p>
-          </CardContent>
-        </Card>
-
-        <Card className="border-border bg-card">
-          <CardHeader className="pb-2">
-            <CardTitle className="text-sm font-medium text-foreground">
-              进度统计
-            </CardTitle>
-          </CardHeader>
-          <CardContent className="space-y-3 text-xs text-muted-foreground">
-            <div className="flex flex-wrap gap-2">
-              <Badge variant="secondary">选题策划 {planRows.length}</Badge>
-              <Badge variant="secondary">已生成 {generatedCount}</Badge>
-            </div>
-            <p>
-              当前页面只围绕“选题策划”结果生成脚本，不再使用旧的手动选题方式。
-            </p>
-          </CardContent>
-        </Card>
-      </div>
-
       {topicPlansLoading || scriptsLoading ? (
         <div className="space-y-4">
           {[1, 2, 3].map(item => (
@@ -289,7 +276,7 @@ export default function ScriptDirector({ projectId }: Props) {
       ) : planRows.length === 0 ? (
         <Card className="border-border bg-card">
           <CardContent className="py-16 text-center text-sm text-muted-foreground">
-            当前还没有选题策划结果。请先到“选题策划”页面生成题目。
+            当前还没有选题策划结果。请先到"选题策划"页面生成题目。
           </CardContent>
         </Card>
       ) : (
@@ -309,9 +296,10 @@ export default function ScriptDirector({ projectId }: Props) {
                 className="overflow-hidden rounded-3xl border-border bg-card"
               >
                 <CardContent className="p-0">
-                  <div className="grid gap-0 lg:grid-cols-[320px_minmax(0,1fr)]">
-                    <div className="border-b border-border/70 bg-muted/20 p-4 lg:border-b-0 lg:border-r">
-                      <div className="relative overflow-hidden rounded-2xl bg-muted">
+                  <div className="grid gap-0 lg:grid-cols-[240px_minmax(0,1fr)]">
+                    {/* 左侧：封面 + 源视频信息 */}
+                    <div className="flex flex-col border-b border-border/70 bg-muted/20 p-4 lg:border-b-0 lg:border-r">
+                      <div className="relative overflow-hidden rounded-xl bg-muted">
                         <div className="aspect-[3/4]">
                           {cover ? (
                             <img
@@ -326,81 +314,67 @@ export default function ScriptDirector({ projectId }: Props) {
                           )}
                         </div>
                         {duration ? (
-                          <div className="absolute bottom-3 right-3 rounded-full bg-black/70 px-2 py-1 text-xs text-white">
+                          <div className="absolute bottom-2 right-2 rounded-full bg-black/70 px-2 py-0.5 text-xs text-white">
                             {duration}
                           </div>
                         ) : null}
                       </div>
 
-                      <div className="mt-4 space-y-3">
-                        <Badge
-                          variant="outline"
-                          className="border-emerald-500/30 bg-emerald-500/10 text-emerald-400"
-                        >
-                          爆款分析已完成
-                        </Badge>
-                        <div>
-                          <p className="text-xs text-muted-foreground">
-                            源爆款视频
-                          </p>
-                          <p className="mt-1 line-clamp-2 text-sm font-medium text-foreground">
-                            {hubItem?.title || "未找到源视频"}
-                          </p>
-                          <p className="mt-1 text-xs text-muted-foreground">
-                            {tags.authorName || "小红书作者"}
-                          </p>
-                        </div>
-                        <div className="flex items-center gap-4 text-xs text-muted-foreground">
+                      <div className="mt-3 space-y-2">
+                        <p className="line-clamp-2 text-xs font-medium leading-5 text-foreground">
+                          {hubItem?.title || "未找到源视频"}
+                        </p>
+                        <div className="flex items-center gap-3 text-xs text-muted-foreground">
                           <span className="flex items-center gap-1">
-                            <Heart className="h-3.5 w-3.5" />
+                            <Heart className="h-3 w-3" />
                             {formatCount(tags.likedCount)}
                           </span>
                           <span className="flex items-center gap-1">
-                            <MessageCircle className="h-3.5 w-3.5" />
+                            <MessageCircle className="h-3 w-3" />
                             {formatCount(tags.commentCount)}
                           </span>
                           <span className="flex items-center gap-1">
-                            <Share2 className="h-3.5 w-3.5" />
+                            <Share2 className="h-3 w-3" />
                             {formatCount(tags.sharedCount)}
                           </span>
-                        </div>
-                        <div>
-                          <p className="text-xs text-muted-foreground">
-                            选题策划题目
-                          </p>
-                          <p className="mt-1 text-sm font-medium leading-6 text-foreground">
-                            {plan.title}
-                          </p>
-                          <p className="mt-2 text-xs leading-6 text-muted-foreground">
-                            生成依据：{plan.rationale || "无"}
-                          </p>
                         </div>
                         {hubItem?.url ? (
                           <a
                             href={hubItem.url}
                             target="_blank"
                             rel="noreferrer"
-                            className="inline-flex items-center gap-1 rounded-full border border-border px-3 py-1 text-xs text-foreground transition-colors hover:border-primary hover:text-primary"
+                            className="inline-flex items-center gap-1 rounded-full border border-border/60 px-2.5 py-0.5 text-xs text-muted-foreground transition-colors hover:border-primary hover:text-primary"
                           >
-                            <ExternalLink className="h-3.5 w-3.5" />
+                            <ExternalLink className="h-3 w-3" />
                             原视频
                           </a>
                         ) : null}
                       </div>
                     </div>
 
-                    <div className="p-5 lg:p-6">
-                      <div className="mb-4 flex items-center justify-between gap-3">
-                        <div>
-                          <p className="text-sm font-medium text-foreground">
-                            复刻脚本
+                    {/* 右侧：选题题目 + 脚本操作 + 预览 */}
+                    <div className="flex flex-col gap-0 p-5 lg:p-6">
+                      {/* 选题题目 */}
+                      <div className="mb-4">
+                        <p className="text-base font-semibold leading-6 text-foreground">
+                          {plan.title}
+                        </p>
+                        {plan.rationale && (
+                          <p className="mt-1 line-clamp-2 text-xs leading-5 text-muted-foreground">
+                            {plan.rationale}
                           </p>
-                          <p className="mt-1 text-xs text-muted-foreground">
-                            输入：账号定位 + 爆款因子分析 + 选题策划题目
-                          </p>
-                        </div>
-                        <div className="flex items-center gap-2">
-                          {script ? (
+                        )}
+                      </div>
+
+                      <Separator className="mb-4 opacity-40" />
+
+                      {/* 操作栏 */}
+                      <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+                        <p className="text-xs text-muted-foreground">
+                          复刻脚本
+                        </p>
+                        <div className="flex flex-wrap items-center gap-2">
+                          {script && (
                             <Select
                               value={script.status || "draft"}
                               onValueChange={value =>
@@ -414,7 +388,7 @@ export default function ScriptDirector({ projectId }: Props) {
                                 })
                               }
                             >
-                              <SelectTrigger className="h-8 w-24 border-border bg-input text-xs text-foreground">
+                              <SelectTrigger className="h-7 w-20 border-border bg-input text-xs text-foreground">
                                 <SelectValue />
                               </SelectTrigger>
                               <SelectContent className="border-border bg-popover">
@@ -429,11 +403,10 @@ export default function ScriptDirector({ projectId }: Props) {
                                 ))}
                               </SelectContent>
                             </Select>
-                          ) : null}
-
+                          )}
                           <Button
                             size="sm"
-                            className="h-8 px-3 text-xs"
+                            className="h-7 px-3 text-xs"
                             onClick={() =>
                               generateMutation.mutate({
                                 projectId: pid,
@@ -444,7 +417,7 @@ export default function ScriptDirector({ projectId }: Props) {
                           >
                             {isGenerating ? (
                               <>
-                                <Loader2 className="mr-1 h-3.5 w-3.5 animate-spin" />
+                                <Loader2 className="mr-1 h-3 w-3 animate-spin" />
                                 生成中
                               </>
                             ) : script ? (
@@ -453,12 +426,46 @@ export default function ScriptDirector({ projectId }: Props) {
                               "生成脚本"
                             )}
                           </Button>
+                          {script && (
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              onClick={() =>
+                                deleteMutation.mutate({ id: script.id })
+                              }
+                              className="h-7 px-2 text-xs text-muted-foreground hover:text-destructive"
+                            >
+                              删除
+                            </Button>
+                          )}
+                        </div>
+                      </div>
 
-                          {script ? (
+                      {/* 脚本预览 */}
+                      {script?.fullScript ? (
+                        <div className="flex flex-1 flex-col gap-3 rounded-xl border border-border/60 bg-background/20 p-4">
+                          <p className="line-clamp-[9] text-sm leading-7 text-foreground/85">
+                            {extractPreview(script.fullScript)}
+                          </p>
+                          <div className="flex items-center gap-2 border-t border-border/40 pt-3">
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              className="h-7 px-2 text-xs text-primary hover:text-primary"
+                              onClick={() =>
+                                setViewScript({
+                                  title: script.title,
+                                  content: script.fullScript || "",
+                                })
+                              }
+                            >
+                              <Video className="mr-1 h-3.5 w-3.5" />
+                              查看完整脚本
+                            </Button>
                             <Button
                               variant="ghost"
                               size="icon"
-                              className="h-8 w-8 text-muted-foreground"
+                              className="h-7 w-7 text-muted-foreground"
                               onClick={() =>
                                 handleCopy(script.id, script.fullScript || "")
                               }
@@ -469,49 +476,11 @@ export default function ScriptDirector({ projectId }: Props) {
                                 <Copy className="h-3.5 w-3.5" />
                               )}
                             </Button>
-                          ) : null}
-
-                          {script ? (
-                            <Button
-                              variant="ghost"
-                              size="sm"
-                              className="h-8 px-2 text-xs text-primary"
-                              onClick={() =>
-                                setViewScript({
-                                  title: script.title,
-                                  content: script.fullScript || "",
-                                })
-                              }
-                            >
-                              <Video className="mr-1 h-3.5 w-3.5" />
-                              查看全文
-                            </Button>
-                          ) : null}
-
-                          {script ? (
-                            <Button
-                              variant="ghost"
-                              size="sm"
-                              onClick={() =>
-                                deleteMutation.mutate({ id: script.id })
-                              }
-                              className="h-8 px-2 text-xs text-muted-foreground hover:text-destructive"
-                            >
-                              删除
-                            </Button>
-                          ) : null}
-                        </div>
-                      </div>
-
-                      {script?.fullScript ? (
-                        <div className="rounded-2xl border border-border/70 bg-background/20 p-4">
-                          <div className="prose prose-sm prose-invert max-w-none text-sm leading-relaxed text-foreground/90">
-                            <Streamdown>{script.fullScript}</Streamdown>
                           </div>
                         </div>
                       ) : (
-                        <div className="flex min-h-[260px] items-center justify-center rounded-3xl border border-dashed border-border/70 bg-background/20 px-6 text-center text-sm text-muted-foreground">
-                          当前还没有脚本。点击“生成脚本”后，会根据这条选题策划结果生成对应口播脚本。
+                        <div className="flex flex-1 items-center justify-center rounded-xl border border-dashed border-border/60 bg-background/20 px-6 py-10 text-center text-sm text-muted-foreground">
+                          点击"生成脚本"，将基于本条选题策划结果生成口播脚本。
                         </div>
                       )}
                     </div>

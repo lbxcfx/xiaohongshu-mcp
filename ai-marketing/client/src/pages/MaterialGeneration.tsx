@@ -3,9 +3,11 @@ import { toast } from "sonner";
 import { trpc } from "@/lib/trpc";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Separator } from "@/components/ui/separator";
+import { Switch } from "@/components/ui/switch";
 import {
   Select,
   SelectContent,
@@ -13,6 +15,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   Dialog,
   DialogContent,
@@ -21,6 +24,7 @@ import {
 } from "@/components/ui/dialog";
 import {
   CheckCircle,
+  CheckCircle2,
   Clapperboard,
   ExternalLink,
   Heart,
@@ -31,7 +35,9 @@ import {
   Share2,
   Sparkles,
   Upload,
+  VideoIcon,
   Wand2,
+  XCircle,
 } from "lucide-react";
 
 interface Props {
@@ -73,6 +79,13 @@ const DEFAULT_CONFIG: GenerationConfig = {
   generateAudio: true,
 };
 
+const TYPE_LABELS: Record<GenerationConfig["type"], string> = {
+  real_person: "真人口播",
+  digital_avatar: "数字人",
+  before_after: "术前术后",
+  other: "其他素材",
+};
+
 function toLocalAssetUrl(filePath?: string) {
   if (!filePath) return undefined;
   const normalized = filePath.replace(/\\/g, "/");
@@ -94,6 +107,37 @@ function shotKey(scriptId: number, shotIndex: number) {
 
 function directKey(scriptId: number) {
   return `direct:${scriptId}`;
+}
+
+// 素材状态配置
+function getMaterialStatus(status: string) {
+  switch (status) {
+    case "ready":
+    case "completed":
+      return {
+        label: "已就绪",
+        className: "border-emerald-500/30 bg-emerald-500/10 text-emerald-400",
+        icon: CheckCircle2,
+      };
+    case "processing":
+      return {
+        label: "生成中",
+        className: "border-amber-500/30 bg-amber-500/10 text-amber-400",
+        icon: Loader2,
+      };
+    case "failed":
+      return {
+        label: "失败",
+        className: "border-red-500/30 bg-red-500/10 text-red-400",
+        icon: XCircle,
+      };
+    default:
+      return {
+        label: "待处理",
+        className: "border-border/50 bg-muted/30 text-muted-foreground",
+        icon: VideoIcon,
+      };
+  }
 }
 
 export default function MaterialGeneration({ projectId }: Props) {
@@ -198,9 +242,7 @@ export default function MaterialGeneration({ projectId }: Props) {
       body: formData,
     });
     const data = (await response.json()) as { success?: boolean; url?: string };
-    if (!data.success || !data.url) {
-      throw new Error("参考图上传失败");
-    }
+    if (!data.success || !data.url) throw new Error("参考图上传失败");
     setShotImages(prev => ({ ...prev, [key]: data.url! }));
   }
 
@@ -229,7 +271,6 @@ export default function MaterialGeneration({ projectId }: Props) {
         generateAudio: config.generateAudio,
       });
     }
-
     toast.success(`已提交 ${targets.length} 个素材生成任务`);
   }
 
@@ -253,12 +294,19 @@ export default function MaterialGeneration({ projectId }: Props) {
       resolution: config.resolution,
       generateAudio: config.generateAudio,
     });
-
     toast.success("已提交脚本直出视频任务");
+  }
+
+  function updateConfig(scriptId: number, patch: Partial<GenerationConfig>) {
+    setConfigs(prev => ({
+      ...prev,
+      [scriptId]: { ...(prev[scriptId] ?? DEFAULT_CONFIG), ...patch },
+    }));
   }
 
   return (
     <div className="space-y-6">
+      {/* 页头 */}
       <div className="flex items-start justify-between gap-4">
         <div>
           <h1 className="flex items-center gap-2 text-2xl font-bold text-foreground">
@@ -266,7 +314,7 @@ export default function MaterialGeneration({ projectId }: Props) {
             素材智造
           </h1>
           <p className="mt-1 text-sm text-muted-foreground">
-            每条爆款复刻脚本独立生成分镜，并按镜头生成可投放的视频素材。
+            每条爆款复刻脚本可生成分镜，并按镜头生成可投放的视频素材。
           </p>
         </div>
         <Button
@@ -281,6 +329,7 @@ export default function MaterialGeneration({ projectId }: Props) {
         </Button>
       </div>
 
+      {/* 列表 */}
       {scriptsLoading || materialsLoading ? (
         <div className="space-y-4">
           {[1, 2, 3].map(item => (
@@ -288,13 +337,19 @@ export default function MaterialGeneration({ projectId }: Props) {
           ))}
         </div>
       ) : rows.length === 0 ? (
-        <Card className="border-border bg-card">
-          <CardContent className="py-16 text-center text-sm text-muted-foreground">
-            当前还没有可用脚本。请先到“爆款复刻”生成脚本。
-          </CardContent>
-        </Card>
+        <div className="flex min-h-[280px] flex-col items-center justify-center rounded-3xl border border-dashed border-border/60 bg-card/40 px-8 py-14 text-center">
+          <div className="mb-5 flex h-16 w-16 items-center justify-center rounded-2xl bg-blue-400/10">
+            <VideoIcon className="h-8 w-8 text-blue-400" />
+          </div>
+          <h3 className="text-base font-semibold text-foreground">
+            还没有可用脚本
+          </h3>
+          <p className="mt-2.5 max-w-sm text-sm leading-7 text-muted-foreground">
+            请先到「爆款复刻」页面生成脚本，完成后回到这里生成视频素材。
+          </p>
+        </div>
       ) : (
-        <div className="space-y-4">
+        <div className="space-y-5">
           {rows.map(row => {
             const tags = ((row.hubItem?.tags ?? {}) as HubTags) ?? {};
             const cover =
@@ -311,51 +366,95 @@ export default function MaterialGeneration({ projectId }: Props) {
                 key={row.script.id}
                 className="overflow-hidden rounded-3xl border-border bg-card"
               >
-                <CardContent className="grid gap-0 p-0 lg:grid-cols-[280px_minmax(0,1fr)]">
-                  <div className="border-b border-border/70 bg-muted/20 p-4 lg:border-b-0 lg:border-r">
-                    <div className="aspect-[3/4] overflow-hidden rounded-2xl bg-muted">
-                      {cover ? (
-                        <img
-                          src={cover}
-                          alt={row.script.title}
-                          className="h-full w-full object-cover"
-                        />
-                      ) : (
-                        <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
-                          暂无封面
-                        </div>
-                      )}
+                <CardContent className="grid gap-0 p-0 lg:grid-cols-[240px_minmax(0,1fr)]">
+                  {/* 左侧：封面 + 源视频信息 */}
+                  <div className="flex flex-col gap-4 border-b border-border/70 bg-muted/15 p-5 lg:border-b-0 lg:border-r">
+                    <div className="overflow-hidden rounded-2xl bg-muted">
+                      <div className="aspect-[3/4]">
+                        {cover ? (
+                          <img
+                            src={cover}
+                            alt={row.script.title}
+                            className="h-full w-full object-cover"
+                          />
+                        ) : (
+                          <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
+                            暂无封面
+                          </div>
+                        )}
+                      </div>
                     </div>
-                    <div className="mt-4 space-y-2 text-xs text-muted-foreground">
-                      <p>{tags.authorName || "小红书作者"}</p>
+                    <div className="space-y-1.5 text-xs text-muted-foreground">
+                      <p className="font-medium text-foreground/80">
+                        {tags.authorName || "小红书作者"}
+                      </p>
                       <div className="flex gap-3">
                         <span className="flex items-center gap-1">
-                          <Heart className="h-3.5 w-3.5" />
+                          <Heart className="h-3 w-3" />
                           {formatCount(Number(tags.likedCount || 0))}
                         </span>
                         <span className="flex items-center gap-1">
-                          <MessageCircle className="h-3.5 w-3.5" />
+                          <MessageCircle className="h-3 w-3" />
                           {formatCount(Number(tags.commentCount || 0))}
                         </span>
                         <span className="flex items-center gap-1">
-                          <Share2 className="h-3.5 w-3.5" />
+                          <Share2 className="h-3 w-3" />
                           {formatCount(Number(tags.sharedCount || 0))}
                         </span>
                       </div>
                     </div>
+
+                    {/* 素材统计 */}
+                    {row.materials.length > 0 && (
+                      <div className="rounded-xl border border-border/60 bg-background/30 px-3 py-2.5">
+                        <p className="text-xs text-muted-foreground">
+                          已生成素材
+                        </p>
+                        <p className="mt-0.5 text-xl font-bold text-foreground">
+                          {row.materials.length}
+                        </p>
+                        <div className="mt-2 flex flex-wrap gap-1.5">
+                          {(["ready", "processing", "failed"] as const).map(
+                            s => {
+                              const count = row.materials.filter(
+                                m =>
+                                  m.status === s ||
+                                  (s === "ready" && m.status === "completed")
+                              ).length;
+                              if (!count) return null;
+                              const st = getMaterialStatus(s);
+                              return (
+                                <span
+                                  key={s}
+                                  className={`rounded-full border px-2 py-0.5 text-[11px] ${st.className}`}
+                                >
+                                  {st.label} {count}
+                                </span>
+                              );
+                            }
+                          )}
+                        </div>
+                      </div>
+                    )}
                   </div>
 
-                  <div className="space-y-4 p-5">
-                    <div className="flex flex-col gap-3 xl:flex-row xl:items-start xl:justify-between">
-                      <div>
-                        <h2 className="text-lg font-semibold text-foreground">
+                  {/* 右侧：内容区 */}
+                  <div className="divide-y divide-border/50">
+                    {/* 脚本标题区 */}
+                    <div className="flex items-start justify-between gap-3 px-5 py-4">
+                      <div className="min-w-0">
+                        <h2 className="truncate text-base font-semibold text-foreground">
                           {row.script.title}
                         </h2>
-                        <p className="mt-2 text-sm text-muted-foreground">
-                          {row.plan?.title || "未关联选题"}
-                        </p>
+                        {row.plan?.title && (
+                          <p className="mt-1 truncate text-xs text-muted-foreground">
+                            {row.plan.title}
+                          </p>
+                        )}
                       </div>
                       <Button
+                        size="sm"
+                        variant="outline"
                         onClick={() =>
                           storyboardMutation.mutate({
                             projectId: pid,
@@ -363,466 +462,483 @@ export default function MaterialGeneration({ projectId }: Props) {
                           })
                         }
                         disabled={isStoryboardLoading}
+                        className="shrink-0 rounded-full"
                       >
                         {isStoryboardLoading ? (
-                          <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                          <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
                         ) : (
-                          <Clapperboard className="mr-2 h-4 w-4" />
+                          <Clapperboard className="mr-1.5 h-3.5 w-3.5" />
                         )}
                         生成分镜
                       </Button>
                     </div>
 
-                    <div className="grid gap-3 md:grid-cols-4">
-                      <div className="space-y-1.5">
-                        <Label className="text-xs text-muted-foreground">
-                          生成方式
-                        </Label>
-                        <div className="flex gap-2">
-                          <Button
-                            type="button"
-                            variant={
-                              generationMode === "direct"
-                                ? "default"
-                                : "outline"
-                            }
-                            size="sm"
-                            className="flex-1"
-                            onClick={() =>
+                    {/* 生成配置区 */}
+                    <div className="space-y-4 px-5 py-4">
+                      {/* 生成模式 + 配置参数 */}
+                      <div className="flex flex-wrap items-end gap-3">
+                        {/* 生成方式 Tab */}
+                        <div className="space-y-1.5">
+                          <Label className="text-xs text-muted-foreground">
+                            生成方式
+                          </Label>
+                          <Tabs
+                            value={generationMode}
+                            onValueChange={v =>
                               setModeByScript(prev => ({
                                 ...prev,
-                                [row.script.id]: "direct",
+                                [row.script.id]: v as "direct" | "storyboard",
                               }))
                             }
                           >
-                            <Wand2 className="mr-1 h-3.5 w-3.5" />
-                            脚本直出
-                          </Button>
-                          <Button
-                            type="button"
-                            variant={
-                              generationMode === "storyboard"
-                                ? "default"
-                                : "outline"
-                            }
-                            size="sm"
-                            className="flex-1"
-                            onClick={() =>
-                              setModeByScript(prev => ({
-                                ...prev,
-                                [row.script.id]: "storyboard",
-                              }))
+                            <TabsList className="h-9 rounded-xl bg-muted/50 px-1">
+                              <TabsTrigger
+                                value="direct"
+                                className="rounded-lg px-3 text-xs data-[state=active]:bg-primary data-[state=active]:text-primary-foreground"
+                              >
+                                <Wand2 className="mr-1 h-3 w-3" />
+                                脚本直出
+                              </TabsTrigger>
+                              <TabsTrigger
+                                value="storyboard"
+                                className="rounded-lg px-3 text-xs data-[state=active]:bg-primary data-[state=active]:text-primary-foreground"
+                              >
+                                <Clapperboard className="mr-1 h-3 w-3" />
+                                分镜生成
+                              </TabsTrigger>
+                            </TabsList>
+                          </Tabs>
+                        </div>
+
+                        {/* 素材类型 */}
+                        <div className="space-y-1.5">
+                          <Label className="text-xs text-muted-foreground">
+                            素材类型
+                          </Label>
+                          <Select
+                            value={currentConfig.type}
+                            onValueChange={v =>
+                              updateConfig(row.script.id, {
+                                type: v as GenerationConfig["type"],
+                              })
                             }
                           >
-                            <Clapperboard className="mr-1 h-3.5 w-3.5" />
-                            先分镜
-                          </Button>
+                            <SelectTrigger className="h-9 w-[110px] rounded-xl text-xs">
+                              <SelectValue />
+                            </SelectTrigger>
+                            <SelectContent>
+                              {Object.entries(TYPE_LABELS).map(([v, label]) => (
+                                <SelectItem key={v} value={v}>
+                                  {label}
+                                </SelectItem>
+                              ))}
+                            </SelectContent>
+                          </Select>
                         </div>
-                      </div>
-                      <div className="space-y-1.5">
-                        <Label className="text-xs text-muted-foreground">
-                          素材类型
-                        </Label>
-                        <Select
-                          value={currentConfig.type}
-                          onValueChange={value =>
-                            setConfigs(prev => ({
-                              ...prev,
-                              [row.script.id]: {
-                                ...currentConfig,
-                                type: value as GenerationConfig["type"],
-                              },
-                            }))
-                          }
-                        >
-                          <SelectTrigger>
-                            <SelectValue />
-                          </SelectTrigger>
-                          <SelectContent>
-                            <SelectItem value="real_person">
-                              真人口播
-                            </SelectItem>
-                            <SelectItem value="digital_avatar">
-                              数字人
-                            </SelectItem>
-                            <SelectItem value="before_after">
-                              术前术后
-                            </SelectItem>
-                            <SelectItem value="other">其他素材</SelectItem>
-                          </SelectContent>
-                        </Select>
-                      </div>
-                      <div className="space-y-1.5">
-                        <Label className="text-xs text-muted-foreground">
-                          视频比例
-                        </Label>
-                        <Select
-                          value={currentConfig.ratio}
-                          onValueChange={value =>
-                            setConfigs(prev => ({
-                              ...prev,
-                              [row.script.id]: {
-                                ...currentConfig,
-                                ratio: value as GenerationConfig["ratio"],
-                              },
-                            }))
-                          }
-                        >
-                          <SelectTrigger>
-                            <SelectValue />
-                          </SelectTrigger>
-                          <SelectContent>
-                            {[
-                              "9:16",
-                              "16:9",
-                              "1:1",
-                              "3:4",
-                              "4:3",
-                              "adaptive",
-                            ].map(value => (
-                              <SelectItem key={value} value={value}>
-                                {value}
-                              </SelectItem>
-                            ))}
-                          </SelectContent>
-                        </Select>
-                      </div>
-                      <div className="space-y-1.5">
-                        <Label className="text-xs text-muted-foreground">
-                          视频时长
-                        </Label>
-                        <Select
-                          value={String(currentConfig.duration)}
-                          onValueChange={value =>
-                            setConfigs(prev => ({
-                              ...prev,
-                              [row.script.id]: {
-                                ...currentConfig,
-                                duration: Number(value),
-                              },
-                            }))
-                          }
-                        >
-                          <SelectTrigger>
-                            <SelectValue />
-                          </SelectTrigger>
-                          <SelectContent>
-                            {[4, 5, 6, 8, 10, 12].map(value => (
-                              <SelectItem key={value} value={String(value)}>
-                                {value}s
-                              </SelectItem>
-                            ))}
-                          </SelectContent>
-                        </Select>
-                      </div>
-                      <div className="space-y-1.5">
-                        <Label className="text-xs text-muted-foreground">
-                          视频分辨率
-                        </Label>
-                        <Select
-                          value={currentConfig.resolution}
-                          onValueChange={value =>
-                            setConfigs(prev => ({
-                              ...prev,
-                              [row.script.id]: {
-                                ...currentConfig,
-                                resolution:
-                                  value as GenerationConfig["resolution"],
-                              },
-                            }))
-                          }
-                        >
-                          <SelectTrigger>
-                            <SelectValue />
-                          </SelectTrigger>
-                          <SelectContent>
-                            {["480p", "720p", "1080p"].map(value => (
-                              <SelectItem key={value} value={value}>
-                                {value}
-                              </SelectItem>
-                            ))}
-                          </SelectContent>
-                        </Select>
-                      </div>
-                    </div>
 
-                    <div className="rounded-2xl border border-border/70 bg-muted/10 p-4">
-                      <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
-                        <div>
-                          <p className="text-sm font-medium text-foreground">
-                            当前脚本的 Seedance 参数
-                          </p>
-                          <p className="mt-1 text-xs text-muted-foreground">
-                            可直接用脚本文本生成视频，也可以先拆成分镜再逐镜头生成。
-                          </p>
-                        </div>
-                        <label className="inline-flex items-center gap-2 rounded-lg border border-border bg-card px-3 py-2 text-xs text-foreground">
-                          <input
-                            type="checkbox"
-                            checked={currentConfig.generateAudio}
-                            onChange={event =>
-                              setConfigs(prev => ({
-                                ...prev,
-                                [row.script.id]: {
-                                  ...currentConfig,
-                                  generateAudio: event.target.checked,
-                                },
-                              }))
+                        {/* 视频比例 */}
+                        <div className="space-y-1.5">
+                          <Label className="text-xs text-muted-foreground">
+                            比例
+                          </Label>
+                          <Select
+                            value={currentConfig.ratio}
+                            onValueChange={v =>
+                              updateConfig(row.script.id, {
+                                ratio: v as GenerationConfig["ratio"],
+                              })
                             }
-                          />
-                          生成音频
-                        </label>
-                      </div>
-                    </div>
+                          >
+                            <SelectTrigger className="h-9 w-[90px] rounded-xl text-xs">
+                              <SelectValue />
+                            </SelectTrigger>
+                            <SelectContent>
+                              {[
+                                "9:16",
+                                "16:9",
+                                "1:1",
+                                "3:4",
+                                "4:3",
+                                "adaptive",
+                              ].map(v => (
+                                <SelectItem key={v} value={v}>
+                                  {v}
+                                </SelectItem>
+                              ))}
+                            </SelectContent>
+                          </Select>
+                        </div>
 
-                    {generationMode === "direct" ? (
-                      <div className="space-y-3 rounded-2xl border border-border/70 bg-muted/10 p-4">
-                        <div className="space-y-2">
-                          <p className="text-sm font-medium text-foreground">
-                            脚本文本直出视频
-                          </p>
+                        {/* 时长 */}
+                        <div className="space-y-1.5">
+                          <Label className="text-xs text-muted-foreground">
+                            时长
+                          </Label>
+                          <Select
+                            value={String(currentConfig.duration)}
+                            onValueChange={v =>
+                              updateConfig(row.script.id, {
+                                duration: Number(v),
+                              })
+                            }
+                          >
+                            <SelectTrigger className="h-9 w-[76px] rounded-xl text-xs">
+                              <SelectValue />
+                            </SelectTrigger>
+                            <SelectContent>
+                              {[4, 5, 6, 8, 10, 12].map(v => (
+                                <SelectItem key={v} value={String(v)}>
+                                  {v}s
+                                </SelectItem>
+                              ))}
+                            </SelectContent>
+                          </Select>
+                        </div>
+
+                        {/* 分辨率 */}
+                        <div className="space-y-1.5">
+                          <Label className="text-xs text-muted-foreground">
+                            分辨率
+                          </Label>
+                          <Select
+                            value={currentConfig.resolution}
+                            onValueChange={v =>
+                              updateConfig(row.script.id, {
+                                resolution: v as GenerationConfig["resolution"],
+                              })
+                            }
+                          >
+                            <SelectTrigger className="h-9 w-[84px] rounded-xl text-xs">
+                              <SelectValue />
+                            </SelectTrigger>
+                            <SelectContent>
+                              {["480p", "720p", "1080p"].map(v => (
+                                <SelectItem key={v} value={v}>
+                                  {v}
+                                </SelectItem>
+                              ))}
+                            </SelectContent>
+                          </Select>
+                        </div>
+
+                        {/* 生成音频 Switch */}
+                        <div className="space-y-1.5">
+                          <Label className="text-xs text-muted-foreground">
+                            生成音频
+                          </Label>
+                          <div className="flex h-9 items-center">
+                            <Switch
+                              checked={currentConfig.generateAudio}
+                              onCheckedChange={v =>
+                                updateConfig(row.script.id, {
+                                  generateAudio: v,
+                                })
+                              }
+                            />
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* 生成区域 */}
+                      {generationMode === "direct" ? (
+                        <div className="space-y-3 rounded-2xl border border-border/60 bg-muted/10 p-4">
                           <p className="text-xs text-muted-foreground">
                             直接把当前脚本正文提交给 Seedance
-                            生成完整视频，不经过分镜拆解。
+                            生成完整视频，无需分镜拆解。
                           </p>
-                        </div>
-                        <Input
-                          placeholder="可选：直出视频参考图 URL"
-                          value={shotImages[directKey(row.script.id)] || ""}
-                          onChange={event =>
-                            setShotImages(prev => ({
-                              ...prev,
-                              [directKey(row.script.id)]: event.target.value,
-                            }))
-                          }
-                        />
-                        <label className="inline-flex cursor-pointer items-center gap-2 text-xs text-primary">
-                          <Upload className="h-3.5 w-3.5" />
-                          上传直出参考图
-                          <input
-                            type="file"
-                            accept="image/*"
-                            className="hidden"
-                            onChange={async event => {
-                              const file = event.target.files?.[0];
-                              if (!file) return;
-                              try {
-                                await handleUploadByKey(
-                                  directKey(row.script.id),
-                                  file
-                                );
-                                toast.success("直出参考图上传成功");
-                              } catch (error) {
-                                toast.error(
-                                  (error as Error).message ||
-                                    "直出参考图上传失败"
-                                );
+                          <div className="flex items-center gap-2">
+                            <Input
+                              placeholder="可选：参考图 URL"
+                              value={shotImages[directKey(row.script.id)] || ""}
+                              onChange={e =>
+                                setShotImages(prev => ({
+                                  ...prev,
+                                  [directKey(row.script.id)]: e.target.value,
+                                }))
                               }
-                            }}
-                          />
-                        </label>
-                        <Button
-                          onClick={() => void handleGenerateDirect(row)}
-                          disabled={createTaskMutation.isPending}
-                        >
-                          {createTaskMutation.isPending ? (
-                            <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                          ) : (
-                            <Wand2 className="mr-2 h-4 w-4" />
-                          )}
-                          脚本直出视频
-                        </Button>
-                      </div>
-                    ) : shots.length > 0 ? (
-                      <div className="space-y-3 rounded-2xl border border-border/70 bg-muted/10 p-4">
-                        {shots.map(shot => {
-                          const selected = (
-                            selectedShots[row.script.id] ?? []
-                          ).includes(shot.shotIndex);
-                          return (
-                            <div
-                              key={shot.shotIndex}
-                              className="rounded-2xl border border-border bg-card p-4"
-                            >
-                              <div className="flex items-start gap-3">
-                                <button
-                                  type="button"
-                                  onClick={() =>
-                                    setSelectedShots(prev => ({
-                                      ...prev,
-                                      [row.script.id]: selected
-                                        ? (prev[row.script.id] ?? []).filter(
-                                            item => item !== shot.shotIndex
-                                          )
-                                        : [
-                                            ...(prev[row.script.id] ?? []),
-                                            shot.shotIndex,
-                                          ],
-                                    }))
+                              className="h-9 rounded-xl text-xs"
+                            />
+                            <label className="inline-flex cursor-pointer items-center gap-1.5 rounded-xl border border-border px-3 py-2 text-xs text-muted-foreground hover:border-primary hover:text-primary transition-colors">
+                              <Upload className="h-3.5 w-3.5" />
+                              上传图片
+                              <input
+                                type="file"
+                                accept="image/*"
+                                className="hidden"
+                                onChange={async e => {
+                                  const file = e.target.files?.[0];
+                                  if (!file) return;
+                                  try {
+                                    await handleUploadByKey(
+                                      directKey(row.script.id),
+                                      file
+                                    );
+                                    toast.success("参考图上传成功");
+                                  } catch (error) {
+                                    toast.error(
+                                      (error as Error).message || "上传失败"
+                                    );
                                   }
-                                  className={`mt-1 flex h-5 w-5 items-center justify-center rounded border ${selected ? "border-primary bg-primary text-primary-foreground" : "border-muted-foreground"}`}
+                                }}
+                              />
+                            </label>
+                          </div>
+                          <Button
+                            size="sm"
+                            onClick={() => void handleGenerateDirect(row)}
+                            disabled={createTaskMutation.isPending}
+                            className="rounded-full px-5"
+                          >
+                            {createTaskMutation.isPending ? (
+                              <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                            ) : (
+                              <Wand2 className="mr-1.5 h-3.5 w-3.5" />
+                            )}
+                            脚本直出视频
+                          </Button>
+                        </div>
+                      ) : shots.length > 0 ? (
+                        <div className="space-y-3 rounded-2xl border border-border/60 bg-muted/10 p-4">
+                          <div className="space-y-2">
+                            {shots.map(shot => {
+                              const selected = (
+                                selectedShots[row.script.id] ?? []
+                              ).includes(shot.shotIndex);
+                              return (
+                                <div
+                                  key={shot.shotIndex}
+                                  className={`rounded-xl border p-3 transition-colors ${
+                                    selected
+                                      ? "border-primary/40 bg-primary/5"
+                                      : "border-border/60 bg-background/30"
+                                  }`}
                                 >
-                                  {selected ? (
-                                    <CheckCircle className="h-3.5 w-3.5" />
-                                  ) : null}
-                                </button>
-                                <div className="min-w-0 flex-1 space-y-2">
-                                  <div className="flex flex-wrap items-center gap-2">
-                                    <Badge variant="secondary">
-                                      镜头 {shot.shotIndex}
-                                    </Badge>
-                                    <Badge variant="outline">
-                                      {shot.timeRange}
-                                    </Badge>
+                                  <div className="flex items-start gap-3">
+                                    <button
+                                      type="button"
+                                      onClick={() =>
+                                        setSelectedShots(prev => ({
+                                          ...prev,
+                                          [row.script.id]: selected
+                                            ? (
+                                                prev[row.script.id] ?? []
+                                              ).filter(
+                                                i => i !== shot.shotIndex
+                                              )
+                                            : [
+                                                ...(prev[row.script.id] ?? []),
+                                                shot.shotIndex,
+                                              ],
+                                        }))
+                                      }
+                                      className={`mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded border transition-colors ${
+                                        selected
+                                          ? "border-primary bg-primary text-primary-foreground"
+                                          : "border-muted-foreground/50"
+                                      }`}
+                                    >
+                                      {selected && (
+                                        <CheckCircle className="h-3.5 w-3.5" />
+                                      )}
+                                    </button>
+                                    <div className="min-w-0 flex-1 space-y-1.5">
+                                      <div className="flex flex-wrap items-center gap-1.5">
+                                        <Badge
+                                          variant="secondary"
+                                          className="text-xs"
+                                        >
+                                          镜头 {shot.shotIndex}
+                                        </Badge>
+                                        <Badge
+                                          variant="outline"
+                                          className="text-xs"
+                                        >
+                                          {shot.timeRange}
+                                        </Badge>
+                                      </div>
+                                      <p className="text-sm text-foreground">
+                                        {shot.description}
+                                      </p>
+                                      <p className="text-xs text-muted-foreground">
+                                        镜头：{shot.cameraInstruction}
+                                      </p>
+                                      <p className="text-xs text-muted-foreground">
+                                        视觉：{shot.visualSuggestion}
+                                      </p>
+                                      <div className="flex items-center gap-2 pt-1">
+                                        <Input
+                                          placeholder="参考图 URL（可选）"
+                                          value={
+                                            shotImages[
+                                              shotKey(
+                                                row.script.id,
+                                                shot.shotIndex
+                                              )
+                                            ] || ""
+                                          }
+                                          onChange={e =>
+                                            setShotImages(prev => ({
+                                              ...prev,
+                                              [shotKey(
+                                                row.script.id,
+                                                shot.shotIndex
+                                              )]: e.target.value,
+                                            }))
+                                          }
+                                          className="h-8 rounded-lg text-xs"
+                                        />
+                                        <label className="shrink-0 cursor-pointer rounded-lg border border-border px-2.5 py-1.5 text-xs text-muted-foreground hover:border-primary hover:text-primary transition-colors">
+                                          <Upload className="h-3.5 w-3.5" />
+                                          <input
+                                            type="file"
+                                            accept="image/*"
+                                            className="hidden"
+                                            onChange={async e => {
+                                              const file = e.target.files?.[0];
+                                              if (!file) return;
+                                              try {
+                                                await handleUploadByKey(
+                                                  shotKey(
+                                                    row.script.id,
+                                                    shot.shotIndex
+                                                  ),
+                                                  file
+                                                );
+                                                toast.success("参考图上传成功");
+                                              } catch (error) {
+                                                toast.error(
+                                                  (error as Error).message ||
+                                                    "上传失败"
+                                                );
+                                              }
+                                            }}
+                                          />
+                                        </label>
+                                      </div>
+                                    </div>
                                   </div>
-                                  <p className="text-sm text-foreground">
-                                    {shot.description}
-                                  </p>
-                                  <p className="text-xs text-muted-foreground">
-                                    镜头指令：{shot.cameraInstruction}
-                                  </p>
-                                  <p className="text-xs text-muted-foreground">
-                                    视觉建议：{shot.visualSuggestion}
-                                  </p>
-                                  <Input
-                                    placeholder="参考图 URL，可不填"
-                                    value={
-                                      shotImages[
-                                        shotKey(row.script.id, shot.shotIndex)
-                                      ] || ""
-                                    }
-                                    onChange={event =>
-                                      setShotImages(prev => ({
-                                        ...prev,
-                                        [shotKey(
-                                          row.script.id,
-                                          shot.shotIndex
-                                        )]: event.target.value,
-                                      }))
-                                    }
-                                  />
-                                  <label className="inline-flex cursor-pointer items-center gap-2 text-xs text-primary">
-                                    <Upload className="h-3.5 w-3.5" />
-                                    上传本地参考图
-                                    <input
-                                      type="file"
-                                      accept="image/*"
-                                      className="hidden"
-                                      onChange={async event => {
-                                        const file = event.target.files?.[0];
-                                        if (!file) return;
-                                        try {
-                                          await handleUploadByKey(
-                                            shotKey(
-                                              row.script.id,
-                                              shot.shotIndex
-                                            ),
-                                            file
-                                          );
-                                          toast.success("参考图上传成功");
-                                        } catch (error) {
-                                          toast.error(
-                                            (error as Error).message ||
-                                              "参考图上传失败"
-                                          );
-                                        }
-                                      }}
-                                    />
-                                  </label>
                                 </div>
-                              </div>
-                            </div>
-                          );
-                        })}
-                        <Button
-                          onClick={() => void handleGenerateByStoryboard(row)}
-                          disabled={createTaskMutation.isPending}
-                        >
-                          {createTaskMutation.isPending ? (
-                            <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                          ) : (
-                            <Sparkles className="mr-2 h-4 w-4" />
-                          )}
-                          生成选中素材
-                        </Button>
-                      </div>
-                    ) : (
-                      <div className="rounded-2xl border border-dashed border-border p-4 text-sm text-muted-foreground">
-                        当前还没有分镜头。点击上方“生成分镜”后，可按镜头生成视频素材。
-                      </div>
-                    )}
-
-                    <div className="space-y-3">
-                      <div className="flex items-center justify-between">
-                        <CardTitle className="text-sm">已生成素材</CardTitle>
-                        <Badge variant="secondary">
-                          {row.materials.length}
-                        </Badge>
-                      </div>
-                      {row.materials.length === 0 ? (
-                        <div className="rounded-2xl border border-dashed border-border p-4 text-sm text-muted-foreground">
-                          还没有生成素材。
+                              );
+                            })}
+                          </div>
+                          <Button
+                            size="sm"
+                            onClick={() => void handleGenerateByStoryboard(row)}
+                            disabled={createTaskMutation.isPending}
+                            className="rounded-full px-5"
+                          >
+                            {createTaskMutation.isPending ? (
+                              <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                            ) : (
+                              <Sparkles className="mr-1.5 h-3.5 w-3.5" />
+                            )}
+                            生成选中素材
+                          </Button>
                         </div>
                       ) : (
-                        <div className="grid gap-3 xl:grid-cols-2">
-                          {row.materials.map(material => (
-                            <div
-                              key={material.id}
-                              className="rounded-2xl border border-border bg-card p-4"
-                            >
-                              <p className="text-sm font-medium text-foreground">
-                                {material.title}
-                              </p>
-                              <div className="mt-3 flex flex-wrap gap-2">
-                                {material.fileUrl ? (
-                                  <>
-                                    <Button
-                                      variant="outline"
-                                      size="sm"
-                                      onClick={() =>
-                                        setPreviewVideo({
-                                          url: material.fileUrl!,
-                                          title: material.title,
-                                        })
-                                      }
-                                    >
-                                      <Play className="mr-1 h-3.5 w-3.5" />
-                                      预览
-                                    </Button>
-                                    <a
-                                      href={material.fileUrl}
-                                      target="_blank"
-                                      rel="noopener noreferrer"
-                                    >
-                                      <Button variant="outline" size="sm">
-                                        <ExternalLink className="mr-1 h-3.5 w-3.5" />
-                                        打开
-                                      </Button>
-                                    </a>
-                                  </>
-                                ) : null}
-                                {material.status === "processing" &&
-                                material.seedanceTaskId ? (
-                                  <Button
-                                    variant="outline"
-                                    size="sm"
-                                    onClick={() =>
-                                      checkStatusMutation.mutate({
-                                        materialId: material.id,
-                                        taskId: material.seedanceTaskId!,
-                                      })
-                                    }
-                                  >
-                                    <RefreshCw className="mr-1 h-3.5 w-3.5" />
-                                    查询状态
-                                  </Button>
-                                ) : null}
-                              </div>
-                            </div>
-                          ))}
+                        <div className="rounded-2xl border border-dashed border-border/60 px-5 py-6 text-center text-sm text-muted-foreground">
+                          还没有分镜头。点击右上角「生成分镜」后，可按镜头生成视频素材。
                         </div>
                       )}
                     </div>
+
+                    {/* 已生成素材区 */}
+                    {row.materials.length > 0 && (
+                      <>
+                        <Separator />
+                        <div className="space-y-3 px-5 py-4">
+                          <div className="flex items-center gap-2">
+                            <p className="text-sm font-medium text-foreground">
+                              已生成素材
+                            </p>
+                            <Badge variant="secondary">
+                              {row.materials.length}
+                            </Badge>
+                          </div>
+                          <div className="grid gap-2.5 sm:grid-cols-2">
+                            {row.materials.map(material => {
+                              const st = getMaterialStatus(
+                                material.status ?? "pending"
+                              );
+                              const StatusIcon = st.icon;
+                              return (
+                                <div
+                                  key={material.id}
+                                  className="flex items-start justify-between gap-3 rounded-2xl border border-border/60 bg-background/30 p-3.5"
+                                >
+                                  <div className="min-w-0 flex-1">
+                                    <p className="truncate text-sm font-medium text-foreground">
+                                      {material.title}
+                                    </p>
+                                    <div className="mt-1.5">
+                                      <span
+                                        className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-xs ${st.className}`}
+                                      >
+                                        <StatusIcon
+                                          className={`h-3 w-3 ${material.status === "processing" ? "animate-spin" : ""}`}
+                                        />
+                                        {st.label}
+                                      </span>
+                                    </div>
+                                  </div>
+                                  <div className="flex shrink-0 flex-col gap-1.5">
+                                    {material.fileUrl && (
+                                      <>
+                                        <Button
+                                          variant="ghost"
+                                          size="sm"
+                                          className="h-7 rounded-full px-3 text-xs"
+                                          onClick={() =>
+                                            setPreviewVideo({
+                                              url: material.fileUrl!,
+                                              title: material.title,
+                                            })
+                                          }
+                                        >
+                                          <Play className="mr-1 h-3 w-3" />
+                                          预览
+                                        </Button>
+                                        <a
+                                          href={material.fileUrl}
+                                          target="_blank"
+                                          rel="noopener noreferrer"
+                                        >
+                                          <Button
+                                            variant="ghost"
+                                            size="sm"
+                                            className="h-7 w-full rounded-full px-3 text-xs"
+                                          >
+                                            <ExternalLink className="mr-1 h-3 w-3" />
+                                            打开
+                                          </Button>
+                                        </a>
+                                      </>
+                                    )}
+                                    {material.status === "processing" &&
+                                      material.seedanceTaskId && (
+                                        <Button
+                                          variant="ghost"
+                                          size="sm"
+                                          className="h-7 rounded-full px-3 text-xs"
+                                          onClick={() =>
+                                            checkStatusMutation.mutate({
+                                              materialId: material.id,
+                                              taskId: material.seedanceTaskId!,
+                                            })
+                                          }
+                                        >
+                                          <RefreshCw className="mr-1 h-3 w-3" />
+                                          查询
+                                        </Button>
+                                      )}
+                                  </div>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      </>
+                    )}
                   </div>
                 </CardContent>
               </Card>
@@ -831,21 +947,22 @@ export default function MaterialGeneration({ projectId }: Props) {
         </div>
       )}
 
+      {/* 视频预览弹窗 */}
       <Dialog open={!!previewVideo} onOpenChange={() => setPreviewVideo(null)}>
-        <DialogContent className="max-w-3xl bg-background border-border">
+        <DialogContent className="max-w-3xl border-border bg-background">
           <DialogHeader>
             <DialogTitle className="text-sm text-foreground">
               {previewVideo?.title}
             </DialogTitle>
           </DialogHeader>
-          {previewVideo ? (
+          {previewVideo && (
             <video
               src={previewVideo.url}
               controls
               autoPlay
               className="max-h-[70vh] w-full rounded-xl"
             />
-          ) : null}
+          )}
         </DialogContent>
       </Dialog>
     </div>

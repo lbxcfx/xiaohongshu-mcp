@@ -252,7 +252,7 @@ function DashboardLayoutContent({
             {navSections.map(section => (
               <SidebarGroup key={section.label} className="px-2 py-1">
                 {!isCollapsed && (
-                  <SidebarGroupLabel className="mb-1 px-2 text-xs uppercase tracking-wider text-sidebar-foreground/40">
+                  <SidebarGroupLabel className="mb-1 px-2 text-xs uppercase tracking-wider text-sidebar-foreground/55">
                     {section.label}
                   </SidebarGroupLabel>
                 )}
@@ -277,13 +277,13 @@ function DashboardLayoutContent({
                           className={`h-9 font-normal transition-all ${
                             active
                               ? "bg-primary/15 text-primary"
-                              : "text-sidebar-foreground/70 hover:bg-sidebar-accent hover:text-sidebar-foreground"
-                          } ${disabled ? "opacity-40" : ""}`}
+                              : "text-sidebar-foreground/85 hover:bg-sidebar-accent hover:text-sidebar-foreground"
+                          } ${disabled ? "opacity-35" : ""}`}
                         >
                           <item.icon
                             className={`h-4 w-4 shrink-0 ${active ? "text-primary" : ""}`}
                           />
-                          <span className="text-sm">{item.label}</span>
+                          <span className="text-[13.5px]">{item.label}</span>
                         </SidebarMenuButton>
                       </SidebarMenuItem>
                     );

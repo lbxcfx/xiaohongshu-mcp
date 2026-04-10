@@ -1,6 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
 import {
-  ExternalLink,
   Heart,
   Loader2,
   MessageCircle,
@@ -8,6 +7,7 @@ import {
   Share2,
   Sparkles,
   TrendingUp,
+  Video,
 } from "lucide-react";
 import { toast } from "sonner";
 import { Badge } from "@/components/ui/badge";
@@ -539,15 +539,15 @@ export default function TopicHub({ projectId }: Props) {
                     </div>
 
                     <div className="flex flex-wrap gap-2">
-                      {item.url ? (
+                      {toLocalAssetUrl(meta.videoDownloadPath) ? (
                         <a
-                          href={item.url}
+                          href={toLocalAssetUrl(meta.videoDownloadPath)}
                           target="_blank"
                           rel="noreferrer"
-                          className="inline-flex items-center gap-1 rounded-full border border-border px-3 py-1 text-xs text-foreground transition-colors hover:border-primary hover:text-primary"
+                          className="inline-flex items-center gap-1 rounded-full border border-primary/30 bg-primary/5 px-3 py-1 text-xs text-primary transition-colors hover:bg-primary/10"
                         >
-                          <ExternalLink className="h-3.5 w-3.5" />
-                          原视频
+                          <Video className="h-3.5 w-3.5" />
+                          本地视频
                         </a>
                       ) : null}
 

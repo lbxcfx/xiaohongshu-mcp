@@ -323,7 +323,7 @@ export default function Dashboard() {
               <Sparkles className="h-4 w-4" />
               AI 内容生产指挥台
             </div>
-            <h1 className="max-w-3xl text-3xl font-black leading-tight text-foreground md:text-5xl">
+            <h1 className="max-w-3xl text-3xl font-black leading-tight text-foreground [word-break:keep-all] md:text-5xl">
               把爆款拆成可复用的
               <span className="gradient-text"> 选题、脚本、视频和发布结果</span>
             </h1>
