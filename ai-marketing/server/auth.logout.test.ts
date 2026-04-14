@@ -3,7 +3,32 @@ import { appRouter } from "./routers";
 import { COOKIE_NAME } from "../shared/const";
 import type { TrpcContext } from "./_core/context";
 
-vi.mock("./db", () => ({}));
+vi.mock("./db", () => ({
+  getDefaultXhsAccount: vi.fn().mockResolvedValue({
+    id: 1,
+    userId: 1,
+    accountKey: "u1-default",
+    status: "unknown",
+    createdAt: new Date(),
+    updatedAt: new Date(),
+  }),
+  upsertXhsAccount: vi.fn().mockResolvedValue({
+    id: 1,
+    userId: 1,
+    accountKey: "u1-default",
+    status: "unknown",
+    createdAt: new Date(),
+    updatedAt: new Date(),
+  }),
+}));
+
+vi.mock("./_core/xhsApi", () => ({
+  deleteXhsCookies: vi.fn().mockResolvedValue(undefined),
+  getXhsLoginStatus: vi.fn().mockResolvedValue({
+    status: "unknown",
+    is_logged_in: false,
+  }),
+}));
 
 type CookieCall = {
   name: string;
@@ -21,8 +46,11 @@ function createAuthContext(): {
   const user: AuthenticatedUser = {
     id: 1,
     openId: "sample-user",
+    xhsUserId: null,
+    xhsNickname: null,
     email: "sample@example.com",
     name: "Sample User",
+    avatar: null,
     loginMethod: "manus",
     role: "user",
     createdAt: new Date(),

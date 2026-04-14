@@ -1,22 +1,30 @@
 import { useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { XhsLoginDialog } from "@/components/XhsLoginDialog";
+import { withXhsClientHeader } from "@/lib/xhsClientId";
 
 type LoginStatusResponse = {
-  status?: "unknown" | "waiting_verification" | "secondary_required" | "logged_in";
+  status?:
+    | "unknown"
+    | "waiting_verification"
+    | "secondary_required"
+    | "logged_in";
   is_logged_in: boolean;
   username?: string;
   detail?: string;
 };
 
 async function fetchJson<T>(path: string, init: RequestInit = {}): Promise<T> {
-  const response = await fetch(path, {
-    ...init,
-    headers: {
-      accept: "application/json",
-      ...(init.headers ?? {}),
-    },
-  });
+  const response = await fetch(
+    path,
+    withXhsClientHeader({
+      ...init,
+      headers: {
+        accept: "application/json",
+        ...(init.headers ?? {}),
+      },
+    })
+  );
 
   const payload = await response.json().catch(() => ({}));
   if (!response.ok || payload?.success === false) {
@@ -39,10 +47,14 @@ export default function XhsLoginPage() {
     setLoading(true);
     setError(null);
     try {
-      const nextStatus = await fetchJson<LoginStatusResponse>("/api/xhs/login/status");
+      const nextStatus = await fetchJson<LoginStatusResponse>(
+        "/api/xhs/login/status"
+      );
       setStatus(nextStatus);
     } catch (statusError) {
-      setError(statusError instanceof Error ? statusError.message : "读取登录状态失败");
+      setError(
+        statusError instanceof Error ? statusError.message : "读取登录状态失败"
+      );
     } finally {
       setLoading(false);
     }
@@ -60,7 +72,9 @@ export default function XhsLoginPage() {
       await refreshStatus();
       setDialogOpen(true);
     } catch (resetError) {
-      setError(resetError instanceof Error ? resetError.message : "清理登录态失败");
+      setError(
+        resetError instanceof Error ? resetError.message : "清理登录态失败"
+      );
     } finally {
       setResetting(false);
     }
@@ -88,9 +102,13 @@ export default function XhsLoginPage() {
                     : "未登录"}
               </p>
               {status?.detail ? (
-                <p className="mt-2 text-sm text-muted-foreground">{status.detail}</p>
+                <p className="mt-2 text-sm text-muted-foreground">
+                  {status.detail}
+                </p>
               ) : null}
-              {error ? <p className="mt-2 text-sm text-red-400">{error}</p> : null}
+              {error ? (
+                <p className="mt-2 text-sm text-red-400">{error}</p>
+              ) : null}
             </div>
 
             <div className="flex flex-wrap gap-3">

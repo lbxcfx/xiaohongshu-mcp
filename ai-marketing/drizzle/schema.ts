@@ -12,7 +12,10 @@ import {
 export const users = mysqlTable("users", {
   id: int("id").autoincrement().primaryKey(),
   openId: varchar("openId", { length: 64 }).notNull().unique(),
+  xhsUserId: varchar("xhsUserId", { length: 128 }),
+  xhsNickname: varchar("xhsNickname", { length: 255 }),
   name: text("name"),
+  avatar: text("avatar"),
   email: varchar("email", { length: 320 }),
   loginMethod: varchar("loginMethod", { length: 64 }),
   role: mysqlEnum("role", ["user", "admin"]).default("user").notNull(),
@@ -28,6 +31,7 @@ export type InsertUser = typeof users.$inferInsert;
 export const projects = mysqlTable("projects", {
   id: int("id").autoincrement().primaryKey(),
   userId: int("userId").notNull(),
+  xhsAccountId: int("xhsAccountId"),
   name: varchar("name", { length: 255 }).notNull(),
   description: text("description"),
   industry: varchar("industry", { length: 128 }),
@@ -41,6 +45,26 @@ export const projects = mysqlTable("projects", {
 
 export type Project = typeof projects.$inferSelect;
 export type InsertProject = typeof projects.$inferInsert;
+
+export const xhsAccounts = mysqlTable("xhs_accounts", {
+  id: int("id").autoincrement().primaryKey(),
+  userId: int("userId").notNull(),
+  accountKey: varchar("accountKey", { length: 128 }).notNull(),
+  xhsUserId: varchar("xhsUserId", { length: 128 }),
+  nickname: varchar("nickname", { length: 255 }),
+  avatar: text("avatar"),
+  status: mysqlEnum("status", ["unknown", "logged_in", "expired"])
+    .default("unknown")
+    .notNull(),
+  cookiesPath: text("cookiesPath"),
+  loginStatePath: text("loginStatePath"),
+  browserUserDataDir: text("browserUserDataDir"),
+  createdAt: timestamp("createdAt").defaultNow().notNull(),
+  updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
+});
+
+export type XhsAccount = typeof xhsAccounts.$inferSelect;
+export type InsertXhsAccount = typeof xhsAccounts.$inferInsert;
 
 // ─── Account Positionings ─────────────────────────────────────────────────────
 export const positionings = mysqlTable("positionings", {
@@ -223,7 +247,10 @@ export const materials = mysqlTable("materials", {
   status: mysqlEnum("status", ["uploading", "processing", "ready", "failed"])
     .default("uploading")
     .notNull(),
+  provider: varchar("provider", { length: 64 }),
+  taskType: varchar("taskType", { length: 64 }),
   seedanceTaskId: varchar("seedanceTaskId", { length: 128 }),
+  pixelleTaskId: varchar("pixelleTaskId", { length: 128 }),
   referenceImageUrl: text("referenceImageUrl"),
   prompt: text("prompt"),
   createdAt: timestamp("createdAt").defaultNow().notNull(),

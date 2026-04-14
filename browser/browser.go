@@ -28,6 +28,7 @@ type Browser struct {
 type browserConfig struct {
 	binPath     string
 	userDataDir string
+	cookiesPath string
 }
 
 type Option func(*browserConfig)
@@ -41,6 +42,12 @@ func WithBinPath(binPath string) Option {
 func WithUserDataDir(userDataDir string) Option {
 	return func(c *browserConfig) {
 		c.userDataDir = userDataDir
+	}
+}
+
+func WithCookiesPath(cookiesPath string) Option {
+	return func(c *browserConfig) {
+		c.cookiesPath = cookiesPath
 	}
 }
 
@@ -89,7 +96,10 @@ func NewBrowser(headless bool, options ...Option) *Browser {
 		ControlURL(browserURL).
 		MustConnect()
 
-	cookiePath := cookies.GetCookiesFilePath()
+	cookiePath := cfg.cookiesPath
+	if cookiePath == "" {
+		cookiePath = cookies.GetCookiesFilePath()
+	}
 	cookieLoader := cookies.NewLoadCookie(cookiePath)
 	if data, err := cookieLoader.LoadCookies(); err == nil {
 		var cookieList []*proto.NetworkCookie
@@ -148,7 +158,10 @@ func isEphemeralUserDataDir(userDataDir string) bool {
 }
 
 func CloneUserDataDirToTemp() (string, error) {
-	sourceDir := GetUserDataDir()
+	return CloneUserDataDirToTempFrom(GetUserDataDir())
+}
+
+func CloneUserDataDirToTempFrom(sourceDir string) (string, error) {
 	targetDir, err := os.MkdirTemp("", "xhs-browser-task-*")
 	if err != nil {
 		return "", err
@@ -222,7 +235,10 @@ func shouldSkipProfileEntry(relPath string, d fs.DirEntry) bool {
 }
 
 func ClearUserDataDir() error {
-	userDataDir := GetUserDataDir()
+	return ClearUserDataDirPath(GetUserDataDir())
+}
+
+func ClearUserDataDirPath(userDataDir string) error {
 	if err := os.RemoveAll(userDataDir); err == nil {
 		return nil
 	}
@@ -241,7 +257,10 @@ func ClearUserDataDir() error {
 
 // CleanupStaleBrowserProfile 清理残留的浏览器 profile 进程和目录。
 func CleanupStaleBrowserProfile() error {
-	userDataDir := GetUserDataDir()
+	return CleanupStaleBrowserProfilePath(GetUserDataDir())
+}
+
+func CleanupStaleBrowserProfilePath(userDataDir string) error {
 	logrus.Infof("cleanup stale browser profile: %s", userDataDir)
 
 	if runtime.GOOS == "linux" {

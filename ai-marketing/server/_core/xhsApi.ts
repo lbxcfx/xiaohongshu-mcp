@@ -112,14 +112,31 @@ export type XhsUserProfileLookup = {
   xsec_token: string;
 };
 
+export type XhsPublishVideoInput = {
+  title: string;
+  content: string;
+  video: string;
+  tags?: string[];
+  visibility?: string;
+};
+
+export type XhsPublishVideoResponse = {
+  post_id?: string;
+  status?: string;
+};
+
 async function requestXhsApi<T>(
   path: string,
-  init: RequestInit = {}
+  init: RequestInit = {},
+  accountKey?: string | null
 ): Promise<T> {
   const baseUrl = ENV.xhsApiUrl.endsWith("/")
     ? ENV.xhsApiUrl
     : `${ENV.xhsApiUrl}/`;
-  const url = new URL(path.replace(/^\//, ""), baseUrl).toString();
+  const scopedPath = accountKey
+    ? `/api/v1/accounts/${encodeURIComponent(accountKey)}${path.startsWith("/") ? path : `/${path}`}`
+    : path;
+  const url = new URL(scopedPath.replace(/^\//, ""), baseUrl).toString();
 
   const response = await fetch(url, {
     ...init,
@@ -148,91 +165,152 @@ async function requestXhsApi<T>(
   return payload as T;
 }
 
-export async function getXhsLoginStatus(): Promise<XhsLoginStatus> {
-  return requestXhsApi<XhsLoginStatus>("/api/v1/login/status");
+export async function getXhsLoginStatus(
+  accountKey?: string | null
+): Promise<XhsLoginStatus> {
+  return requestXhsApi<XhsLoginStatus>("/login/status", {}, accountKey);
 }
 
-export async function startXhsLoginSession(): Promise<XhsLoginStatus> {
-  return requestXhsApi<XhsLoginStatus>("/api/v1/login/session/start", {
-    method: "POST",
-  });
+export async function startXhsLoginSession(
+  accountKey?: string | null
+): Promise<XhsLoginStatus> {
+  return requestXhsApi<XhsLoginStatus>(
+    "/login/session/start",
+    {
+      method: "POST",
+    },
+    accountKey
+  );
 }
 
-export async function getXhsLoginQrcode(): Promise<XhsLoginQrcode> {
-  return requestXhsApi<XhsLoginQrcode>("/api/v1/login/qrcode");
+export async function getXhsLoginQrcode(
+  accountKey?: string | null
+): Promise<XhsLoginQrcode> {
+  return requestXhsApi<XhsLoginQrcode>("/login/qrcode", {}, accountKey);
 }
 
-export async function deleteXhsCookies(): Promise<void> {
-  await requestXhsApi("/api/v1/login/cookies", {
-    method: "DELETE",
-  });
+export async function deleteXhsCookies(
+  accountKey?: string | null
+): Promise<void> {
+  await requestXhsApi(
+    "/login/cookies",
+    {
+      method: "DELETE",
+    },
+    accountKey
+  );
 }
 
-export async function startXhsPhoneLogin(): Promise<XhsPhoneLoginStart> {
-  return requestXhsApi<XhsPhoneLoginStart>("/api/v1/login/phone/start", {
-    method: "POST",
-  });
+export async function startXhsPhoneLogin(
+  accountKey?: string | null
+): Promise<XhsPhoneLoginStart> {
+  return requestXhsApi<XhsPhoneLoginStart>(
+    "/login/phone/start",
+    {
+      method: "POST",
+    },
+    accountKey
+  );
 }
 
 export async function sendXhsPhoneLoginCode(
-  phone: string
+  phone: string,
+  accountKey?: string | null
 ): Promise<XhsPhoneLoginAction> {
-  return requestXhsApi<XhsPhoneLoginAction>("/api/v1/login/phone/send_code", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
+  return requestXhsApi<XhsPhoneLoginAction>(
+    "/login/phone/send_code",
+    {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ phone }),
     },
-    body: JSON.stringify({ phone }),
-  });
+    accountKey
+  );
 }
 
 export async function verifyXhsPhoneLoginCode(
-  code: string
+  code: string,
+  accountKey?: string | null
 ): Promise<XhsPhoneLoginAction> {
-  return requestXhsApi<XhsPhoneLoginAction>("/api/v1/login/phone/verify", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
+  return requestXhsApi<XhsPhoneLoginAction>(
+    "/login/phone/verify",
+    {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ code }),
     },
-    body: JSON.stringify({ code }),
-  });
+    accountKey
+  );
 }
 
 export async function searchXhsFeeds(
   keyword: string,
-  filters?: XhsSearchFilters
+  filters?: XhsSearchFilters,
+  accountKey?: string | null
 ): Promise<XhsSearchFeedsResponse> {
-  return requestXhsApi<XhsSearchFeedsResponse>("/api/v1/feeds/search", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
+  return requestXhsApi<XhsSearchFeedsResponse>(
+    "/feeds/search",
+    {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        keyword,
+        filters,
+      }),
     },
-    body: JSON.stringify({
-      keyword,
-      filters,
-    }),
-  });
+    accountKey
+  );
 }
 
-export async function getXhsMyProfile(): Promise<XhsUserProfile> {
+export async function getXhsMyProfile(
+  accountKey?: string | null
+): Promise<XhsUserProfile> {
   const result = await requestXhsApi<{ data?: XhsUserProfile }>(
-    "/api/v1/user/me"
+    "/user/me",
+    {},
+    accountKey
   );
   return result.data ?? { feeds: [] };
 }
 
 export async function getXhsUserProfile(
-  params: XhsUserProfileLookup
+  params: XhsUserProfileLookup,
+  accountKey?: string | null
 ): Promise<XhsUserProfile> {
   const result = await requestXhsApi<{ data?: XhsUserProfile }>(
-    "/api/v1/user/profile",
+    "/user/profile",
     {
       method: "POST",
       headers: {
         "content-type": "application/json",
       },
       body: JSON.stringify(params),
-    }
+    },
+    accountKey
   );
   return result.data ?? { feeds: [] };
+}
+
+export async function publishXhsVideo(
+  input: XhsPublishVideoInput,
+  accountKey?: string | null
+): Promise<XhsPublishVideoResponse> {
+  return requestXhsApi<XhsPublishVideoResponse>(
+    "/publish_video",
+    {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(input),
+      signal: AbortSignal.timeout(600_000),
+    },
+    accountKey
+  );
 }

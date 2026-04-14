@@ -65,18 +65,27 @@ type ShotItem = {
 
 type GenerationConfig = {
   type: "real_person" | "digital_avatar" | "before_after" | "other";
+  taskType:
+    | "quick_video"
+    | "product_i2v"
+    | "video_clone"
+    | "asset_remix"
+    | "long_marketing";
   ratio: "16:9" | "4:3" | "1:1" | "3:4" | "9:16" | "21:9" | "adaptive";
   duration: number;
   resolution: "480p" | "720p" | "1080p";
   generateAudio: boolean;
+  subtitlesEnabled: boolean;
 };
 
 const DEFAULT_CONFIG: GenerationConfig = {
   type: "real_person",
+  taskType: "quick_video",
   ratio: "9:16",
   duration: 5,
   resolution: "720p",
   generateAudio: true,
+  subtitlesEnabled: true,
 };
 
 const TYPE_LABELS: Record<GenerationConfig["type"], string> = {
@@ -85,6 +94,20 @@ const TYPE_LABELS: Record<GenerationConfig["type"], string> = {
   before_after: "术前术后",
   other: "其他素材",
 };
+
+const PIXELLE_TASK_LABELS: Record<GenerationConfig["taskType"], string> = {
+  quick_video: "快速短视频",
+  product_i2v: "商品图动起来",
+  video_clone: "参考视频复刻",
+  asset_remix: "多素材混剪",
+  long_marketing: "多分镜营销视频",
+};
+
+const PIXELLE_TASK_TYPES: GenerationConfig["taskType"][] = [
+  "video_clone",
+  "asset_remix",
+  "long_marketing",
+];
 
 function toLocalAssetUrl(filePath?: string) {
   if (!filePath) return undefined;
@@ -107,6 +130,38 @@ function shotKey(scriptId: number, shotIndex: number) {
 
 function directKey(scriptId: number) {
   return `direct:${scriptId}`;
+}
+
+function pixelleVideoKey(scriptId: number) {
+  return `pixelle-video:${scriptId}`;
+}
+
+function pixelleImageKey(scriptId: number) {
+  return `pixelle-image:${scriptId}`;
+}
+
+function materialTags(material: { tags?: unknown }) {
+  return Array.isArray(material.tags) ? material.tags.map(String) : [];
+}
+
+function materialProvider(material: {
+  provider?: string | null;
+  tags?: unknown;
+}) {
+  if (
+    material.provider === "pixelle" ||
+    materialTags(material).includes("pixelle")
+  ) {
+    return "pixelle";
+  }
+  return "seedance";
+}
+
+function materialTaskId(material: {
+  pixelleTaskId?: string | null;
+  seedanceTaskId?: string | null;
+}) {
+  return material.pixelleTaskId || material.seedanceTaskId;
 }
 
 // 素材状态配置
@@ -153,7 +208,7 @@ export default function MaterialGeneration({ projectId }: Props) {
   const [shotImages, setShotImages] = useState<Record<string, string>>({});
   const [configs, setConfigs] = useState<Record<number, GenerationConfig>>({});
   const [modeByScript, setModeByScript] = useState<
-    Record<number, "direct" | "storyboard">
+    Record<number, "direct" | "storyboard" | "pixelle">
   >({});
   const [previewVideo, setPreviewVideo] = useState<{
     url: string;
@@ -242,7 +297,7 @@ export default function MaterialGeneration({ projectId }: Props) {
       body: formData,
     });
     const data = (await response.json()) as { success?: boolean; url?: string };
-    if (!data.success || !data.url) throw new Error("参考图上传失败");
+    if (!data.success || !data.url) throw new Error("素材上传失败");
     setShotImages(prev => ({ ...prev, [key]: data.url! }));
   }
 
@@ -265,6 +320,7 @@ export default function MaterialGeneration({ projectId }: Props) {
         prompt: `画面描述：${shot.description}。镜头指令：${shot.cameraInstruction}。视觉建议：${shot.visualSuggestion}。口播内容：${shot.voiceOver}`,
         referenceImageUrl:
           shotImages[shotKey(row.script.id, shot.shotIndex)] || undefined,
+        taskType: "product_i2v",
         ratio: config.ratio,
         duration: config.duration,
         resolution: config.resolution,
@@ -287,6 +343,9 @@ export default function MaterialGeneration({ projectId }: Props) {
       scriptId: row.script.id,
       title: `${row.script.title} - 脚本直出`,
       type: config.type,
+      taskType: shotImages[directKey(row.script.id)]
+        ? "product_i2v"
+        : "quick_video",
       prompt,
       referenceImageUrl: shotImages[directKey(row.script.id)] || undefined,
       ratio: config.ratio,
@@ -295,6 +354,45 @@ export default function MaterialGeneration({ projectId }: Props) {
       generateAudio: config.generateAudio,
     });
     toast.success("已提交脚本直出视频任务");
+  }
+
+  async function handleGeneratePixelle(row: (typeof rows)[number]) {
+    const config = configs[row.script.id] ?? DEFAULT_CONFIG;
+    const prompt = (row.script.fullScript || row.script.title || "").trim();
+    const taskType = PIXELLE_TASK_TYPES.includes(config.taskType)
+      ? config.taskType
+      : "video_clone";
+    const referenceVideoUrl = shotImages[pixelleVideoKey(row.script.id)] || "";
+    const referenceImageUrl = shotImages[pixelleImageKey(row.script.id)] || "";
+
+    if (!prompt) {
+      toast.error("当前脚本内容为空，无法创建 Pixelle 任务");
+      return;
+    }
+
+    if (taskType === "video_clone" && !referenceVideoUrl) {
+      toast.error("参考视频复刻需要先填写或上传参考视频");
+      return;
+    }
+
+    await createTaskMutation.mutateAsync({
+      projectId: pid,
+      scriptId: row.script.id,
+      title: `${row.script.title} - ${PIXELLE_TASK_LABELS[taskType]}`,
+      provider: "pixelle",
+      taskType,
+      type: config.type,
+      prompt,
+      referenceVideoUrl: referenceVideoUrl || undefined,
+      referenceImageUrl: referenceImageUrl || undefined,
+      productImageUrls: referenceImageUrl ? [referenceImageUrl] : undefined,
+      ratio: config.ratio,
+      duration: config.duration,
+      resolution: config.resolution,
+      generateAudio: config.generateAudio,
+      subtitlesEnabled: config.subtitlesEnabled,
+    });
+    toast.success("已提交 Pixelle 编排任务");
   }
 
   function updateConfig(scriptId: number, patch: Partial<GenerationConfig>) {
@@ -417,9 +515,7 @@ export default function MaterialGeneration({ projectId }: Props) {
                           {(["ready", "processing", "failed"] as const).map(
                             s => {
                               const count = row.materials.filter(
-                                m =>
-                                  m.status === s ||
-                                  (s === "ready" && m.status === "completed")
+                                m => m.status === s
                               ).length;
                               if (!count) return null;
                               const st = getMaterialStatus(s);
@@ -487,7 +583,10 @@ export default function MaterialGeneration({ projectId }: Props) {
                             onValueChange={v =>
                               setModeByScript(prev => ({
                                 ...prev,
-                                [row.script.id]: v as "direct" | "storyboard",
+                                [row.script.id]: v as
+                                  | "direct"
+                                  | "storyboard"
+                                  | "pixelle",
                               }))
                             }
                           >
@@ -505,6 +604,13 @@ export default function MaterialGeneration({ projectId }: Props) {
                               >
                                 <Clapperboard className="mr-1 h-3 w-3" />
                                 分镜生成
+                              </TabsTrigger>
+                              <TabsTrigger
+                                value="pixelle"
+                                className="rounded-lg px-3 text-xs data-[state=active]:bg-primary data-[state=active]:text-primary-foreground"
+                              >
+                                <VideoIcon className="mr-1 h-3 w-3" />
+                                Pixelle
                               </TabsTrigger>
                             </TabsList>
                           </Tabs>
@@ -535,6 +641,39 @@ export default function MaterialGeneration({ projectId }: Props) {
                             </SelectContent>
                           </Select>
                         </div>
+
+                        {generationMode === "pixelle" && (
+                          <div className="space-y-1.5">
+                            <Label className="text-xs text-muted-foreground">
+                              Pixelle 类型
+                            </Label>
+                            <Select
+                              value={
+                                PIXELLE_TASK_TYPES.includes(
+                                  currentConfig.taskType
+                                )
+                                  ? currentConfig.taskType
+                                  : "video_clone"
+                              }
+                              onValueChange={v =>
+                                updateConfig(row.script.id, {
+                                  taskType: v as GenerationConfig["taskType"],
+                                })
+                              }
+                            >
+                              <SelectTrigger className="h-9 w-[138px] rounded-xl text-xs">
+                                <SelectValue />
+                              </SelectTrigger>
+                              <SelectContent>
+                                {PIXELLE_TASK_TYPES.map(v => (
+                                  <SelectItem key={v} value={v}>
+                                    {PIXELLE_TASK_LABELS[v]}
+                                  </SelectItem>
+                                ))}
+                              </SelectContent>
+                            </Select>
+                          </div>
+                        )}
 
                         {/* 视频比例 */}
                         <div className="space-y-1.5">
@@ -637,10 +776,145 @@ export default function MaterialGeneration({ projectId }: Props) {
                             />
                           </div>
                         </div>
+
+                        {generationMode === "pixelle" && (
+                          <div className="space-y-1.5">
+                            <Label className="text-xs text-muted-foreground">
+                              字幕
+                            </Label>
+                            <div className="flex h-9 items-center">
+                              <Switch
+                                checked={currentConfig.subtitlesEnabled}
+                                onCheckedChange={v =>
+                                  updateConfig(row.script.id, {
+                                    subtitlesEnabled: v,
+                                  })
+                                }
+                              />
+                            </div>
+                          </div>
+                        )}
                       </div>
 
                       {/* 生成区域 */}
-                      {generationMode === "direct" ? (
+                      {generationMode === "pixelle" ? (
+                        <div className="space-y-3 rounded-2xl border border-border/60 bg-muted/10 p-4">
+                          <p className="text-xs leading-6 text-muted-foreground">
+                            Pixelle
+                            负责参考视频复刻、多素材混剪和多分镜编排；后端统一创建任务，简单短视频仍由
+                            Seedance 处理。
+                          </p>
+                          <div className="grid gap-3 md:grid-cols-2">
+                            <div className="space-y-1.5">
+                              <Label className="text-xs text-muted-foreground">
+                                参考视频
+                              </Label>
+                              <div className="flex items-center gap-2">
+                                <Input
+                                  placeholder="视频 URL 或上传本地视频"
+                                  value={
+                                    shotImages[
+                                      pixelleVideoKey(row.script.id)
+                                    ] || ""
+                                  }
+                                  onChange={e =>
+                                    setShotImages(prev => ({
+                                      ...prev,
+                                      [pixelleVideoKey(row.script.id)]:
+                                        e.target.value,
+                                    }))
+                                  }
+                                  className="h-9 rounded-xl text-xs"
+                                />
+                                <label className="inline-flex shrink-0 cursor-pointer items-center gap-1.5 rounded-xl border border-border px-3 py-2 text-xs text-muted-foreground hover:border-primary hover:text-primary transition-colors">
+                                  <Upload className="h-3.5 w-3.5" />
+                                  上传
+                                  <input
+                                    type="file"
+                                    accept="video/*"
+                                    className="hidden"
+                                    onChange={async e => {
+                                      const file = e.target.files?.[0];
+                                      if (!file) return;
+                                      try {
+                                        await handleUploadByKey(
+                                          pixelleVideoKey(row.script.id),
+                                          file
+                                        );
+                                        toast.success("参考视频上传成功");
+                                      } catch (error) {
+                                        toast.error(
+                                          (error as Error).message || "上传失败"
+                                        );
+                                      }
+                                    }}
+                                  />
+                                </label>
+                              </div>
+                            </div>
+                            <div className="space-y-1.5">
+                              <Label className="text-xs text-muted-foreground">
+                                商品图
+                              </Label>
+                              <div className="flex items-center gap-2">
+                                <Input
+                                  placeholder="商品图 URL 或上传图片"
+                                  value={
+                                    shotImages[
+                                      pixelleImageKey(row.script.id)
+                                    ] || ""
+                                  }
+                                  onChange={e =>
+                                    setShotImages(prev => ({
+                                      ...prev,
+                                      [pixelleImageKey(row.script.id)]:
+                                        e.target.value,
+                                    }))
+                                  }
+                                  className="h-9 rounded-xl text-xs"
+                                />
+                                <label className="inline-flex shrink-0 cursor-pointer items-center gap-1.5 rounded-xl border border-border px-3 py-2 text-xs text-muted-foreground hover:border-primary hover:text-primary transition-colors">
+                                  <Upload className="h-3.5 w-3.5" />
+                                  上传
+                                  <input
+                                    type="file"
+                                    accept="image/*"
+                                    className="hidden"
+                                    onChange={async e => {
+                                      const file = e.target.files?.[0];
+                                      if (!file) return;
+                                      try {
+                                        await handleUploadByKey(
+                                          pixelleImageKey(row.script.id),
+                                          file
+                                        );
+                                        toast.success("商品图上传成功");
+                                      } catch (error) {
+                                        toast.error(
+                                          (error as Error).message || "上传失败"
+                                        );
+                                      }
+                                    }}
+                                  />
+                                </label>
+                              </div>
+                            </div>
+                          </div>
+                          <Button
+                            size="sm"
+                            onClick={() => void handleGeneratePixelle(row)}
+                            disabled={createTaskMutation.isPending}
+                            className="rounded-full px-5"
+                          >
+                            {createTaskMutation.isPending ? (
+                              <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                            ) : (
+                              <VideoIcon className="mr-1.5 h-3.5 w-3.5" />
+                            )}
+                            创建 Pixelle 任务
+                          </Button>
+                        </div>
+                      ) : generationMode === "direct" ? (
                         <div className="space-y-3 rounded-2xl border border-border/60 bg-muted/10 p-4">
                           <p className="text-xs text-muted-foreground">
                             直接把当前脚本正文提交给 Seedance
@@ -861,6 +1135,8 @@ export default function MaterialGeneration({ projectId }: Props) {
                                 material.status ?? "pending"
                               );
                               const StatusIcon = st.icon;
+                              const provider = materialProvider(material);
+                              const taskId = materialTaskId(material);
                               return (
                                 <div
                                   key={material.id}
@@ -871,14 +1147,24 @@ export default function MaterialGeneration({ projectId }: Props) {
                                       {material.title}
                                     </p>
                                     <div className="mt-1.5">
-                                      <span
-                                        className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-xs ${st.className}`}
-                                      >
-                                        <StatusIcon
-                                          className={`h-3 w-3 ${material.status === "processing" ? "animate-spin" : ""}`}
-                                        />
-                                        {st.label}
-                                      </span>
+                                      <div className="flex flex-wrap gap-1.5">
+                                        <span
+                                          className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-xs ${st.className}`}
+                                        >
+                                          <StatusIcon
+                                            className={`h-3 w-3 ${material.status === "processing" ? "animate-spin" : ""}`}
+                                          />
+                                          {st.label}
+                                        </span>
+                                        <Badge
+                                          variant="outline"
+                                          className="rounded-full px-2 py-0.5 text-xs"
+                                        >
+                                          {provider === "pixelle"
+                                            ? "Pixelle"
+                                            : "Seedance"}
+                                        </Badge>
+                                      </div>
                                     </div>
                                   </div>
                                   <div className="flex shrink-0 flex-col gap-1.5">
@@ -915,7 +1201,7 @@ export default function MaterialGeneration({ projectId }: Props) {
                                       </>
                                     )}
                                     {material.status === "processing" &&
-                                      material.seedanceTaskId && (
+                                      taskId && (
                                         <Button
                                           variant="ghost"
                                           size="sm"
@@ -923,7 +1209,8 @@ export default function MaterialGeneration({ projectId }: Props) {
                                           onClick={() =>
                                             checkStatusMutation.mutate({
                                               materialId: material.id,
-                                              taskId: material.seedanceTaskId!,
+                                              taskId,
+                                              provider,
                                             })
                                           }
                                         >

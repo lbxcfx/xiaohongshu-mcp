@@ -8,6 +8,7 @@ vi.mock("./db", () => ({
     {
       id: 1,
       userId: 1,
+      xhsAccountId: 1,
       name: "Test Project",
       description: "A test project",
       industry: "医美",
@@ -23,6 +24,7 @@ vi.mock("./db", () => ({
   getProjectById: vi.fn().mockResolvedValue({
     id: 1,
     userId: 1,
+    xhsAccountId: 1,
     name: "Test Project",
     industry: "医美",
     status: "active",
@@ -87,6 +89,32 @@ vi.mock("./db", () => ({
   logUsage: vi.fn().mockResolvedValue(undefined),
   upsertUser: vi.fn().mockResolvedValue(undefined),
   getUserByOpenId: vi.fn().mockResolvedValue(undefined),
+  getXhsAccounts: vi.fn().mockResolvedValue([]),
+  getDefaultXhsAccount: vi.fn().mockResolvedValue({
+    id: 1,
+    userId: 1,
+    accountKey: "u1-default",
+    status: "unknown",
+    createdAt: new Date(),
+    updatedAt: new Date(),
+  }),
+  getXhsAccountById: vi.fn().mockResolvedValue({
+    id: 1,
+    userId: 1,
+    accountKey: "u1-default",
+    status: "unknown",
+    createdAt: new Date(),
+    updatedAt: new Date(),
+  }),
+  upsertXhsAccount: vi.fn().mockResolvedValue({
+    id: 1,
+    userId: 1,
+    accountKey: "u1-default",
+    status: "unknown",
+    createdAt: new Date(),
+    updatedAt: new Date(),
+  }),
+  upsertMaterialPublication: vi.fn().mockResolvedValue(1),
 }));
 
 // Mock the LLM module
@@ -109,11 +137,40 @@ vi.mock("./_core/ark", () => ({
   }),
 }));
 
+vi.mock("./_core/pixelle", () => ({
+  createPixelleTask: vi.fn().mockResolvedValue({
+    taskId: "pixelle-test-task",
+    status: "queued",
+  }),
+  queryPixelleTask: vi.fn().mockResolvedValue({
+    status: "running",
+    progress: 20,
+  }),
+}));
+
 vi.mock("./_core/lux", () => ({
   downloadWithLux: vi.fn().mockResolvedValue({
     success: true,
     filePath: "/tmp/test-video.mp4",
     attempts: 1,
+  }),
+}));
+
+vi.mock("./_core/xhsApi", () => ({
+  getXhsLoginStatus: vi.fn().mockResolvedValue({
+    status: "unknown",
+    is_logged_in: false,
+  }),
+  getXhsLoginQrcode: vi.fn().mockResolvedValue({
+    timeout: "0s",
+    is_logged_in: false,
+  }),
+  deleteXhsCookies: vi.fn().mockResolvedValue(undefined),
+  searchXhsFeeds: vi.fn().mockResolvedValue({ feeds: [], count: 0 }),
+  getXhsUserProfile: vi.fn().mockResolvedValue({ feeds: [] }),
+  publishXhsVideo: vi.fn().mockResolvedValue({
+    post_id: "test-post",
+    status: "published",
   }),
 }));
 
@@ -389,6 +446,34 @@ describe("materials router", () => {
     const caller = appRouter.createCaller(ctx);
     const result = await caller.materials.delete({ id: 1 });
     expect(result).toEqual({ success: true });
+  });
+});
+
+describe("video generation router", () => {
+  it("creates a Pixelle material task", async () => {
+    const ctx = createAuthContext();
+    const caller = appRouter.createCaller(ctx);
+    const result = await caller.videoGeneration.createTask({
+      projectId: 1,
+      scriptId: 1,
+      title: "Pixelle 测试任务",
+      provider: "pixelle",
+      taskType: "video_clone",
+      type: "real_person",
+      prompt: "按参考视频结构生成营销短视频",
+      referenceVideoUrl: "/_local/uploads/1/demo.mp4",
+      ratio: "9:16",
+      duration: 8,
+      resolution: "720p",
+      generateAudio: true,
+      subtitlesEnabled: true,
+    });
+
+    expect(result).toMatchObject({
+      materialId: 1,
+      taskId: "pixelle-test-task",
+      provider: "pixelle",
+    });
   });
 });
 

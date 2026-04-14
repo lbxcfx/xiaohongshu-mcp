@@ -6,6 +6,7 @@ import { DatabaseSync } from "node:sqlite";
 import {
   InsertUser,
   users,
+  xhsAccounts,
   projects,
   positionings,
   topicHubItems,
@@ -18,6 +19,7 @@ import {
   materialPublications,
   usageStats,
   type InsertProject,
+  type InsertXhsAccount,
   type InsertPositioning,
   type InsertTopicHubItem,
   type InsertTopic,
@@ -38,11 +40,27 @@ type ProjectStatus = "active" | "archived";
 type SqliteProjectRow = {
   id: number;
   userId: number;
+  xhsAccountId: number | null;
   name: string;
   description: string | null;
   industry: string | null;
   platform: string | null;
   status: ProjectStatus;
+  createdAt: string;
+  updatedAt: string;
+};
+
+type SqliteXhsAccountRow = {
+  id: number;
+  userId: number;
+  accountKey: string;
+  xhsUserId: string | null;
+  nickname: string | null;
+  avatar: string | null;
+  status: string;
+  cookiesPath: string | null;
+  loginStatePath: string | null;
+  browserUserDataDir: string | null;
   createdAt: string;
   updatedAt: string;
 };
@@ -155,11 +173,36 @@ function getSqliteDb() {
     CREATE TABLE IF NOT EXISTS projects (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       userId INTEGER NOT NULL,
+      xhsAccountId INTEGER,
       name TEXT NOT NULL,
       description TEXT,
       industry TEXT,
       platform TEXT,
       status TEXT NOT NULL DEFAULT 'active',
+      createdAt TEXT NOT NULL,
+      updatedAt TEXT NOT NULL
+    )
+  `);
+  const projectColumns = (
+    _sqliteDb.prepare("PRAGMA table_info(projects)").all() as Array<{
+      name: string;
+    }>
+  ).map(column => column.name);
+  if (!projectColumns.includes("xhsAccountId")) {
+    _sqliteDb.exec("ALTER TABLE projects ADD COLUMN xhsAccountId INTEGER");
+  }
+  _sqliteDb.exec(`
+    CREATE TABLE IF NOT EXISTS xhs_accounts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      userId INTEGER NOT NULL,
+      accountKey TEXT NOT NULL,
+      xhsUserId TEXT,
+      nickname TEXT,
+      avatar TEXT,
+      status TEXT NOT NULL DEFAULT 'unknown',
+      cookiesPath TEXT,
+      loginStatePath TEXT,
+      browserUserDataDir TEXT,
       createdAt TEXT NOT NULL,
       updatedAt TEXT NOT NULL
     )
@@ -273,13 +316,30 @@ function getSqliteDb() {
       treatmentType TEXT,
       style TEXT,
       status TEXT NOT NULL DEFAULT 'uploading',
+      provider TEXT,
+      taskType TEXT,
       seedanceTaskId TEXT,
+      pixelleTaskId TEXT,
       referenceImageUrl TEXT,
       prompt TEXT,
       createdAt TEXT DEFAULT (datetime('now')),
       updatedAt TEXT DEFAULT (datetime('now'))
     )
   `);
+  const materialColumns = (
+    _sqliteDb.prepare("PRAGMA table_info(materials)").all() as Array<{
+      name: string;
+    }>
+  ).map(column => column.name);
+  if (!materialColumns.includes("provider")) {
+    _sqliteDb.exec("ALTER TABLE materials ADD COLUMN provider TEXT");
+  }
+  if (!materialColumns.includes("taskType")) {
+    _sqliteDb.exec("ALTER TABLE materials ADD COLUMN taskType TEXT");
+  }
+  if (!materialColumns.includes("pixelleTaskId")) {
+    _sqliteDb.exec("ALTER TABLE materials ADD COLUMN pixelleTaskId TEXT");
+  }
   _sqliteDb.exec(`
     CREATE TABLE IF NOT EXISTS platform_adaptations (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -324,11 +384,30 @@ function mapSqliteProject(row: SqliteProjectRow | undefined | null) {
   return {
     id: Number(row.id),
     userId: Number(row.userId),
+    xhsAccountId: row.xhsAccountId,
     name: row.name,
     description: row.description,
     industry: row.industry,
     platform: row.platform,
     status: row.status,
+    createdAt: new Date(row.createdAt),
+    updatedAt: new Date(row.updatedAt),
+  };
+}
+
+function mapSqliteXhsAccount(row: SqliteXhsAccountRow | undefined | null) {
+  if (!row) return null;
+  return {
+    id: Number(row.id),
+    userId: Number(row.userId),
+    accountKey: row.accountKey,
+    xhsUserId: row.xhsUserId,
+    nickname: row.nickname,
+    avatar: row.avatar,
+    status: row.status as "unknown" | "logged_in" | "expired",
+    cookiesPath: row.cookiesPath,
+    loginStatePath: row.loginStatePath,
+    browserUserDataDir: row.browserUserDataDir,
     createdAt: new Date(row.createdAt),
     updatedAt: new Date(row.updatedAt),
   };
@@ -404,7 +483,14 @@ export async function upsertUser(user: InsertUser): Promise<void> {
   try {
     const values: InsertUser = { openId: user.openId };
     const updateSet: Record<string, unknown> = {};
-    const textFields = ["name", "email", "loginMethod"] as const;
+    const textFields = [
+      "xhsUserId",
+      "xhsNickname",
+      "name",
+      "avatar",
+      "email",
+      "loginMethod",
+    ] as const;
     type TextField = (typeof textFields)[number];
     const assignNullable = (field: TextField) => {
       const value = user[field];
@@ -449,6 +535,145 @@ export async function getUserByOpenId(openId: string) {
   return result.length > 0 ? result[0] : undefined;
 }
 
+// ─── XHS Accounts ─────────────────────────────────────────────────────────────
+export async function getXhsAccounts(userId: number) {
+  const db = await getDb();
+  if (!db) {
+    const sqlite = getSqliteDb();
+    const rows = sqlite
+      .prepare(
+        `SELECT * FROM xhs_accounts WHERE userId = ? ORDER BY datetime(updatedAt) DESC, id DESC`
+      )
+      .all(userId) as SqliteXhsAccountRow[];
+    return rows.map(row => mapSqliteXhsAccount(row)!);
+  }
+  return db
+    .select()
+    .from(xhsAccounts)
+    .where(eq(xhsAccounts.userId, userId))
+    .orderBy(desc(xhsAccounts.updatedAt));
+}
+
+export async function getXhsAccountById(userId: number, id: number) {
+  const db = await getDb();
+  if (!db) {
+    const sqlite = getSqliteDb();
+    const row = sqlite
+      .prepare(`SELECT * FROM xhs_accounts WHERE userId = ? AND id = ? LIMIT 1`)
+      .get(userId, id) as SqliteXhsAccountRow | undefined;
+    return mapSqliteXhsAccount(row);
+  }
+  const rows = await db
+    .select()
+    .from(xhsAccounts)
+    .where(and(eq(xhsAccounts.userId, userId), eq(xhsAccounts.id, id)))
+    .limit(1);
+  return rows[0] ?? null;
+}
+
+export async function upsertXhsAccount(
+  userId: number,
+  data: Omit<InsertXhsAccount, "userId"> & { id?: number }
+) {
+  const db = await getDb();
+  const now = new Date();
+  if (!db) {
+    const sqlite = getSqliteDb();
+    const existing = sqlite
+      .prepare(
+        `SELECT * FROM xhs_accounts WHERE userId = ? AND accountKey = ? LIMIT 1`
+      )
+      .get(userId, data.accountKey) as SqliteXhsAccountRow | undefined;
+
+    if (existing) {
+      sqlite
+        .prepare(
+          `UPDATE xhs_accounts
+           SET xhsUserId = ?, nickname = ?, avatar = ?, status = ?, cookiesPath = ?, loginStatePath = ?, browserUserDataDir = ?, updatedAt = ?
+           WHERE id = ? AND userId = ?`
+        )
+        .run(
+          data.xhsUserId ?? existing.xhsUserId,
+          data.nickname ?? existing.nickname,
+          data.avatar ?? existing.avatar,
+          data.status ?? existing.status,
+          data.cookiesPath ?? existing.cookiesPath,
+          data.loginStatePath ?? existing.loginStatePath,
+          data.browserUserDataDir ?? existing.browserUserDataDir,
+          now.toISOString(),
+          existing.id,
+          userId
+        );
+      return getXhsAccountById(userId, existing.id);
+    }
+
+    const result = sqlite
+      .prepare(
+        `INSERT INTO xhs_accounts (userId, accountKey, xhsUserId, nickname, avatar, status, cookiesPath, loginStatePath, browserUserDataDir, createdAt, updatedAt)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        userId,
+        data.accountKey,
+        data.xhsUserId ?? null,
+        data.nickname ?? null,
+        data.avatar ?? null,
+        data.status ?? "unknown",
+        data.cookiesPath ?? null,
+        data.loginStatePath ?? null,
+        data.browserUserDataDir ?? null,
+        now.toISOString(),
+        now.toISOString()
+      );
+    return getXhsAccountById(userId, Number(result.lastInsertRowid));
+  }
+
+  const existing = await db
+    .select()
+    .from(xhsAccounts)
+    .where(
+      and(
+        eq(xhsAccounts.userId, userId),
+        eq(xhsAccounts.accountKey, data.accountKey)
+      )
+    )
+    .limit(1);
+  const values = { ...data, userId } as InsertXhsAccount;
+  if (existing[0]) {
+    await db
+      .update(xhsAccounts)
+      .set({
+        xhsUserId: values.xhsUserId,
+        nickname: values.nickname,
+        avatar: values.avatar,
+        status: values.status,
+        cookiesPath: values.cookiesPath,
+        loginStatePath: values.loginStatePath,
+        browserUserDataDir: values.browserUserDataDir,
+        updatedAt: now,
+      })
+      .where(eq(xhsAccounts.id, existing[0].id));
+  } else {
+    await db.insert(xhsAccounts).values(values);
+  }
+  const rows = await db
+    .select()
+    .from(xhsAccounts)
+    .where(
+      and(
+        eq(xhsAccounts.userId, userId),
+        eq(xhsAccounts.accountKey, data.accountKey)
+      )
+    )
+    .limit(1);
+  return rows[0] ?? null;
+}
+
+export async function getDefaultXhsAccount(userId: number) {
+  const accounts = await getXhsAccounts(userId);
+  return accounts[0] ?? null;
+}
+
 // ─── Projects ─────────────────────────────────────────────────────────────────
 export async function getProjects(userId: number) {
   const db = await getDb();
@@ -456,7 +681,7 @@ export async function getProjects(userId: number) {
     const sqlite = getSqliteDb();
     const rows = sqlite
       .prepare(
-        `SELECT id, userId, name, description, industry, platform, status, createdAt, updatedAt
+        `SELECT id, userId, xhsAccountId, name, description, industry, platform, status, createdAt, updatedAt
          FROM projects
          WHERE userId = ?
          ORDER BY datetime(createdAt) DESC, id DESC`
@@ -477,7 +702,7 @@ export async function getProjectById(userId: number, id: number) {
     const sqlite = getSqliteDb();
     const row = sqlite
       .prepare(
-        `SELECT id, userId, name, description, industry, platform, status, createdAt, updatedAt
+        `SELECT id, userId, xhsAccountId, name, description, industry, platform, status, createdAt, updatedAt
          FROM projects
          WHERE id = ? AND userId = ?
          LIMIT 1`
@@ -503,11 +728,12 @@ export async function createProject(
     const now = new Date().toISOString();
     const result = sqlite
       .prepare(
-        `INSERT INTO projects (userId, name, description, industry, platform, status, createdAt, updatedAt)
-         VALUES (?, ?, ?, ?, ?, 'active', ?, ?)`
+        `INSERT INTO projects (userId, xhsAccountId, name, description, industry, platform, status, createdAt, updatedAt)
+         VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?)`
       )
       .run(
         userId,
+        data.xhsAccountId ?? null,
         data.name,
         data.description ?? null,
         data.industry ?? null,
@@ -517,7 +743,7 @@ export async function createProject(
       );
     const row = sqlite
       .prepare(
-        `SELECT id, userId, name, description, industry, platform, status, createdAt, updatedAt
+        `SELECT id, userId, xhsAccountId, name, description, industry, platform, status, createdAt, updatedAt
          FROM projects
          WHERE id = ?
          LIMIT 1`
@@ -545,6 +771,7 @@ export async function updateProject(
     description?: string;
     industry?: string;
     platform?: string;
+    xhsAccountId?: number | null;
     status?: "active" | "archived";
   }
 ) {
@@ -568,6 +795,10 @@ export async function updateProject(
     if (data.platform !== undefined) {
       fields.push("platform = ?");
       values.push(data.platform ?? null);
+    }
+    if (data.xhsAccountId !== undefined) {
+      fields.push("xhsAccountId = ?");
+      values.push(data.xhsAccountId ?? null);
     }
     if (data.status !== undefined) {
       fields.push("status = ?");
@@ -1364,7 +1595,10 @@ type SqliteMaterialRow = {
   treatmentType: string | null;
   style: string | null;
   status: string;
+  provider: string | null;
+  taskType: string | null;
   seedanceTaskId: string | null;
+  pixelleTaskId: string | null;
   referenceImageUrl: string | null;
   prompt: string | null;
   createdAt: string;
@@ -1425,7 +1659,10 @@ function mapSqliteMaterial(row: SqliteMaterialRow | undefined | null) {
     treatmentType: row.treatmentType,
     style: row.style,
     status: row.status as "uploading" | "processing" | "ready" | "failed",
+    provider: row.provider,
+    taskType: row.taskType,
     seedanceTaskId: row.seedanceTaskId,
+    pixelleTaskId: row.pixelleTaskId,
     referenceImageUrl: row.referenceImageUrl,
     prompt: row.prompt,
     createdAt: new Date(row.createdAt),
@@ -1505,7 +1742,10 @@ export async function getMaterials(userId: number, projectId: number) {
 export async function createMaterial(
   userId: number,
   data: Omit<InsertMaterial, "userId"> & {
+    provider?: string;
+    taskType?: string;
     seedanceTaskId?: string;
+    pixelleTaskId?: string;
     referenceImageUrl?: string;
     prompt?: string;
   }
@@ -1516,8 +1756,8 @@ export async function createMaterial(
     const now = new Date().toISOString();
     const result = sqlite
       .prepare(
-        `INSERT INTO materials (projectId, userId, scriptId, type, title, fileUrl, thumbnailUrl, tags, bodyPart, treatmentType, style, status, seedanceTaskId, referenceImageUrl, prompt, createdAt, updatedAt)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        `INSERT INTO materials (projectId, userId, scriptId, type, title, fileUrl, thumbnailUrl, tags, bodyPart, treatmentType, style, status, provider, taskType, seedanceTaskId, pixelleTaskId, referenceImageUrl, prompt, createdAt, updatedAt)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         data.projectId,
@@ -1532,7 +1772,10 @@ export async function createMaterial(
         data.treatmentType ?? null,
         data.style ?? null,
         data.status ?? "uploading",
+        data.provider ?? null,
+        data.taskType ?? null,
         data.seedanceTaskId ?? null,
+        data.pixelleTaskId ?? null,
         data.referenceImageUrl ?? null,
         data.prompt ?? null,
         now,
@@ -1556,7 +1799,10 @@ export async function updateMaterial(
     tags?: string[];
     fileUrl?: string;
     thumbnailUrl?: string;
+    provider?: string;
+    taskType?: string;
     seedanceTaskId?: string;
+    pixelleTaskId?: string;
     referenceImageUrl?: string;
     prompt?: string;
   }
@@ -1583,9 +1829,21 @@ export async function updateMaterial(
       sets.push("thumbnailUrl = ?");
       vals.push(rest.thumbnailUrl);
     }
+    if (rest.provider !== undefined) {
+      sets.push("provider = ?");
+      vals.push(rest.provider);
+    }
+    if (rest.taskType !== undefined) {
+      sets.push("taskType = ?");
+      vals.push(rest.taskType);
+    }
     if (rest.seedanceTaskId !== undefined) {
       sets.push("seedanceTaskId = ?");
       vals.push(rest.seedanceTaskId);
+    }
+    if (rest.pixelleTaskId !== undefined) {
+      sets.push("pixelleTaskId = ?");
+      vals.push(rest.pixelleTaskId);
     }
     if (rest.referenceImageUrl !== undefined) {
       sets.push("referenceImageUrl = ?");

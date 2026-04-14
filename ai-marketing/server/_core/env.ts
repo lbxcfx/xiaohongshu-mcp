@@ -18,4 +18,6 @@ export const ENV = {
     process.env.ARK_FILE_UPLOAD_TIMEOUT_MS ?? "900000"
   ),
   arkResponseTimeoutMs: Number(process.env.ARK_RESPONSE_TIMEOUT_MS ?? "600000"),
+  pixelleApiUrl: process.env.PIXELLE_API_URL ?? "",
+  pixelleApiKey: process.env.PIXELLE_API_KEY ?? "",
 };

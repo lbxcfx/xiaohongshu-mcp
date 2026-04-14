@@ -9,6 +9,7 @@ import {
 } from "@/components/ui/dialog";
 import { Loader2, RefreshCw, ShieldCheck, Smartphone } from "lucide-react";
 import { trpc } from "@/lib/trpc";
+import { withXhsClientHeader } from "@/lib/xhsClientId";
 
 type XhsLoginDialogProps = {
   open: boolean;
@@ -37,13 +38,16 @@ function resolveStatus(status: LoginStatusResponse | null): LoginStatus {
 }
 
 async function fetchJson<T>(path: string, init: RequestInit = {}): Promise<T> {
-  const response = await fetch(path, {
-    ...init,
-    headers: {
-      accept: "application/json",
-      ...(init.headers ?? {}),
-    },
-  });
+  const response = await fetch(
+    path,
+    withXhsClientHeader({
+      ...init,
+      headers: {
+        accept: "application/json",
+        ...(init.headers ?? {}),
+      },
+    })
+  );
 
   const payload = await response.json().catch(() => ({}));
   if (!response.ok || payload?.success === false) {

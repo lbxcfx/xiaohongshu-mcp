@@ -3,7 +3,6 @@ package main
 import (
 	"net/http"
 
-	"github.com/xpzouying/xiaohongshu-mcp/cookies"
 	xhsErrors "github.com/xpzouying/xiaohongshu-mcp/errors"
 	"github.com/xpzouying/xiaohongshu-mcp/xiaohongshu"
 
@@ -56,7 +55,6 @@ func (s *AppServer) checkLoginStatusHandler(c *gin.Context) {
 		return
 	}
 
-	c.Set("account", "ai-report")
 	respondSuccess(c, status, "检查登录状态成功")
 }
 
@@ -158,7 +156,8 @@ func (s *AppServer) deleteCookiesHandler(c *gin.Context) {
 		return
 	}
 
-	cookiePath := cookies.GetCookiesFilePath()
+	account := getAccountRuntime(c.Request.Context())
+	cookiePath := account.CookiesPath
 	respondSuccess(c, map[string]interface{}{
 		"cookie_path": cookiePath,
 		"message":     "Cookies 已成功删除，登录状态已重置。下次操作时需要重新登录。",
@@ -215,7 +214,6 @@ func (s *AppServer) listFeedsHandler(c *gin.Context) {
 		return
 	}
 
-	c.Set("account", "ai-report")
 	respondSuccess(c, result, "获取Feeds列表成功")
 }
 
@@ -258,7 +256,6 @@ func (s *AppServer) searchFeedsHandler(c *gin.Context) {
 		return
 	}
 
-	c.Set("account", "ai-report")
 	respondSuccess(c, result, "搜索Feeds成功")
 }
 
@@ -294,7 +291,6 @@ func (s *AppServer) getFeedDetailHandler(c *gin.Context) {
 		return
 	}
 
-	c.Set("account", "ai-report")
 	respondSuccess(c, result, "获取Feed详情成功")
 }
 
@@ -315,7 +311,6 @@ func (s *AppServer) userProfileHandler(c *gin.Context) {
 		return
 	}
 
-	c.Set("account", "ai-report")
 	respondSuccess(c, map[string]any{"data": result}, "result.Message")
 }
 
@@ -336,7 +331,6 @@ func (s *AppServer) postCommentHandler(c *gin.Context) {
 		return
 	}
 
-	c.Set("account", "ai-report")
 	respondSuccess(c, result, result.Message)
 }
 
@@ -356,7 +350,6 @@ func (s *AppServer) replyCommentHandler(c *gin.Context) {
 		return
 	}
 
-	c.Set("account", "ai-report")
 	respondSuccess(c, result, result.Message)
 }
 
@@ -365,7 +358,6 @@ func healthHandler(c *gin.Context) {
 	respondSuccess(c, map[string]any{
 		"status":    "healthy",
 		"service":   "xiaohongshu-mcp",
-		"account":   "ai-report",
 		"timestamp": "now",
 	}, "服务正常")
 }
@@ -380,6 +372,5 @@ func (s *AppServer) myProfileHandler(c *gin.Context) {
 		return
 	}
 
-	c.Set("account", "ai-report")
 	respondSuccess(c, map[string]any{"data": result}, "获取我的主页成功")
 }

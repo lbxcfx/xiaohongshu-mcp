@@ -1,19 +1,25 @@
 import { trpc } from "@/lib/trpc";
 import { UNAUTHED_ERR_MSG } from "@shared/const";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { httpBatchLink, httpLink, splitLink, TRPCClientError } from "@trpc/client";
+import {
+  httpBatchLink,
+  httpLink,
+  splitLink,
+  TRPCClientError,
+} from "@trpc/client";
 import { createRoot } from "react-dom/client";
 import superjson from "superjson";
 import App from "./App";
 import "./index.css";
+import { withXhsClientHeader } from "./lib/xhsClientId";
 
 const queryClient = new QueryClient();
 
 const trpcFetch: typeof globalThis.fetch = (input, init) =>
-  globalThis.fetch(input, {
-    ...(init ?? {}),
-    credentials: "include",
-  });
+  globalThis.fetch(
+    input,
+    withXhsClientHeader({ ...(init ?? {}), credentials: "include" })
+  );
 
 const redirectToLoginIfUnauthorized = (error: unknown) => {
   if (!(error instanceof TRPCClientError)) return;

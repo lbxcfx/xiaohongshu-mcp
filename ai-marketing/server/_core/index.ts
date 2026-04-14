@@ -7,17 +7,90 @@ import { mkdirSync } from "node:fs";
 import multer from "multer";
 import { createExpressMiddleware } from "@trpc/server/adapters/express";
 import { appRouter, ensureTopicHubVideoPipelineStarted } from "../routers";
-import { createContext } from "./context";
+import { createContext, hashClientId } from "./context";
+import { getUserByOpenId, upsertUser, upsertXhsAccount } from "../db";
 import { serveStatic, setupVite } from "./vite";
 import {
   deleteXhsCookies,
+  getXhsMyProfile,
   getXhsLoginQrcode,
   getXhsLoginStatus,
+  type XhsLoginStatus,
   sendXhsPhoneLoginCode,
   startXhsLoginSession,
   startXhsPhoneLogin,
   verifyXhsPhoneLoginCode,
 } from "./xhsApi";
+
+function headerValue(value: unknown) {
+  return Array.isArray(value) ? value[0] : value;
+}
+
+function accountRuntimePaths(accountKey: string) {
+  return {
+    cookiesPath: `.data/xhs-accounts/${accountKey}/cookies.json`,
+    loginStatePath: `.data/xhs-accounts/${accountKey}/login_state.json`,
+    browserUserDataDir: `.data/xhs-accounts/${accountKey}/browser`,
+  };
+}
+
+async function getDefaultAccountKey(req: express.Request) {
+  const clientId = headerValue(req.headers["x-xhs-client-id"]);
+  if (!clientId || typeof clientId !== "string") return null;
+
+  let userId = hashClientId(clientId);
+  await upsertUser({
+    openId: clientId,
+    xhsUserId: clientId,
+    xhsNickname: "小红书用户",
+    name: "小红书用户",
+    loginMethod: "xhs",
+    lastSignedIn: new Date(),
+  });
+  const user = await getUserByOpenId(clientId);
+  userId = user?.id ?? userId;
+  const accountKey = `u${userId}-default`;
+  await upsertXhsAccount(userId, {
+    accountKey,
+    status: "unknown",
+    ...accountRuntimePaths(accountKey),
+  });
+  return { userId, openId: clientId, accountKey };
+}
+
+async function syncLoginIdentity(req: express.Request, status: XhsLoginStatus) {
+  if (!status.is_logged_in) return;
+
+  const account = await getDefaultAccountKey(req);
+  if (!account) return;
+
+  let nickname = status.username || "小红书用户";
+  let xhsUserId = account.openId;
+
+  try {
+    const profile = await getXhsMyProfile(account.accountKey);
+    nickname = profile.userBasicInfo?.nickname || nickname;
+    xhsUserId = profile.userBasicInfo?.redId || xhsUserId;
+  } catch (error) {
+    console.warn("[XHS] sync profile failed", error);
+  }
+
+  await upsertUser({
+    openId: account.openId,
+    xhsUserId,
+    xhsNickname: nickname,
+    name: nickname,
+    loginMethod: "xhs",
+    lastSignedIn: new Date(),
+  });
+  await upsertXhsAccount(account.userId, {
+    accountKey: account.accountKey,
+    xhsUserId,
+    nickname,
+    status: "logged_in",
+    ...accountRuntimePaths(account.accountKey),
+  });
+}
 
 function isPortAvailable(port: number): Promise<boolean> {
   return new Promise(resolve => {
@@ -66,13 +139,16 @@ async function startServer() {
         cb(null, `${Date.now()}${ext}`);
       },
     }),
-    limits: { fileSize: 30 * 1024 * 1024 }, // 最大 30MB
+    limits: { fileSize: 200 * 1024 * 1024 }, // 最大 200MB
     fileFilter: (_req, file, cb) => {
-      // 仅允许图片
-      if (file.mimetype.startsWith("image/")) {
+      // 仅允许素材图片和参考视频
+      if (
+        file.mimetype.startsWith("image/") ||
+        file.mimetype.startsWith("video/")
+      ) {
         cb(null, true);
       } else {
-        cb(new Error("仅支持上传图片文件"));
+        cb(new Error("仅支持上传图片或视频文件"));
       }
     },
   });
@@ -86,9 +162,10 @@ async function startServer() {
     res.json({ success: true, url });
   });
 
-  app.get("/api/xhs/login/qrcode", async (_req, res) => {
+  app.get("/api/xhs/login/qrcode", async (req, res) => {
     try {
-      const data = await getXhsLoginQrcode();
+      const account = await getDefaultAccountKey(req);
+      const data = await getXhsLoginQrcode(account?.accountKey);
       res.json({ success: true, data });
     } catch (error) {
       res.status(502).json({
@@ -97,9 +174,11 @@ async function startServer() {
       });
     }
   });
-  app.get("/api/xhs/login/status", async (_req, res) => {
+  app.get("/api/xhs/login/status", async (req, res) => {
     try {
-      const data = await getXhsLoginStatus();
+      const account = await getDefaultAccountKey(req);
+      const data = await getXhsLoginStatus(account?.accountKey);
+      await syncLoginIdentity(req, data);
       res.json({ success: true, data });
     } catch (error) {
       res.status(502).json({
@@ -108,9 +187,10 @@ async function startServer() {
       });
     }
   });
-  app.delete("/api/xhs/login/cookies", async (_req, res) => {
+  app.delete("/api/xhs/login/cookies", async (req, res) => {
     try {
-      await deleteXhsCookies();
+      const account = await getDefaultAccountKey(req);
+      await deleteXhsCookies(account?.accountKey);
       res.json({ success: true });
     } catch (error) {
       res.status(502).json({
@@ -119,9 +199,11 @@ async function startServer() {
       });
     }
   });
-  app.post("/api/xhs/login/session/start", async (_req, res) => {
+  app.post("/api/xhs/login/session/start", async (req, res) => {
     try {
-      const data = await startXhsLoginSession();
+      const account = await getDefaultAccountKey(req);
+      const data = await startXhsLoginSession(account?.accountKey);
+      await syncLoginIdentity(req, data);
       res.json({ success: true, data });
     } catch (error) {
       res.status(502).json({
@@ -130,9 +212,10 @@ async function startServer() {
       });
     }
   });
-  app.post("/api/xhs/login/phone/start", async (_req, res) => {
+  app.post("/api/xhs/login/phone/start", async (req, res) => {
     try {
-      const data = await startXhsPhoneLogin();
+      const account = await getDefaultAccountKey(req);
+      const data = await startXhsPhoneLogin(account?.accountKey);
       res.json({ success: true, data });
     } catch (error) {
       res.status(502).json({
@@ -143,7 +226,11 @@ async function startServer() {
   });
   app.post("/api/xhs/login/phone/send_code", async (req, res) => {
     try {
-      const data = await sendXhsPhoneLoginCode(String(req.body?.phone || ""));
+      const account = await getDefaultAccountKey(req);
+      const data = await sendXhsPhoneLoginCode(
+        String(req.body?.phone || ""),
+        account?.accountKey
+      );
       res.json({ success: true, data });
     } catch (error) {
       res.status(502).json({
@@ -154,7 +241,11 @@ async function startServer() {
   });
   app.post("/api/xhs/login/phone/verify", async (req, res) => {
     try {
-      const data = await verifyXhsPhoneLoginCode(String(req.body?.code || ""));
+      const account = await getDefaultAccountKey(req);
+      const data = await verifyXhsPhoneLoginCode(
+        String(req.body?.code || ""),
+        account?.accountKey
+      );
       res.json({ success: true, data });
     } catch (error) {
       res.status(502).json({

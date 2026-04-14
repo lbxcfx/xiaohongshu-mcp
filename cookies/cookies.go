@@ -49,6 +49,9 @@ func (c *localCookie) LoadCookies() ([]byte, error) {
 
 // SaveCookies 保存 cookies 到文件中。
 func (c *localCookie) SaveCookies(data []byte) error {
+	if err := os.MkdirAll(filepath.Dir(c.path), 0755); err != nil {
+		return err
+	}
 	return os.WriteFile(c.path, data, 0644)
 }
 
@@ -101,17 +104,28 @@ func GetLoginStateFilePath() string {
 
 // SaveLoginState 保存登录状态。
 func SaveLoginState(state LoginState) error {
+	return SaveLoginStateTo(GetLoginStateFilePath(), state)
+}
+
+func SaveLoginStateTo(path string, state LoginState) error {
 	state.UpdatedAt = time.Now()
 	data, err := json.Marshal(state)
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(GetLoginStateFilePath(), data, 0644)
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0644)
 }
 
 // LoadLoginState 读取登录状态。
 func LoadLoginState() (*LoginState, error) {
-	data, err := os.ReadFile(GetLoginStateFilePath())
+	return LoadLoginStateFrom(GetLoginStateFilePath())
+}
+
+func LoadLoginStateFrom(path string) (*LoginState, error) {
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to read login state file")
 	}
@@ -125,7 +139,10 @@ func LoadLoginState() (*LoginState, error) {
 
 // DeleteLoginState 删除登录状态文件。
 func DeleteLoginState() error {
-	path := GetLoginStateFilePath()
+	return DeleteLoginStateFrom(GetLoginStateFilePath())
+}
+
+func DeleteLoginStateFrom(path string) error {
 	if _, err := os.Stat(path); os.IsNotExist(err) {
 		return nil
 	}

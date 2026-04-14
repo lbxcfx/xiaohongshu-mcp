@@ -9,6 +9,10 @@ import {
   updateProject,
   deleteProject,
   getProjectById,
+  getDefaultXhsAccount,
+  getXhsAccountById,
+  getXhsAccounts,
+  upsertXhsAccount,
   getPositionings,
   createPositioning,
   updatePositioning,
@@ -51,6 +55,7 @@ import { ENV } from "./_core/env";
 import { invokeLLM } from "./_core/llm";
 import { analyzeVideoWithArk, generateTextWithArk } from "./_core/ark";
 import { createSeedanceTask, querySeedanceTask } from "./_core/seedance";
+import { createPixelleTask, queryPixelleTask } from "./_core/pixelle";
 import { callDataApi } from "./_core/dataApi";
 import { generateImage } from "./_core/imageGeneration";
 import { downloadWithLux } from "./_core/lux";
@@ -61,14 +66,52 @@ import {
   getXhsLoginQrcode,
   getXhsLoginStatus,
   getXhsUserProfile,
+  publishXhsVideo,
   type XhsFeed,
   searchXhsFeeds,
   type XhsLoginStatus,
   type XhsSearchFilters,
 } from "./_core/xhsApi";
+import { getActiveUserId } from "./_core/userScope";
 
-// Guest user ID – all data is stored under this shared ID since auth is disabled
-const GUEST_USER_ID = 1;
+function currentUserId(ctx: { user: { id: number } | null }) {
+  return ctx.user?.id ?? getActiveUserId();
+}
+
+function accountKeyForUser(userId: number, accountId?: number | null) {
+  return accountId ? `u${userId}-a${accountId}` : `u${userId}-default`;
+}
+
+function accountRuntimePaths(accountKey: string) {
+  return {
+    cookiesPath: `.data/xhs-accounts/${accountKey}/cookies.json`,
+    loginStatePath: `.data/xhs-accounts/${accountKey}/login_state.json`,
+    browserUserDataDir: `.data/xhs-accounts/${accountKey}/browser`,
+  };
+}
+
+async function ensureDefaultXhsAccount(userId: number) {
+  const existing = await getDefaultXhsAccount(userId);
+  if (existing) return existing;
+
+  const accountKey = accountKeyForUser(userId);
+  return upsertXhsAccount(userId, {
+    accountKey,
+    status: "unknown",
+    ...accountRuntimePaths(accountKey),
+  });
+}
+
+async function getProjectXhsAccountKey(userId: number, projectId: number) {
+  const project = await getProjectById(userId, projectId);
+  if (!project) throw new Error("未找到项目");
+  if (project.xhsAccountId) {
+    const account = await getXhsAccountById(userId, project.xhsAccountId);
+    if (account) return account.accountKey;
+  }
+  const account = await ensureDefaultXhsAccount(userId);
+  return account?.accountKey ?? accountKeyForUser(userId);
+}
 function parseEngagementCount(value?: string | null): number {
   if (!value) return 0;
   const normalized = value.replace(/,/g, "").trim();
@@ -160,15 +203,16 @@ function extractJsonArray(text: string) {
 }
 
 async function generateScriptForTopicPlanWithArk(
+  userId: number,
   projectId: number,
   topicPlanId: number
 ) {
   const [allTopicPlans, hubItems, allPositionings, allScripts] =
     await Promise.all([
-      getTopicPlans(GUEST_USER_ID, projectId),
-      getTopicHubItems(GUEST_USER_ID, projectId),
-      getPositionings(GUEST_USER_ID, projectId),
-      getScripts(GUEST_USER_ID, projectId),
+      getTopicPlans(userId, projectId),
+      getTopicHubItems(userId, projectId),
+      getPositionings(userId, projectId),
+      getScripts(userId, projectId),
     ]);
 
   const topicPlan = allTopicPlans.find(item => item.id === topicPlanId);
@@ -256,7 +300,7 @@ ${viralAnalysis}
   const nextTitle = topicPlan.title;
 
   if (existingScript) {
-    await updateScript(GUEST_USER_ID, {
+    await updateScript(userId, {
       id: existingScript.id,
       title: nextTitle,
       fullScript: scriptContent,
@@ -265,7 +309,7 @@ ${viralAnalysis}
     return { id: existingScript.id, script: scriptContent };
   }
 
-  const createdId = await createScript(GUEST_USER_ID, {
+  const createdId = await createScript(userId, {
     projectId,
     topicPlanId: topicPlan.id,
     hubItemId: hubItem.id,
@@ -302,11 +346,11 @@ function hasRequestedTopicHubVideoAnalysis(tags: Record<string, unknown>) {
 
   return Boolean(
     tags.videoDownloadQueuedAt ||
-    tags.videoAnalysisQueuedAt ||
-    tags.videoAnalysisStartedAt ||
-    tags.videoAnalysisFinishedAt ||
-    (downloadStatus && downloadStatus !== "idle") ||
-    analysisStatus
+      tags.videoAnalysisQueuedAt ||
+      tags.videoAnalysisStartedAt ||
+      tags.videoAnalysisFinishedAt ||
+      (downloadStatus && downloadStatus !== "idle") ||
+      analysisStatus
   );
 }
 
@@ -347,6 +391,7 @@ function extractMatchedTopicHubVideoIds(value: Record<string, unknown>) {
 }
 
 async function ensureXhsDraftForScript(params: {
+  userId: number;
   projectId: number;
   materialId: number;
   scriptId?: number | null;
@@ -360,7 +405,7 @@ async function ensureXhsDraftForScript(params: {
 
   if (params.scriptId) {
     const existing = (
-      await getPlatformAdaptations(GUEST_USER_ID, params.scriptId)
+      await getPlatformAdaptations(params.userId, params.scriptId)
     )
       .filter(item => item.platform === "xiaohongshu")
       .find(item => item.title && item.caption);
@@ -370,7 +415,7 @@ async function ensureXhsDraftForScript(params: {
         content: existing.caption,
         tags: normalizeXhsTags(existing.hashtags),
       };
-      await upsertMaterialPublication(GUEST_USER_ID, {
+      await upsertMaterialPublication(params.userId, {
         projectId: params.projectId,
         materialId: params.materialId,
         scriptId: params.scriptId,
@@ -413,7 +458,7 @@ ${scriptText}`,
   }
 
   if (params.scriptId) {
-    await createPlatformAdaptation(GUEST_USER_ID, {
+    await createPlatformAdaptation(params.userId, {
       projectId: params.projectId,
       scriptId: params.scriptId,
       platform: "xiaohongshu",
@@ -425,7 +470,7 @@ ${scriptText}`,
     });
   }
 
-  await upsertMaterialPublication(GUEST_USER_ID, {
+  await upsertMaterialPublication(params.userId, {
     projectId: params.projectId,
     materialId: params.materialId,
     scriptId: params.scriptId ?? null,
@@ -479,6 +524,7 @@ async function resolvePublishVideoPath(params: {
 }
 
 async function publishMaterialToXhs(input: {
+  userId: number;
   projectId: number;
   materialId: number;
   title?: string;
@@ -486,9 +532,13 @@ async function publishMaterialToXhs(input: {
   tags?: string[];
   visibility?: "公开可见" | "仅自己可见" | "仅互关好友可见";
 }) {
+  const accountKey = await getProjectXhsAccountKey(
+    input.userId,
+    input.projectId
+  );
   const [allMaterials, allScripts] = await Promise.all([
-    getMaterials(GUEST_USER_ID, input.projectId),
-    getScripts(GUEST_USER_ID, input.projectId),
+    getMaterials(input.userId, input.projectId),
+    getScripts(input.userId, input.projectId),
   ]);
   const material = allMaterials.find(item => item.id === input.materialId);
   if (!material) throw new Error("未找到素材记录");
@@ -507,6 +557,7 @@ async function publishMaterialToXhs(input: {
           tags: normalizeXhsTags(input.tags),
         }
       : await ensureXhsDraftForScript({
+          userId: input.userId,
           projectId: input.projectId,
           materialId: input.materialId,
           scriptId: material.scriptId,
@@ -516,7 +567,7 @@ async function publishMaterialToXhs(input: {
         });
 
   const visibility = input.visibility ?? "公开可见";
-  await upsertMaterialPublication(GUEST_USER_ID, {
+  await upsertMaterialPublication(input.userId, {
     projectId: input.projectId,
     materialId: input.materialId,
     scriptId: material.scriptId ?? null,
@@ -535,31 +586,18 @@ async function publishMaterialToXhs(input: {
       fileUrl: material.fileUrl,
     });
     try {
-      const publishResp = await fetch(`${ENV.xhsApiUrl}/api/v1/publish_video`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
+      const result = await publishXhsVideo(
+        {
           title: draft.title,
           content: draft.content,
           video: videoPath.path,
           tags: draft.tags,
           visibility,
-        }),
-        signal: AbortSignal.timeout(600_000),
-      });
-      const result = (await publishResp.json()) as {
-        success?: boolean;
-        data?: { post_id?: string; status?: string };
-        message?: string;
-        error?: string;
-      };
-      if (!publishResp.ok || !result.success) {
-        throw new Error(
-          result.error || result.message || `发布失败 (${publishResp.status})`
-        );
-      }
+        },
+        accountKey
+      );
 
-      await upsertMaterialPublication(GUEST_USER_ID, {
+      await upsertMaterialPublication(input.userId, {
         projectId: input.projectId,
         materialId: input.materialId,
         scriptId: material.scriptId ?? null,
@@ -569,15 +607,15 @@ async function publishMaterialToXhs(input: {
         content: draft.content,
         tags: draft.tags,
         visibility,
-        postId: result.data?.post_id ?? null,
+        postId: result.post_id ?? null,
         publishedAt: new Date(),
       });
 
       return {
         materialId: input.materialId,
-        postId: result.data?.post_id,
-        status: result.data?.status ?? "published",
-        message: result.message ?? "发布成功",
+        postId: result.post_id,
+        status: result.status ?? "published",
+        message: "发布成功",
         draft,
       };
     } finally {
@@ -587,7 +625,7 @@ async function publishMaterialToXhs(input: {
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : "发布失败";
-    await upsertMaterialPublication(GUEST_USER_ID, {
+    await upsertMaterialPublication(input.userId, {
       projectId: input.projectId,
       materialId: input.materialId,
       scriptId: material.scriptId ?? null,
@@ -623,7 +661,7 @@ function getLatestByDate<T extends { createdAt?: Date; updatedAt?: Date }>(
 }
 
 async function getDashboardContentResults() {
-  const projects = await getProjects(GUEST_USER_ID);
+  const projects = await getProjects(getActiveUserId());
   const rows = await Promise.all(
     projects.map(async project => {
       const [
@@ -635,13 +673,13 @@ async function getDashboardContentResults() {
         adaptations,
         publications,
       ] = await Promise.all([
-        getPositionings(GUEST_USER_ID, project.id),
-        getTopicHubItems(GUEST_USER_ID, project.id),
-        getTopicPlans(GUEST_USER_ID, project.id),
-        getScripts(GUEST_USER_ID, project.id),
-        getMaterials(GUEST_USER_ID, project.id),
-        getPlatformAdaptationsByProject(GUEST_USER_ID, project.id),
-        getMaterialPublications(GUEST_USER_ID, project.id),
+        getPositionings(getActiveUserId(), project.id),
+        getTopicHubItems(getActiveUserId(), project.id),
+        getTopicPlans(getActiveUserId(), project.id),
+        getScripts(getActiveUserId(), project.id),
+        getMaterials(getActiveUserId(), project.id),
+        getPlatformAdaptationsByProject(getActiveUserId(), project.id),
+        getMaterialPublications(getActiveUserId(), project.id),
       ]);
 
       const completedPositioning = positionings.find(
@@ -759,8 +797,8 @@ async function getDashboardContentResults() {
 
 async function generateTopicPlansForProject(projectId: number) {
   const [positionings, hubItems] = await Promise.all([
-    getPositionings(GUEST_USER_ID, projectId),
-    getTopicHubItems(GUEST_USER_ID, projectId),
+    getPositionings(getActiveUserId(), projectId),
+    getTopicHubItems(getActiveUserId(), projectId),
   ]);
 
   const completedPositioning = positionings.find(
@@ -846,11 +884,11 @@ ${viralAnalysis}
     });
   }
 
-  await deleteTopicPlansByProject(GUEST_USER_ID, projectId);
+  await deleteTopicPlansByProject(getActiveUserId(), projectId);
 
   const savedPlans = [];
   for (const plan of generatedPlans) {
-    const saved = await createTopicPlan(GUEST_USER_ID, {
+    const saved = await createTopicPlan(getActiveUserId(), {
       projectId,
       hubItemId: plan.hubItemId,
       title: plan.title,
@@ -1261,7 +1299,7 @@ function queueTopicHubVideoAnalysis(task: {
       ...task.tags,
       videoAnalysisStatus: "analyzing",
     };
-    await updateTopicHubItemTags(GUEST_USER_ID, {
+    await updateTopicHubItemTags(getActiveUserId(), {
       id: task.itemId,
       tags: analyzingTags,
     });
@@ -1272,7 +1310,7 @@ function queueTopicHubVideoAnalysis(task: {
         prompt: TOPIC_HUB_VIRAL_ANALYSIS_PROMPT_V2,
       });
 
-      await updateTopicHubItemTags(GUEST_USER_ID, {
+      await updateTopicHubItemTags(getActiveUserId(), {
         id: task.itemId,
         tags: {
           ...analyzingTags,
@@ -1286,7 +1324,7 @@ function queueTopicHubVideoAnalysis(task: {
       );
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      await updateTopicHubItemTags(GUEST_USER_ID, {
+      await updateTopicHubItemTags(getActiveUserId(), {
         id: task.itemId,
         tags: {
           ...analyzingTags,
@@ -1326,7 +1364,7 @@ function queueTopicHubVideoDownload(task: {
       const previousStatus = String(task.tags.videoDownloadStatus ?? "");
 
       if (previousStatus === "failed" && previousFailedAttempts >= 3) {
-        await updateTopicHubItemTags(GUEST_USER_ID, {
+        await updateTopicHubItemTags(getActiveUserId(), {
           id: task.itemId,
           tags: {
             ...task.tags,
@@ -1350,7 +1388,7 @@ function queueTopicHubVideoDownload(task: {
           videoDownloadStatus: downloadResult.success ? "success" : "failed",
           videoDownloadError: downloadResult.error,
         };
-        await updateTopicHubItemTags(GUEST_USER_ID, {
+        await updateTopicHubItemTags(getActiveUserId(), {
           id: task.itemId,
           tags: updatedTags,
         });
@@ -1365,7 +1403,7 @@ function queueTopicHubVideoDownload(task: {
         }
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        await updateTopicHubItemTags(GUEST_USER_ID, {
+        await updateTopicHubItemTags(getActiveUserId(), {
           id: task.itemId,
           tags: {
             ...task.tags,
@@ -1391,9 +1429,9 @@ function getTopicHubQueueTimestamp(tags: Record<string, unknown>, key: string) {
 }
 
 async function listTopicHubVideoItemsForPipeline() {
-  const projects = await getProjects(GUEST_USER_ID);
+  const projects = await getProjects(getActiveUserId());
   const itemGroups = await Promise.all(
-    projects.map(project => getTopicHubItems(GUEST_USER_ID, project.id))
+    projects.map(project => getTopicHubItems(getActiveUserId(), project.id))
   );
 
   return itemGroups
@@ -1411,7 +1449,7 @@ async function recoverTopicHubVideoPipelineState() {
     const tags = (item.tags ?? {}) as Record<string, unknown>;
     if (String(tags.videoAnalysisStatus || "") !== "analyzing") continue;
 
-    await updateTopicHubItemTags(GUEST_USER_ID, {
+    await updateTopicHubItemTags(getActiveUserId(), {
       id: item.id,
       tags: {
         ...tags,
@@ -1450,7 +1488,7 @@ async function runTopicHubDownloadTask(
     }
 
     if (previousStatus === "failed" && previousFailedAttempts >= 3) {
-      await updateTopicHubItemTags(GUEST_USER_ID, {
+      await updateTopicHubItemTags(getActiveUserId(), {
         id: item.id,
         tags: {
           ...tags,
@@ -1462,7 +1500,7 @@ async function runTopicHubDownloadTask(
       return;
     }
 
-    await updateTopicHubItemTags(GUEST_USER_ID, {
+    await updateTopicHubItemTags(getActiveUserId(), {
       id: item.id,
       tags: {
         ...tags,
@@ -1496,13 +1534,13 @@ async function runTopicHubDownloadTask(
       videoAnalysisStartedAt: undefined,
       videoAnalysisFinishedAt: undefined,
     };
-    await updateTopicHubItemTags(GUEST_USER_ID, {
+    await updateTopicHubItemTags(getActiveUserId(), {
       id: item.id,
       tags: nextTags,
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    await updateTopicHubItemTags(GUEST_USER_ID, {
+    await updateTopicHubItemTags(getActiveUserId(), {
       id: item.id,
       tags: {
         ...tags,
@@ -1538,7 +1576,7 @@ async function runTopicHubAnalysisTask(
       videoAnalysisError: undefined,
       videoAnalysisStartedAt: new Date().toISOString(),
     };
-    await updateTopicHubItemTags(GUEST_USER_ID, {
+    await updateTopicHubItemTags(getActiveUserId(), {
       id: item.id,
       tags: analyzingTags,
     });
@@ -1550,7 +1588,7 @@ async function runTopicHubAnalysisTask(
       prompt: TOPIC_HUB_VIRAL_ANALYSIS_PROMPT_V2,
     });
 
-    await updateTopicHubItemTags(GUEST_USER_ID, {
+    await updateTopicHubItemTags(getActiveUserId(), {
       id: item.id,
       tags: {
         ...analyzingTags,
@@ -1562,7 +1600,7 @@ async function runTopicHubAnalysisTask(
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    await updateTopicHubItemTags(GUEST_USER_ID, {
+    await updateTopicHubItemTags(getActiveUserId(), {
       id: item.id,
       tags: {
         ...tags,
@@ -1705,14 +1743,14 @@ async function saveTopicHubVideoItem(params: {
 
   const noteUrl = `https://www.xiaohongshu.com/explore/${noteId}?xsec_token=${xsecToken}&xsec_source=pc_feed`;
   const existingItem = await findTopicHubItemByNoteId(
-    GUEST_USER_ID,
+    getActiveUserId(),
     params.projectId,
     noteId
   );
   const existingTags =
     (existingItem?.tags as Record<string, unknown> | null | undefined) ?? {};
 
-  const item = await createTopicHubItem(GUEST_USER_ID, {
+  const item = await createTopicHubItem(getActiveUserId(), {
     projectId: params.projectId,
     title: params.feed.noteCard?.displayTitle || "?????",
     content: `关键词：${params.industry}${params.checklist ? ` | 链接搜索：${params.checklist}` : ""}`,
@@ -1976,7 +2014,7 @@ async function runVideoPositioningAnalysisInBackground(input: {
       ...details,
     });
 
-    await updatePositioning(GUEST_USER_ID, {
+    await updatePositioning(getActiveUserId(), {
       id: input.positioningId,
       analysisResult: {
         mode: "video",
@@ -2033,7 +2071,7 @@ async function runVideoPositioningAnalysisInBackground(input: {
       },
     });
 
-    await updatePositioning(GUEST_USER_ID, {
+    await updatePositioning(getActiveUserId(), {
       id: input.positioningId,
       positioningRecommendation: result.text,
       analysisResult: {
@@ -2048,7 +2086,7 @@ async function runVideoPositioningAnalysisInBackground(input: {
       status: "completed",
     });
   } catch (error) {
-    await updatePositioning(GUEST_USER_ID, {
+    await updatePositioning(getActiveUserId(), {
       id: input.positioningId,
       analysisResult: {
         mode: "video",
@@ -2088,10 +2126,10 @@ async function generateScriptForTopicPlan(
 ) {
   const [allTopicPlans, hubItems, allPositionings, allScripts] =
     await Promise.all([
-      getTopicPlans(GUEST_USER_ID, projectId),
-      getTopicHubItems(GUEST_USER_ID, projectId),
-      getPositionings(GUEST_USER_ID, projectId),
-      getScripts(GUEST_USER_ID, projectId),
+      getTopicPlans(getActiveUserId(), projectId),
+      getTopicHubItems(getActiveUserId(), projectId),
+      getPositionings(getActiveUserId(), projectId),
+      getScripts(getActiveUserId(), projectId),
     ]);
 
   const topicPlan = allTopicPlans.find(item => item.id === topicPlanId);
@@ -2170,7 +2208,7 @@ ${viralAnalysis}
   const nextTitle = `${topicPlan.title}`;
 
   if (existingScript) {
-    await updateScript(GUEST_USER_ID, {
+    await updateScript(getActiveUserId(), {
       id: existingScript.id,
       title: nextTitle,
       fullScript: scriptContent,
@@ -2179,7 +2217,7 @@ ${viralAnalysis}
     return { id: existingScript.id, script: scriptContent };
   }
 
-  const createdId = await createScript(GUEST_USER_ID, {
+  const createdId = await createScript(getActiveUserId(), {
     projectId,
     topicPlanId: topicPlan.id,
     hubItemId: hubItem.id,
@@ -2195,24 +2233,34 @@ ${viralAnalysis}
 export const appRouter = router({
   system: systemRouter,
   auth: router({
-    status: publicProcedure.query(async (): Promise<XhsLoginStatus> => {
+    status: publicProcedure.query(async ({ ctx }): Promise<XhsLoginStatus> => {
+      const userId = currentUserId(ctx);
+      const account = await ensureDefaultXhsAccount(userId);
       try {
-        return await getXhsLoginStatus();
+        return await getXhsLoginStatus(account?.accountKey);
       } catch {
         return { status: "unknown", is_logged_in: false, username: undefined };
       }
     }),
-    me: publicProcedure.query(async (): Promise<XhsLoginStatus> => {
+    me: publicProcedure.query(async ({ ctx }): Promise<XhsLoginStatus> => {
+      const userId = currentUserId(ctx);
+      const account = await ensureDefaultXhsAccount(userId);
       try {
-        return await getXhsLoginStatus();
+        return await getXhsLoginStatus(account?.accountKey);
       } catch {
         return { status: "unknown", is_logged_in: false, username: undefined };
       }
     }),
-    qrcode: publicProcedure.query(async () => getXhsLoginQrcode()),
+    qrcode: publicProcedure.query(async ({ ctx }) => {
+      const userId = currentUserId(ctx);
+      const account = await ensureDefaultXhsAccount(userId);
+      return getXhsLoginQrcode(account?.accountKey);
+    }),
     logout: publicProcedure.mutation(async ({ ctx }) => {
+      const userId = currentUserId(ctx);
+      const account = await ensureDefaultXhsAccount(userId);
       try {
-        await deleteXhsCookies();
+        await deleteXhsCookies(account?.accountKey);
       } catch (error) {
         console.warn("[XHS] delete cookies failed", error);
       }
@@ -2225,10 +2273,10 @@ export const appRouter = router({
 
   // ─── Projects ──────────────────────────────────────────────────────────────
   projects: router({
-    list: publicProcedure.query(() => getProjects(GUEST_USER_ID)),
+    list: publicProcedure.query(({ ctx }) => getProjects(currentUserId(ctx))),
     get: publicProcedure
       .input(z.object({ id: z.number() }))
-      .query(({ input }) => getProjectById(GUEST_USER_ID, input.id)),
+      .query(({ ctx, input }) => getProjectById(currentUserId(ctx), input.id)),
     create: publicProcedure
       .input(
         z.object({
@@ -2238,7 +2286,14 @@ export const appRouter = router({
           platform: z.string().optional(),
         })
       )
-      .mutation(({ input }) => createProject(GUEST_USER_ID, input)),
+      .mutation(async ({ ctx, input }) => {
+        const userId = currentUserId(ctx);
+        const account = await ensureDefaultXhsAccount(userId);
+        return createProject(userId, {
+          ...input,
+          xhsAccountId: account?.id ?? null,
+        });
+      }),
     update: publicProcedure
       .input(
         z.object({
@@ -2250,17 +2305,21 @@ export const appRouter = router({
           status: z.enum(["active", "archived"]).optional(),
         })
       )
-      .mutation(({ input }) => updateProject(GUEST_USER_ID, input)),
+      .mutation(({ ctx, input }) => updateProject(currentUserId(ctx), input)),
     delete: publicProcedure
       .input(z.object({ id: z.number() }))
-      .mutation(({ input }) => deleteProject(GUEST_USER_ID, input.id)),
+      .mutation(({ ctx, input }) =>
+        deleteProject(currentUserId(ctx), input.id)
+      ),
   }),
 
   // ─── Positioning ───────────────────────────────────────────────────────────
   positioning: router({
     list: publicProcedure
       .input(z.object({ projectId: z.number() }))
-      .query(({ input }) => getPositionings(GUEST_USER_ID, input.projectId)),
+      .query(({ input }) =>
+        getPositionings(getActiveUserId(), input.projectId)
+      ),
     create: publicProcedure
       .input(
         z.object({
@@ -2273,8 +2332,8 @@ export const appRouter = router({
         })
       )
       .mutation(async ({ input }) => {
-        await deletePositioningsByProject(GUEST_USER_ID, input.projectId);
-        return createPositioning(GUEST_USER_ID, input);
+        await deletePositioningsByProject(getActiveUserId(), input.projectId);
+        return createPositioning(getActiveUserId(), input);
       }),
     createAndAnalyze: publicProcedure
       .input(
@@ -2288,17 +2347,22 @@ export const appRouter = router({
         })
       )
       .mutation(async ({ input }) => {
-        await logUsage(GUEST_USER_ID, input.projectId, "positioning", "create");
-        await deletePositioningsByProject(GUEST_USER_ID, input.projectId);
+        await logUsage(
+          getActiveUserId(),
+          input.projectId,
+          "positioning",
+          "create"
+        );
+        await deletePositioningsByProject(getActiveUserId(), input.projectId);
 
-        const positioningId = await createPositioning(GUEST_USER_ID, {
+        const positioningId = await createPositioning(getActiveUserId(), {
           ...input,
           status: "completed",
         });
 
         const analysis = buildManualPositioningContent(input);
 
-        await updatePositioning(GUEST_USER_ID, {
+        await updatePositioning(getActiveUserId(), {
           id: positioningId,
           positioningRecommendation: analysis,
           analysisResult: {
@@ -2320,7 +2384,7 @@ export const appRouter = router({
       )
       .mutation(async ({ input }) => {
         await logUsage(
-          GUEST_USER_ID,
+          getActiveUserId(),
           input.projectId,
           "positioning",
           "downloadVideo"
@@ -2360,14 +2424,14 @@ export const appRouter = router({
       )
       .mutation(async ({ input }) => {
         await logUsage(
-          GUEST_USER_ID,
+          getActiveUserId(),
           input.projectId,
           "positioning",
           "analyzeVideo"
         );
-        await deletePositioningsByProject(GUEST_USER_ID, input.projectId);
+        await deletePositioningsByProject(getActiveUserId(), input.projectId);
 
-        const positioningId = await createPositioning(GUEST_USER_ID, {
+        const positioningId = await createPositioning(getActiveUserId(), {
           projectId: input.projectId,
           industry: input.industry || "视频定位分析",
           track: input.track || "小红书视频链接",
@@ -2377,7 +2441,7 @@ export const appRouter = router({
           status: "analyzing",
         });
 
-        await updatePositioning(GUEST_USER_ID, {
+        await updatePositioning(getActiveUserId(), {
           id: positioningId,
           analysisResult: {
             mode: "video",
@@ -2398,7 +2462,7 @@ export const appRouter = router({
       }),
     delete: publicProcedure
       .input(z.object({ id: z.number() }))
-      .mutation(({ input }) => deletePositioning(GUEST_USER_ID, input.id)),
+      .mutation(({ input }) => deletePositioning(getActiveUserId(), input.id)),
     analyze: publicProcedure
       .input(
         z.object({
@@ -2412,7 +2476,7 @@ export const appRouter = router({
       )
       .mutation(async ({ input }) => {
         await logUsage(
-          GUEST_USER_ID,
+          getActiveUserId(),
           input.positioningId,
           "positioning",
           "analyze"
@@ -2453,7 +2517,7 @@ export const appRouter = router({
         const analysisResult = String(
           response.choices[0]?.message?.content || ""
         );
-        await updatePositioning(GUEST_USER_ID, {
+        await updatePositioning(getActiveUserId(), {
           id: input.positioningId,
           positioningRecommendation: analysisResult,
           status: "completed",
@@ -2467,7 +2531,9 @@ export const appRouter = router({
   topicHub: router({
     list: publicProcedure
       .input(z.object({ projectId: z.number() }))
-      .query(({ input }) => getTopicHubItems(GUEST_USER_ID, input.projectId)),
+      .query(({ input }) =>
+        getTopicHubItems(getActiveUserId(), input.projectId)
+      ),
     addManual: publicProcedure
       .input(
         z.object({
@@ -2479,7 +2545,7 @@ export const appRouter = router({
           type: z.enum(["trending", "viral_post", "high_conversion", "manual"]),
         })
       )
-      .mutation(({ input }) => createTopicHubItem(GUEST_USER_ID, input)),
+      .mutation(({ input }) => createTopicHubItem(getActiveUserId(), input)),
     crawlTrending: publicProcedure
       .input(
         z.object({
@@ -2491,7 +2557,7 @@ export const appRouter = router({
       )
       .mutation(async ({ input }) => {
         await logUsage(
-          GUEST_USER_ID,
+          getActiveUserId(),
           input.projectId,
           "topicHub",
           "crawlTrending"
@@ -2553,7 +2619,7 @@ ${input.checklist ? `关键词清单：${input.checklist}` : ""}
 
         const items = [];
         for (const topic of parsed.topics || []) {
-          const item = await createTopicHubItem(GUEST_USER_ID, {
+          const item = await createTopicHubItem(getActiveUserId(), {
             projectId: input.projectId,
             title: topic.title,
             content: topic.content,
@@ -2590,7 +2656,7 @@ ${input.checklist ? `关键词清单：${input.checklist}` : ""}
       )
       .mutation(async ({ input }) => {
         await logUsage(
-          GUEST_USER_ID,
+          getActiveUserId(),
           input.projectId,
           "topicHub",
           "searchXiaohongshu"
@@ -2606,7 +2672,11 @@ ${input.checklist ? `关键词清单：${input.checklist}` : ""}
               location: input.filters.location,
             }
           : undefined;
-        const result = await searchXhsFeeds(keyword, filters);
+        const accountKey = await getProjectXhsAccountKey(
+          getActiveUserId(),
+          input.projectId
+        );
+        const result = await searchXhsFeeds(keyword, filters, accountKey);
 
         const topVideoFeeds = (result.feeds || [])
           .map(feed => {
@@ -2649,7 +2719,7 @@ ${input.checklist ? `关键词清单：${input.checklist}` : ""}
           }
 
           const noteUrl = `https://www.xiaohongshu.com/explore/${noteId}?xsec_token=${xsecToken}&xsec_source=pc_feed`;
-          const saved = await createTopicHubItem(GUEST_USER_ID, {
+          const saved = await createTopicHubItem(getActiveUserId(), {
             projectId: input.projectId,
             title: feed.noteCard?.displayTitle || "小红书视频",
             content: `行业关键词：${input.industry}${input.checklist ? ` | checklist：${input.checklist}` : ""}`,
@@ -2707,13 +2777,13 @@ ${input.checklist ? `关键词清单：${input.checklist}` : ""}
       )
       .mutation(async ({ input }) => {
         await logUsage(
-          GUEST_USER_ID,
+          getActiveUserId(),
           input.projectId,
           "topicHub",
           "searchXiaohongshuMulti"
         );
 
-        await deleteTopicHubItemsByProject(GUEST_USER_ID, input.projectId);
+        await deleteTopicHubItemsByProject(getActiveUserId(), input.projectId);
 
         const keyword = (input.industry ?? "").trim();
         const profileLinks = parseXhsProfileLinks(input.checklist);
@@ -2748,13 +2818,21 @@ ${input.checklist ? `关键词清单：${input.checklist}` : ""}
         }> = [];
 
         if (keyword) {
-          const result = await searchXhsFeeds(keyword, filters);
+          const accountKey = await getProjectXhsAccountKey(
+            getActiveUserId(),
+            input.projectId
+          );
+          const result = await searchXhsFeeds(keyword, filters, accountKey);
           let keywordFeeds = selectTopVideoFeeds(result.feeds || [], {
             keywordTerms,
             limit: keywordLimit,
           });
           if (keywordFeeds.length === 0 && filters) {
-            const fallbackResult = await searchXhsFeeds(keyword);
+            const fallbackResult = await searchXhsFeeds(
+              keyword,
+              undefined,
+              accountKey
+            );
             keywordFeeds = selectTopVideoFeeds(fallbackResult.feeds || [], {
               keywordTerms,
               limit: keywordLimit,
@@ -2851,7 +2929,7 @@ ${input.checklist ? `关键词清单：${input.checklist}` : ""}
       )
       .mutation(async ({ input }) => {
         await logUsage(
-          GUEST_USER_ID,
+          getActiveUserId(),
           input.projectId,
           "topicHub",
           "crawlViral"
@@ -2911,7 +2989,7 @@ ${input.checklist ? `关键词清单：${input.checklist}` : ""}
 
         const items = [];
         for (const post of parsed.posts || []) {
-          const item = await createTopicHubItem(GUEST_USER_ID, {
+          const item = await createTopicHubItem(getActiveUserId(), {
             projectId: input.projectId,
             title: post.title,
             content: post.content,
@@ -2926,7 +3004,10 @@ ${input.checklist ? `关键词清单：${input.checklist}` : ""}
     analyzeVideo: publicProcedure
       .input(z.object({ id: z.number(), projectId: z.number() }))
       .mutation(async ({ input }) => {
-        const items = await getTopicHubItems(GUEST_USER_ID, input.projectId);
+        const items = await getTopicHubItems(
+          getActiveUserId(),
+          input.projectId
+        );
         const item = items.find(i => i.id === input.id);
         if (!item) throw new Error("未找到该条目");
 
@@ -2934,7 +3015,7 @@ ${input.checklist ? `关键词清单：${input.checklist}` : ""}
         const filePath = String(tags.videoDownloadPath || "");
         if (!filePath) throw new Error("视频尚未下载完成");
 
-        await updateTopicHubItemTags(GUEST_USER_ID, {
+        await updateTopicHubItemTags(getActiveUserId(), {
           id: item.id,
           tags: {
             ...tags,
@@ -2954,7 +3035,10 @@ ${input.checklist ? `关键词清单：${input.checklist}` : ""}
     requestVideoAnalysis: publicProcedure
       .input(z.object({ id: z.number(), projectId: z.number() }))
       .mutation(async ({ input }) => {
-        const items = await getTopicHubItems(GUEST_USER_ID, input.projectId);
+        const items = await getTopicHubItems(
+          getActiveUserId(),
+          input.projectId
+        );
         const item = items.find(i => i.id === input.id);
         if (!item) throw new Error("未找到该条目");
 
@@ -3011,7 +3095,7 @@ ${input.checklist ? `关键词清单：${input.checklist}` : ""}
           videoAnalysisFinishedAt: undefined,
         };
 
-        await updateTopicHubItemTags(GUEST_USER_ID, {
+        await updateTopicHubItemTags(getActiveUserId(), {
           id: item.id,
           tags: nextTags,
         });
@@ -3027,7 +3111,7 @@ ${input.checklist ? `关键词清单：${input.checklist}` : ""}
       }),
     delete: publicProcedure
       .input(z.object({ id: z.number() }))
-      .mutation(({ input }) => deleteTopicHubItem(GUEST_USER_ID, input.id)),
+      .mutation(({ input }) => deleteTopicHubItem(getActiveUserId(), input.id)),
 
     // ── Real Data Source: TikTok Search ──────────────────────────────────────
     crawlTikTok: publicProcedure
@@ -3039,7 +3123,7 @@ ${input.checklist ? `关键词清单：${input.checklist}` : ""}
       )
       .mutation(async ({ input }) => {
         await logUsage(
-          GUEST_USER_ID,
+          getActiveUserId(),
           input.projectId,
           "topicHub",
           "crawlTikTok"
@@ -3078,7 +3162,7 @@ ${input.checklist ? `关键词清单：${input.checklist}` : ""}
                 Math.log10(Math.max(plays, 1)) * 5
             )
           );
-          const item = await createTopicHubItem(GUEST_USER_ID, {
+          const item = await createTopicHubItem(getActiveUserId(), {
             projectId: input.projectId,
             title: v.desc?.substring(0, 200) || "TikTok视频",
             content: `作者：${v.author?.nickname || "未知"} | 点赞：${likes.toLocaleString()} | 播放：${plays.toLocaleString()} | 评论：${(v.statistics?.comment_count || 0).toLocaleString()}`,
@@ -3102,7 +3186,7 @@ ${input.checklist ? `关键词清单：${input.checklist}` : ""}
       )
       .mutation(async ({ input }) => {
         await logUsage(
-          GUEST_USER_ID,
+          getActiveUserId(),
           input.projectId,
           "topicHub",
           "crawlYouTube"
@@ -3138,7 +3222,7 @@ ${input.checklist ? `关键词清单：${input.checklist}` : ""}
         for (const c of contents.slice(0, 10)) {
           if (c.type !== "video" || !c.video) continue;
           const v = c.video;
-          const item = await createTopicHubItem(GUEST_USER_ID, {
+          const item = await createTopicHubItem(getActiveUserId(), {
             projectId: input.projectId,
             title: v.title || "YouTube视频",
             content: `频道：${v.channelTitle || "未知"} | 播放量：${v.viewCountText || "N/A"} | 发布：${v.publishedTimeText || "N/A"} | ${v.descriptionSnippet?.substring(0, 100) || ""}`,
@@ -3165,7 +3249,7 @@ ${input.checklist ? `关键词清单：${input.checklist}` : ""}
       )
       .mutation(async ({ input }) => {
         await logUsage(
-          GUEST_USER_ID,
+          getActiveUserId(),
           input.projectId,
           "topicHub",
           "crawlAccountPosts"
@@ -3212,7 +3296,7 @@ ${input.checklist ? `关键词清单：${input.checklist}` : ""}
           };
           const posts = postsData?.data?.itemList || [];
           for (const p of posts.slice(0, 10)) {
-            const item = await createTopicHubItem(GUEST_USER_ID, {
+            const item = await createTopicHubItem(getActiveUserId(), {
               projectId: input.projectId,
               title: p.desc?.substring(0, 200) || "TikTok热帖",
               content: `播放：${(p.stats?.playCount || 0).toLocaleString()} | 点赞：${(p.stats?.diggCount || 0).toLocaleString()} | 评论：${(p.stats?.commentCount || 0).toLocaleString()}`,
@@ -3256,7 +3340,7 @@ ${input.checklist ? `关键词清单：${input.checklist}` : ""}
           for (const c of contents.slice(0, 10)) {
             if (c.type !== "video" || !c.video) continue;
             const v = c.video;
-            const item = await createTopicHubItem(GUEST_USER_ID, {
+            const item = await createTopicHubItem(getActiveUserId(), {
               projectId: input.projectId,
               title: v.title || "YouTube视频",
               content: `播放量：${(v.stats?.views || 0).toLocaleString()} | 发布：${v.publishedTimeText || "N/A"}`,
@@ -3281,13 +3365,13 @@ ${input.checklist ? `关键词清单：${input.checklist}` : ""}
   topics: router({
     list: publicProcedure
       .input(z.object({ projectId: z.number() }))
-      .query(({ input }) => getTopics(GUEST_USER_ID, input.projectId)),
+      .query(({ input }) => getTopics(getActiveUserId(), input.projectId)),
     relatedVideos: publicProcedure
       .input(z.object({ projectId: z.number() }))
       .query(async ({ input }) => {
         const [positionings, hubItems] = await Promise.all([
-          getPositionings(GUEST_USER_ID, input.projectId),
-          getTopicHubItems(GUEST_USER_ID, input.projectId),
+          getPositionings(getActiveUserId(), input.projectId),
+          getTopicHubItems(getActiveUserId(), input.projectId),
         ]);
 
         const completedPositioning = positionings.find(
@@ -3416,11 +3500,16 @@ ${requestedVideos.length > 0 ? "说明：用户已经在选题中台手动点击
     generate: publicProcedure
       .input(z.object({ projectId: z.number() }))
       .mutation(async ({ input }) => {
-        await logUsage(GUEST_USER_ID, input.projectId, "topics", "generate");
+        await logUsage(
+          getActiveUserId(),
+          input.projectId,
+          "topics",
+          "generate"
+        );
 
         const [positionings, hubItems] = await Promise.all([
-          getPositionings(GUEST_USER_ID, input.projectId),
-          getTopicHubItems(GUEST_USER_ID, input.projectId),
+          getPositionings(getActiveUserId(), input.projectId),
+          getTopicHubItems(getActiveUserId(), input.projectId),
         ]);
 
         const completedPositioning = positionings.find(
@@ -3467,7 +3556,7 @@ ${completedPositioning.positioningRecommendation}
           throw new Error("请先在选题生成页保留至少一个适配视频后再生成选题");
         }
 
-        await deleteTopicsByProject(GUEST_USER_ID, input.projectId);
+        await deleteTopicsByProject(getActiveUserId(), input.projectId);
 
         const prompt = `你是一位顶级的医美短视频选题策划师，擅长基于账号定位和筛选后的视频题目/爆款因子分析，生成可直接执行的高爆款潜质选题。
 ${positioningBlock}
@@ -3517,7 +3606,7 @@ ${sourceVideoBlock}
 
         const savedTopics = [];
         for (const topic of (parsed.topics || []).slice(0, 10)) {
-          const saved = await createTopic(GUEST_USER_ID, {
+          const saved = await createTopic(getActiveUserId(), {
             projectId: input.projectId,
             title: topic.title,
             description: topic.description,
@@ -3538,7 +3627,10 @@ ${sourceVideoBlock}
       )
       .mutation(async ({ input }) => {
         const videoIds = new Set(input.videoIds);
-        const items = await getTopicHubItems(GUEST_USER_ID, input.projectId);
+        const items = await getTopicHubItems(
+          getActiveUserId(),
+          input.projectId
+        );
         const sourceVideos = items.filter(item => {
           const tags = (item.tags ?? {}) as Record<string, unknown>;
           return (
@@ -3580,7 +3672,7 @@ ${sourceVideoBlock}
           }
 
           const now = new Date().toISOString();
-          await updateTopicHubItemTags(GUEST_USER_ID, {
+          await updateTopicHubItemTags(getActiveUserId(), {
             id: item.id,
             tags: {
               ...tags,
@@ -3635,19 +3727,22 @@ ${sourceVideoBlock}
           title: z.string().optional(),
         })
       )
-      .mutation(({ input }) => updateTopic(GUEST_USER_ID, input)),
+      .mutation(({ input }) => updateTopic(getActiveUserId(), input)),
     delete: publicProcedure
       .input(z.object({ id: z.number() }))
-      .mutation(({ input }) => deleteTopic(GUEST_USER_ID, input.id)),
+      .mutation(({ input }) => deleteTopic(getActiveUserId(), input.id)),
     excludeRelatedVideo: publicProcedure
       .input(z.object({ projectId: z.number(), id: z.number() }))
       .mutation(async ({ input }) => {
-        const items = await getTopicHubItems(GUEST_USER_ID, input.projectId);
+        const items = await getTopicHubItems(
+          getActiveUserId(),
+          input.projectId
+        );
         const item = items.find(video => video.id === input.id);
         if (!item) throw new Error("未找到该视频");
 
         const tags = (item.tags ?? {}) as Record<string, unknown>;
-        await updateTopicHubItemTags(GUEST_USER_ID, {
+        await updateTopicHubItemTags(getActiveUserId(), {
           id: item.id,
           tags: {
             ...tags,
@@ -3664,12 +3759,12 @@ ${sourceVideoBlock}
   topicPlans: router({
     list: publicProcedure
       .input(z.object({ projectId: z.number() }))
-      .query(({ input }) => getTopicPlans(GUEST_USER_ID, input.projectId)),
+      .query(({ input }) => getTopicPlans(getActiveUserId(), input.projectId)),
     generate: publicProcedure
       .input(z.object({ projectId: z.number() }))
       .mutation(async ({ input }) => {
         await logUsage(
-          GUEST_USER_ID,
+          getActiveUserId(),
           input.projectId,
           "topicPlans",
           "generate"
@@ -3681,7 +3776,9 @@ ${sourceVideoBlock}
   viralAnalysis: router({
     list: publicProcedure
       .input(z.object({ projectId: z.number() }))
-      .query(({ input }) => getViralAnalyses(GUEST_USER_ID, input.projectId)),
+      .query(({ input }) =>
+        getViralAnalyses(getActiveUserId(), input.projectId)
+      ),
     analyze: publicProcedure
       .input(
         z.object({
@@ -3694,12 +3791,12 @@ ${sourceVideoBlock}
       )
       .mutation(async ({ input }) => {
         await logUsage(
-          GUEST_USER_ID,
+          getActiveUserId(),
           input.projectId,
           "viralAnalysis",
           "analyze"
         );
-        const analysisId = await createViralAnalysis(GUEST_USER_ID, {
+        const analysisId = await createViralAnalysis(getActiveUserId(), {
           projectId: input.projectId,
           topicId: input.topicId,
           referenceContent: input.referenceContent,
@@ -3749,7 +3846,7 @@ ${input.accountPositioning ? `账号定位：${input.accountPositioning}` : ""}
         const analysisText = String(
           response.choices[0]?.message?.content || ""
         );
-        await updateViralAnalysis(GUEST_USER_ID, {
+        await updateViralAnalysis(getActiveUserId(), {
           id: analysisId,
           viralFormula: analysisText,
           fullAnalysis: { text: analysisText },
@@ -3764,7 +3861,9 @@ ${input.accountPositioning ? `账号定位：${input.accountPositioning}` : ""}
   scripts: router({
     list: publicProcedure
       .input(z.object({ projectId: z.number() }))
-      .query(({ input }) => getScripts(GUEST_USER_ID, input.projectId)),
+      .query(({ ctx, input }) =>
+        getScripts(currentUserId(ctx), input.projectId)
+      ),
     generateForTopicPlan: publicProcedure
       .input(
         z.object({
@@ -3772,9 +3871,11 @@ ${input.accountPositioning ? `账号定位：${input.accountPositioning}` : ""}
           topicPlanId: z.number(),
         })
       )
-      .mutation(async ({ input }) => {
-        await logUsage(GUEST_USER_ID, input.projectId, "scripts", "generate");
+      .mutation(async ({ ctx, input }) => {
+        const userId = currentUserId(ctx);
+        await logUsage(userId, input.projectId, "scripts", "generate");
         return generateScriptForTopicPlanWithArk(
+          userId,
           input.projectId,
           input.topicPlanId
         );
@@ -3786,17 +3887,13 @@ ${input.accountPositioning ? `账号定位：${input.accountPositioning}` : ""}
           regenerateAll: z.boolean().optional(),
         })
       )
-      .mutation(async ({ input }) => {
-        await logUsage(
-          GUEST_USER_ID,
-          input.projectId,
-          "scripts",
-          "generateBatch"
-        );
+      .mutation(async ({ ctx, input }) => {
+        const userId = currentUserId(ctx);
+        await logUsage(userId, input.projectId, "scripts", "generateBatch");
 
         const [plans, scripts] = await Promise.all([
-          getTopicPlans(GUEST_USER_ID, input.projectId),
-          getScripts(GUEST_USER_ID, input.projectId),
+          getTopicPlans(userId, input.projectId),
+          getScripts(userId, input.projectId),
         ]);
 
         const existingPlanIds = new Set(
@@ -3812,7 +3909,11 @@ ${input.accountPositioning ? `账号定位：${input.accountPositioning}` : ""}
         const results = [];
         for (const plan of targetPlans) {
           results.push(
-            await generateScriptForTopicPlanWithArk(input.projectId, plan.id)
+            await generateScriptForTopicPlanWithArk(
+              userId,
+              input.projectId,
+              plan.id
+            )
           );
         }
 
@@ -3832,10 +3933,10 @@ ${input.accountPositioning ? `账号定位：${input.accountPositioning}` : ""}
           title: z.string().optional(),
         })
       )
-      .mutation(({ input }) => updateScript(GUEST_USER_ID, input)),
+      .mutation(({ input }) => updateScript(getActiveUserId(), input)),
     delete: publicProcedure
       .input(z.object({ id: z.number() }))
-      .mutation(({ input }) => deleteScript(GUEST_USER_ID, input.id)),
+      .mutation(({ input }) => deleteScript(getActiveUserId(), input.id)),
   }),
 
   // ─── Digital Avatar Generation (HeyGen) ─────────────────────────────────
@@ -3853,7 +3954,7 @@ ${input.accountPositioning ? `账号定位：${input.accountPositioning}` : ""}
       )
       .mutation(async ({ input }) => {
         await logUsage(
-          GUEST_USER_ID,
+          getActiveUserId(),
           input.projectId,
           "materials",
           "digitalAvatar"
@@ -3906,7 +4007,7 @@ ${input.accountPositioning ? `账号定位：${input.accountPositioning}` : ""}
         const videoId = createData.data?.video_id;
         if (!videoId) throw new Error("HeyGen未返回视频ID");
 
-        const materialId = await createMaterial(GUEST_USER_ID, {
+        const materialId = await createMaterial(getActiveUserId(), {
           projectId: input.projectId,
           title: input.title,
           type: "digital_avatar",
@@ -3954,7 +4055,7 @@ ${input.accountPositioning ? `账号定位：${input.accountPositioning}` : ""}
         const thumbnailUrl = statusData.data?.thumbnail_url;
 
         if (status === "completed" && videoUrl) {
-          await updateMaterial(GUEST_USER_ID, {
+          await updateMaterial(getActiveUserId(), {
             id: input.materialId,
             status: "ready",
             fileUrl: videoUrl,
@@ -3962,7 +4063,7 @@ ${input.accountPositioning ? `账号定位：${input.accountPositioning}` : ""}
           });
           return { status: "completed", videoUrl, thumbnailUrl };
         } else if (status === "failed") {
-          await updateMaterial(GUEST_USER_ID, {
+          await updateMaterial(getActiveUserId(), {
             id: input.materialId,
             status: "failed",
           });
@@ -3998,7 +4099,7 @@ ${input.accountPositioning ? `账号定位：${input.accountPositioning}` : ""}
   materials: router({
     list: publicProcedure
       .input(z.object({ projectId: z.number() }))
-      .query(({ input }) => getMaterials(GUEST_USER_ID, input.projectId)),
+      .query(({ input }) => getMaterials(getActiveUserId(), input.projectId)),
     create: publicProcedure
       .input(
         z.object({
@@ -4019,7 +4120,7 @@ ${input.accountPositioning ? `账号定位：${input.accountPositioning}` : ""}
           style: z.string().optional(),
         })
       )
-      .mutation(({ input }) => createMaterial(GUEST_USER_ID, input)),
+      .mutation(({ input }) => createMaterial(getActiveUserId(), input)),
     update: publicProcedure
       .input(
         z.object({
@@ -4032,10 +4133,10 @@ ${input.accountPositioning ? `账号定位：${input.accountPositioning}` : ""}
           thumbnailUrl: z.string().optional(),
         })
       )
-      .mutation(({ input }) => updateMaterial(GUEST_USER_ID, input)),
+      .mutation(({ input }) => updateMaterial(getActiveUserId(), input)),
     delete: publicProcedure
       .input(z.object({ id: z.number() }))
-      .mutation(({ input }) => deleteMaterial(GUEST_USER_ID, input.id)),
+      .mutation(({ input }) => deleteMaterial(getActiveUserId(), input.id)),
   }),
 
   // ─── Content Package (Cover Image + Hashtags) ────────────────────────────
@@ -4052,7 +4153,7 @@ ${input.accountPositioning ? `账号定位：${input.accountPositioning}` : ""}
       )
       .mutation(async ({ input }) => {
         await logUsage(
-          GUEST_USER_ID,
+          getActiveUserId(),
           input.projectId,
           "platformAdaptation",
           "generateCover"
@@ -4080,7 +4181,7 @@ ${input.accountPositioning ? `账号定位：${input.accountPositioning}` : ""}
       )
       .mutation(async ({ input }) => {
         await logUsage(
-          GUEST_USER_ID,
+          getActiveUserId(),
           input.projectId,
           "platformAdaptation",
           "generateHashtags"
@@ -4126,12 +4227,12 @@ ${input.accountPositioning ? `账号定位：${input.accountPositioning}` : ""}
     list: publicProcedure
       .input(z.object({ scriptId: z.number() }))
       .query(({ input }) =>
-        getPlatformAdaptations(GUEST_USER_ID, input.scriptId)
+        getPlatformAdaptations(getActiveUserId(), input.scriptId)
       ),
     listByProject: publicProcedure
       .input(z.object({ projectId: z.number() }))
       .query(({ input }) =>
-        getPlatformAdaptationsByProject(GUEST_USER_ID, input.projectId)
+        getPlatformAdaptationsByProject(getActiveUserId(), input.projectId)
       ),
     generate: publicProcedure
       .input(
@@ -4147,7 +4248,7 @@ ${input.accountPositioning ? `账号定位：${input.accountPositioning}` : ""}
       )
       .mutation(async ({ input }) => {
         await logUsage(
-          GUEST_USER_ID,
+          getActiveUserId(),
           input.projectId,
           "platformAdaptation",
           "generate"
@@ -4214,7 +4315,7 @@ ${input.scriptContent.substring(0, 1000)}
             parsed = {};
           }
 
-          const saved = await createPlatformAdaptation(GUEST_USER_ID, {
+          const saved = await createPlatformAdaptation(getActiveUserId(), {
             projectId: input.projectId,
             scriptId: input.scriptId,
             platform,
@@ -4232,7 +4333,7 @@ ${input.scriptContent.substring(0, 1000)}
 
   // ─── Dashboard Stats ───────────────────────────────────────────────────────
   dashboard: router({
-    stats: publicProcedure.query(() => getDashboardStats(GUEST_USER_ID)),
+    stats: publicProcedure.query(() => getDashboardStats(getActiveUserId())),
     contentResults: publicProcedure.query(() => getDashboardContentResults()),
   }),
 
@@ -4248,13 +4349,13 @@ ${input.scriptContent.substring(0, 1000)}
       )
       .mutation(async ({ input }) => {
         await logUsage(
-          GUEST_USER_ID,
+          getActiveUserId(),
           input.projectId,
           "materials",
           "storyboard"
         );
 
-        const allScripts = await getScripts(GUEST_USER_ID, input.projectId);
+        const allScripts = await getScripts(getActiveUserId(), input.projectId);
         const script = allScripts.find(s => s.id === input.scriptId);
         if (!script) throw new Error("未找到脚本");
 
@@ -4328,13 +4429,23 @@ ${scriptContent}
         return { shots, scriptTitle: script.title };
       }),
 
-    // 创建 Seedance 视频生成任务
+    // 创建视频生成任务，根据任务类型路由到 Seedance 或 Pixelle
     createTask: publicProcedure
       .input(
         z.object({
           projectId: z.number(),
           scriptId: z.number().optional(),
           title: z.string().min(1),
+          provider: z.enum(["auto", "seedance", "pixelle"]).optional(),
+          taskType: z
+            .enum([
+              "quick_video",
+              "product_i2v",
+              "video_clone",
+              "asset_remix",
+              "long_marketing",
+            ])
+            .optional(),
           type: z.enum([
             "real_person",
             "digital_avatar",
@@ -4343,6 +4454,9 @@ ${scriptContent}
           ]),
           prompt: z.string().min(1),
           referenceImageUrl: z.string().optional(), // 远端 URL 或 /_local/ 开头的本地路径
+          referenceVideoUrl: z.string().optional(),
+          productImageUrls: z.array(z.string()).optional(),
+          subtitlesEnabled: z.boolean().optional(),
           ratio: z
             .enum(["16:9", "4:3", "1:1", "3:4", "9:16", "21:9", "adaptive"])
             .optional(),
@@ -4352,7 +4466,76 @@ ${scriptContent}
         })
       )
       .mutation(async ({ input }) => {
-        await logUsage(GUEST_USER_ID, input.projectId, "materials", "seedance");
+        const taskType = input.taskType ?? "quick_video";
+        const usePixelle =
+          input.provider === "pixelle" ||
+          (input.provider !== "seedance" &&
+            ["video_clone", "asset_remix", "long_marketing"].includes(
+              taskType
+            ));
+
+        if (usePixelle) {
+          if (
+            !["video_clone", "asset_remix", "long_marketing"].includes(taskType)
+          ) {
+            throw new Error(
+              "Pixelle 仅支持视频复刻、多素材混剪和多分镜营销视频"
+            );
+          }
+
+          await logUsage(
+            getActiveUserId(),
+            input.projectId,
+            "materials",
+            "pixelle"
+          );
+
+          const result = await createPixelleTask({
+            projectId: input.projectId,
+            scriptId: input.scriptId,
+            title: input.title,
+            taskType: taskType as
+              | "video_clone"
+              | "asset_remix"
+              | "long_marketing",
+            prompt: input.prompt,
+            referenceVideoUrl: input.referenceVideoUrl,
+            referenceImageUrl: input.referenceImageUrl,
+            productImageUrls: input.productImageUrls,
+            aspectRatio: input.ratio,
+            duration: input.duration,
+            voiceEnabled: input.generateAudio,
+            subtitlesEnabled: input.subtitlesEnabled,
+          });
+
+          const materialId = await createMaterial(getActiveUserId(), {
+            projectId: input.projectId,
+            scriptId: input.scriptId,
+            type: input.type,
+            title: input.title,
+            status: "processing",
+            provider: "pixelle",
+            taskType,
+            pixelleTaskId: result.taskId,
+            referenceImageUrl: input.referenceImageUrl,
+            prompt: input.prompt,
+            tags: ["pixelle", taskType, "AI生成"],
+          });
+
+          return {
+            materialId,
+            taskId: result.taskId,
+            provider: "pixelle" as const,
+            message: result.message,
+          };
+        }
+
+        await logUsage(
+          getActiveUserId(),
+          input.projectId,
+          "materials",
+          "seedance"
+        );
 
         // 本地路径转换：/_local/xxx -> .data/xxx（服务端物理路径）
         let imageInput = input.referenceImageUrl;
@@ -4368,34 +4551,64 @@ ${scriptContent}
           generateAudio: input.generateAudio,
         });
 
-        const materialId = await createMaterial(GUEST_USER_ID, {
+        const materialId = await createMaterial(getActiveUserId(), {
           projectId: input.projectId,
           scriptId: input.scriptId,
           type: input.type,
           title: input.title,
           status: "processing",
+          provider: "seedance",
+          taskType,
           seedanceTaskId: taskId,
           referenceImageUrl: input.referenceImageUrl,
           prompt: input.prompt,
           tags: ["seedance", "AI生成"],
         });
 
-        return { materialId, taskId };
+        return { materialId, taskId, provider: "seedance" as const };
       }),
 
-    // 查询 Seedance 任务状态，完成后更新素材记录
+    // 查询视频任务状态，完成后更新素材记录
     checkStatus: publicProcedure
       .input(
         z.object({
           materialId: z.number(),
           taskId: z.string(),
+          provider: z.enum(["seedance", "pixelle"]).optional(),
         })
       )
       .mutation(async ({ input }) => {
+        if (input.provider === "pixelle") {
+          const result = await queryPixelleTask(input.taskId);
+
+          if (result.status === "succeeded" && result.resultUrl) {
+            await updateMaterial(getActiveUserId(), {
+              id: input.materialId,
+              status: "ready",
+              fileUrl: result.resultUrl,
+            });
+            return { status: "completed", videoUrl: result.resultUrl };
+          }
+
+          if (result.status === "failed") {
+            await updateMaterial(getActiveUserId(), {
+              id: input.materialId,
+              status: "failed",
+            });
+            return { status: "failed", error: result.error || "生成失败" };
+          }
+
+          return {
+            status: "processing",
+            progress: result.progress,
+            error: result.error,
+          };
+        }
+
         const result = await querySeedanceTask(input.taskId);
 
         if (result.status === "succeeded" && result.videoUrl) {
-          await updateMaterial(GUEST_USER_ID, {
+          await updateMaterial(getActiveUserId(), {
             id: input.materialId,
             status: "ready",
             fileUrl: result.videoUrl,
@@ -4404,7 +4617,7 @@ ${scriptContent}
         }
 
         if (result.status === "failed" || result.status === "expired") {
-          await updateMaterial(GUEST_USER_ID, {
+          await updateMaterial(getActiveUserId(), {
             id: input.materialId,
             status: "failed",
           });
@@ -4419,18 +4632,14 @@ ${scriptContent}
   // ─── XHS 发布 ────────────────────────────────────────────────────────────────
   xhsPublish: router({
     // 查询 XHS 登录状态
-    loginStatus: publicProcedure.query(async () => {
+    loginStatus: publicProcedure.query(async ({ ctx }) => {
+      const userId = currentUserId(ctx);
+      const account = await ensureDefaultXhsAccount(userId);
       try {
-        const resp = await fetch(`${ENV.xhsApiUrl}/api/v1/login/status`, {
-          signal: AbortSignal.timeout(5000),
-        });
-        const data = (await resp.json()) as {
-          success?: boolean;
-          data?: { is_logged_in?: boolean; username?: string };
-        };
+        const data = await getXhsLoginStatus(account?.accountKey);
         return {
-          isLoggedIn: data.data?.is_logged_in ?? false,
-          username: data.data?.username ?? "",
+          isLoggedIn: data.is_logged_in ?? false,
+          username: data.username ?? "",
         };
       } catch {
         return { isLoggedIn: false, username: "" };
@@ -4439,8 +4648,8 @@ ${scriptContent}
 
     publications: publicProcedure
       .input(z.object({ projectId: z.number() }))
-      .query(({ input }) =>
-        getMaterialPublications(GUEST_USER_ID, input.projectId)
+      .query(({ ctx, input }) =>
+        getMaterialPublications(currentUserId(ctx), input.projectId)
       ),
 
     prepareDraft: publicProcedure
@@ -4450,10 +4659,11 @@ ${scriptContent}
           materialId: z.number(),
         })
       )
-      .mutation(async ({ input }) => {
+      .mutation(async ({ ctx, input }) => {
+        const userId = currentUserId(ctx);
         const [allMaterials, allScripts] = await Promise.all([
-          getMaterials(GUEST_USER_ID, input.projectId),
-          getScripts(GUEST_USER_ID, input.projectId),
+          getMaterials(userId, input.projectId),
+          getScripts(userId, input.projectId),
         ]);
         const material = allMaterials.find(
           item => item.id === input.materialId
@@ -4463,6 +4673,7 @@ ${scriptContent}
           ? allScripts.find(item => item.id === material.scriptId)
           : undefined;
         const draft = await ensureXhsDraftForScript({
+          userId,
           projectId: input.projectId,
           materialId: input.materialId,
           scriptId: material.scriptId,
@@ -4486,14 +4697,10 @@ ${scriptContent}
             .default("公开可见"),
         })
       )
-      .mutation(async ({ input }) => {
-        await logUsage(
-          GUEST_USER_ID,
-          input.projectId,
-          "platform",
-          "xhs_auto_publish"
-        );
-        return publishMaterialToXhs(input);
+      .mutation(async ({ ctx, input }) => {
+        const userId = currentUserId(ctx);
+        await logUsage(userId, input.projectId, "platform", "xhs_auto_publish");
+        return publishMaterialToXhs({ ...input, userId });
       }),
 
     batchPublishAuto: publicProcedure
@@ -4506,9 +4713,10 @@ ${scriptContent}
             .default("公开可见"),
         })
       )
-      .mutation(async ({ input }) => {
+      .mutation(async ({ ctx, input }) => {
+        const userId = currentUserId(ctx);
         await logUsage(
-          GUEST_USER_ID,
+          userId,
           input.projectId,
           "platform",
           "xhs_batch_publish"
@@ -4522,6 +4730,7 @@ ${scriptContent}
         for (const materialId of input.materialIds) {
           try {
             const result = await publishMaterialToXhs({
+              userId,
               projectId: input.projectId,
               materialId,
               visibility: input.visibility,
@@ -4552,16 +4761,16 @@ ${scriptContent}
             .default("公开可见"),
         })
       )
-      .mutation(async ({ input }) => {
-        await logUsage(
-          GUEST_USER_ID,
-          input.projectId,
-          "platform",
-          "xhs_publish"
+      .mutation(async ({ ctx, input }) => {
+        const userId = currentUserId(ctx);
+        const accountKey = await getProjectXhsAccountKey(
+          userId,
+          input.projectId
         );
+        await logUsage(userId, input.projectId, "platform", "xhs_publish");
 
         // 获取素材记录
-        const allMaterials = await getMaterials(GUEST_USER_ID, input.projectId);
+        const allMaterials = await getMaterials(userId, input.projectId);
         const material = allMaterials.find(m => m.id === input.materialId);
         if (!material) throw new Error("未找到素材记录");
         if (!material.fileUrl) throw new Error("该素材没有可用的视频文件");
@@ -4573,42 +4782,21 @@ ${scriptContent}
         });
 
         try {
-          // 调用 XHS 发布视频 API
-          const publishResp = await fetch(
-            `${ENV.xhsApiUrl}/api/v1/publish_video`,
+          const result = await publishXhsVideo(
             {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({
-                title: input.title,
-                content: input.content,
-                video: videoPath.path,
-                tags: input.tags ?? [],
-                visibility: input.visibility,
-              }),
-              signal: AbortSignal.timeout(600_000), // 视频发布可能较慢，给 10 分钟
-            }
+              title: input.title,
+              content: input.content,
+              video: videoPath.path,
+              tags: input.tags ?? [],
+              visibility: input.visibility,
+            },
+            accountKey
           );
 
-          const result = (await publishResp.json()) as {
-            success?: boolean;
-            data?: { post_id?: string; status?: string };
-            message?: string;
-            error?: string;
-          };
-
-          if (!publishResp.ok || !result.success) {
-            throw new Error(
-              result.error ||
-                result.message ||
-                `发布失败 (${publishResp.status})`
-            );
-          }
-
           return {
-            postId: result.data?.post_id,
-            status: result.data?.status ?? "published",
-            message: result.message ?? "发布成功",
+            postId: result.post_id,
+            status: result.status ?? "published",
+            message: "发布成功",
           };
         } finally {
           if (videoPath.shouldCleanup) {

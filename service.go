@@ -25,6 +25,7 @@ type XiaohongshuService struct{}
 
 type pendingLoginSession struct {
 	mu           sync.Mutex
+	accountID    string
 	browser      *browser.Browser
 	page         *rod.Page
 	action       *xiaohongshu.LoginAction
@@ -35,12 +36,19 @@ type pendingLoginSession struct {
 	authSeenAt   time.Time
 }
 
-var loginSession struct {
+type loginSessionState struct {
 	mu           sync.Mutex
 	activePageMu sync.Mutex
 	pending      *pendingLoginSession
 	active       *browser.Browser
 	activePage   *rod.Page
+}
+
+var accountLoginSessions = struct {
+	mu       sync.Mutex
+	sessions map[string]*loginSessionState
+}{
+	sessions: map[string]*loginSessionState{},
 }
 
 var usernameLookup struct {
@@ -52,6 +60,19 @@ var usernameLookup struct {
 // NewXiaohongshuService 创建小红书服务实例
 func NewXiaohongshuService() *XiaohongshuService {
 	return &XiaohongshuService{}
+}
+
+func getLoginSessionState(ctx context.Context) *loginSessionState {
+	account := getAccountRuntime(ctx)
+	accountLoginSessions.mu.Lock()
+	defer accountLoginSessions.mu.Unlock()
+
+	session := accountLoginSessions.sessions[account.ID]
+	if session == nil {
+		session = &loginSessionState{}
+		accountLoginSessions.sessions[account.ID] = session
+	}
+	return session
 }
 
 // PublishRequest 发布请求
@@ -151,10 +172,12 @@ type cookieEntry struct {
 	Domain string `json:"domain"`
 }
 
-func createPendingLoginSession() *pendingLoginSession {
-	b := newLoginBrowser()
+func createPendingLoginSession(ctx context.Context) *pendingLoginSession {
+	account := getAccountRuntime(ctx)
+	b := newLoginBrowserWithRuntime(account)
 	page := b.NewPage()
 	return &pendingLoginSession{
+		accountID: account.ID,
 		browser: b,
 		page:    page,
 		action:  xiaohongshu.NewLogin(page),
@@ -286,21 +309,22 @@ func fetchUsernameFromPage(ctx context.Context, page *rod.Page) string {
 }
 
 func (s *XiaohongshuService) getCurrentUsername(ctx context.Context) string {
-	loginSession.mu.Lock()
-	hasPendingLogin := loginSession.pending != nil
-	active := loginSession.active
-	activePage := loginSession.activePage
-	loginSession.mu.Unlock()
+	state := getLoginSessionState(ctx)
+	state.mu.Lock()
+	hasPendingLogin := state.pending != nil
+	active := state.active
+	activePage := state.activePage
+	state.mu.Unlock()
 	if hasPendingLogin {
 		return ""
 	}
 
 	if active != nil && activePage != nil {
-		loginSession.activePageMu.Lock()
+		state.activePageMu.Lock()
 		usernameCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
 		username := fetchUsernameFromPage(usernameCtx, activePage)
 		cancel()
-		loginSession.activePageMu.Unlock()
+		state.activePageMu.Unlock()
 		if username != "" {
 			return username
 		}
@@ -318,7 +342,7 @@ func (s *XiaohongshuService) getCurrentUsername(ctx context.Context) string {
 	}()
 
 	var username string
-	_ = withBrowserPage(func(page *rod.Page) error {
+	_ = withBrowserPage(ctx, func(page *rod.Page) error {
 		usernameCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
 		defer cancel()
 		username = fetchUsernameFromPage(usernameCtx, page)
@@ -378,23 +402,25 @@ func endUsernameLookup() {
 
 // DeleteCookies 删除 cookies 文件，用于登录重置
 func (s *XiaohongshuService) DeleteCookies(ctx context.Context) error {
-	s.clearPendingLogin()
-	s.clearActiveBrowser()
+	s.clearPendingLogin(ctx)
+	s.clearActiveBrowser(ctx)
 
-	cookiePath := cookies.GetCookiesFilePath()
+	account := getAccountRuntime(ctx)
+	cookiePath := account.CookiesPath
 	cookieLoader := cookies.NewLoadCookie(cookiePath)
 	if err := cookieLoader.DeleteCookies(); err != nil {
 		return err
 	}
-	if err := cookies.DeleteLoginState(); err != nil {
+	if err := cookies.DeleteLoginStateFrom(account.LoginStatePath); err != nil {
 		return err
 	}
-	return browser.CleanupStaleBrowserProfile()
+	return browser.CleanupStaleBrowserProfilePath(account.BrowserUserDataDir)
 }
 
 // CheckLoginStatus 检查登录状态
 func (s *XiaohongshuService) CheckLoginStatus(ctx context.Context) (*LoginStatusResponse, error) {
-	if state, err := cookies.LoadLoginState(); err == nil {
+	account := getAccountRuntime(ctx)
+	if state, err := cookies.LoadLoginStateFrom(account.LoginStatePath); err == nil {
 		switch state.Status {
 		case string(xiaohongshu.LoginStateSecondaryRequired):
 			return buildLoginStatusResponse(state.Status, state.Username, state.Detail), nil
@@ -403,7 +429,7 @@ func (s *XiaohongshuService) CheckLoginStatus(ctx context.Context) (*LoginStatus
 				username := s.getCurrentUsernameWithFallback(ctx)
 				if username != "" {
 					state.Username = username
-					_ = cookies.SaveLoginState(*state)
+					_ = cookies.SaveLoginStateTo(account.LoginStatePath, *state)
 				}
 			}
 			return buildLoginStatusResponse(state.Status, state.Username, state.Detail), nil
@@ -427,7 +453,7 @@ func (s *XiaohongshuService) CheckSearchAccess(ctx context.Context, keyword stri
 		detail string
 		err    error
 	)
-	err = s.withAuthenticatedPage(func(page *rod.Page) error {
+	err = s.withAuthenticatedPageForContext(ctx, func(page *rod.Page) error {
 		action := xiaohongshu.NewLogin(page)
 		ready, detail, err = action.VerifySearchAccess(ctx, keyword)
 		return err
@@ -445,9 +471,10 @@ func (s *XiaohongshuService) CheckSearchAccess(ctx context.Context, keyword stri
 // GetLoginQrcode 获取登录的扫码二维码
 func (s *XiaohongshuService) GetLoginQrcode(ctx context.Context) (*LoginQrcodeResponse, error) {
 	logrus.Info("开始获取登录二维码")
-	loginSession.mu.Lock()
-	existing := loginSession.pending
-	loginSession.mu.Unlock()
+	state := getLoginSessionState(ctx)
+	state.mu.Lock()
+	existing := state.pending
+	state.mu.Unlock()
 
 	if existing != nil {
 		existing.mu.Lock()
@@ -465,14 +492,15 @@ func (s *XiaohongshuService) GetLoginQrcode(ctx context.Context) (*LoginQrcodeRe
 		existing.mu.Unlock()
 	}
 
-	s.clearPendingLogin()
-	s.clearActiveBrowser()
-	if err := browser.CleanupStaleBrowserProfile(); err != nil {
+	s.clearPendingLogin(ctx)
+	s.clearActiveBrowser(ctx)
+	account := getAccountRuntime(ctx)
+	if err := browser.CleanupStaleBrowserProfilePath(account.BrowserUserDataDir); err != nil {
 		logrus.Errorf("清理浏览器 profile 失败: %v", err)
 		return nil, err
 	}
 
-	_ = cookies.SaveLoginState(cookies.LoginState{
+	_ = cookies.SaveLoginStateTo(account.LoginStatePath, cookies.LoginState{
 		Status: string(xiaohongshu.LoginStateWaitingVerification),
 	})
 
@@ -480,7 +508,7 @@ func (s *XiaohongshuService) GetLoginQrcode(ctx context.Context) (*LoginQrcodeRe
 		deadline:     time.Now().Add(4 * time.Minute),
 		initializing: true,
 	}
-	s.setPendingLogin(session)
+	s.setPendingLogin(ctx, session)
 
 	var (
 		img      string
@@ -490,7 +518,7 @@ func (s *XiaohongshuService) GetLoginQrcode(ctx context.Context) (*LoginQrcodeRe
 	logrus.Info("浏览器启动成功，准备打开二维码页面")
 	for attempt := 1; attempt <= 2; attempt++ {
 		closePendingLoginSession(session)
-		freshSession := createPendingLoginSession()
+		freshSession := createPendingLoginSession(ctx)
 		session.browser = freshSession.browser
 		session.page = freshSession.page
 		session.action = freshSession.action
@@ -508,11 +536,11 @@ func (s *XiaohongshuService) GetLoginQrcode(ctx context.Context) (*LoginQrcodeRe
 		time.Sleep(1 * time.Second)
 	}
 	if err != nil || loggedIn {
-		loginSession.mu.Lock()
-		if loginSession.pending == session {
-			loginSession.pending = nil
+		state.mu.Lock()
+		if state.pending == session {
+			state.pending = nil
 		}
-		loginSession.mu.Unlock()
+		state.mu.Unlock()
 		defer closePendingLoginSession(session)
 	}
 	if err != nil {
@@ -530,13 +558,13 @@ func (s *XiaohongshuService) GetLoginQrcode(ctx context.Context) (*LoginQrcodeRe
 	session.mu.Unlock()
 
 	if !loggedIn {
-		s.setPendingLogin(session)
+		s.setPendingLogin(ctx, session)
 	} else {
 		username := fetchUsernameFromPage(ctx, session.page)
-		if err := saveCookies(session.page); err != nil {
+		if err := saveCookies(ctx, session.page); err != nil {
 			return nil, err
 		}
-		_ = cookies.SaveLoginState(cookies.LoginState{
+		_ = cookies.SaveLoginStateTo(account.LoginStatePath, cookies.LoginState{
 			Status:   string(xiaohongshu.LoginStateLoggedIn),
 			Username: username,
 		})
@@ -567,9 +595,10 @@ func (s *XiaohongshuService) StartPhoneLogin(ctx context.Context) (*PhoneLoginSt
 }
 
 func (s *XiaohongshuService) StartLoginSession(ctx context.Context) (*LoginStatusResponse, error) {
-	s.clearPendingLogin()
-	s.clearActiveBrowser()
-	if err := browser.CleanupStaleBrowserProfile(); err != nil {
+	s.clearPendingLogin(ctx)
+	s.clearActiveBrowser(ctx)
+	account := getAccountRuntime(ctx)
+	if err := browser.CleanupStaleBrowserProfilePath(account.BrowserUserDataDir); err != nil {
 		return nil, err
 	}
 
@@ -577,9 +606,9 @@ func (s *XiaohongshuService) StartLoginSession(ctx context.Context) (*LoginStatu
 		deadline:     time.Now().Add(5 * time.Minute),
 		initializing: true,
 	}
-	s.setPendingLogin(session)
+	s.setPendingLogin(ctx, session)
 
-	freshSession := createPendingLoginSession()
+	freshSession := createPendingLoginSession(ctx)
 	session.browser = freshSession.browser
 	session.page = freshSession.page
 	session.action = freshSession.action
@@ -587,7 +616,7 @@ func (s *XiaohongshuService) StartLoginSession(ctx context.Context) (*LoginStatu
 	prepareCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 	if err := session.action.PrepareLoginFlow(prepareCtx); err != nil {
-		s.clearPendingLogin()
+		s.clearPendingLogin(ctx)
 		return nil, err
 	}
 
@@ -609,7 +638,7 @@ func (s *XiaohongshuService) StartLoginSession(ctx context.Context) (*LoginStatu
 }
 
 func (s *XiaohongshuService) SendPhoneLoginCode(ctx context.Context, phone string) (*PhoneLoginActionResponse, error) {
-	session, err := s.getPendingLoginSession()
+	session, err := s.getPendingLoginSession(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -636,7 +665,7 @@ func (s *XiaohongshuService) SendPhoneLoginCode(ctx context.Context, phone strin
 }
 
 func (s *XiaohongshuService) VerifyPhoneLoginCode(ctx context.Context, code string) (*PhoneLoginActionResponse, error) {
-	session, err := s.getPendingLoginSession()
+	session, err := s.getPendingLoginSession(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -656,27 +685,30 @@ func (s *XiaohongshuService) VerifyPhoneLoginCode(ctx context.Context, code stri
 	}, nil
 }
 
-func (s *XiaohongshuService) setPendingLogin(session *pendingLoginSession) {
-	loginSession.mu.Lock()
-	defer loginSession.mu.Unlock()
-	loginSession.pending = session
+func (s *XiaohongshuService) setPendingLogin(ctx context.Context, session *pendingLoginSession) {
+	state := getLoginSessionState(ctx)
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	state.pending = session
 }
 
-func (s *XiaohongshuService) getPendingLoginSession() (*pendingLoginSession, error) {
-	loginSession.mu.Lock()
-	session := loginSession.pending
-	loginSession.mu.Unlock()
+func (s *XiaohongshuService) getPendingLoginSession(ctx context.Context) (*pendingLoginSession, error) {
+	state := getLoginSessionState(ctx)
+	state.mu.Lock()
+	session := state.pending
+	state.mu.Unlock()
 	if session == nil {
 		return nil, fmt.Errorf("no active login session")
 	}
 	return session, nil
 }
 
-func (s *XiaohongshuService) clearPendingLogin() {
-	loginSession.mu.Lock()
-	session := loginSession.pending
-	loginSession.pending = nil
-	loginSession.mu.Unlock()
+func (s *XiaohongshuService) clearPendingLogin(ctx context.Context) {
+	state := getLoginSessionState(ctx)
+	state.mu.Lock()
+	session := state.pending
+	state.pending = nil
+	state.mu.Unlock()
 
 	if session == nil {
 		return
@@ -700,9 +732,10 @@ func (s *XiaohongshuService) clearPendingLogin() {
 }
 
 func (s *XiaohongshuService) checkPendingLoginStatus(ctx context.Context) (*LoginStatusResponse, bool, error) {
-	loginSession.mu.Lock()
-	session := loginSession.pending
-	loginSession.mu.Unlock()
+	state := getLoginSessionState(ctx)
+	state.mu.Lock()
+	session := state.pending
+	state.mu.Unlock()
 
 	if session == nil {
 		return nil, false, nil
@@ -720,16 +753,17 @@ func (s *XiaohongshuService) checkPendingLoginStatus(ctx context.Context) (*Logi
 	session.mu.Unlock()
 
 	if !pageReady {
-		go s.clearPendingLogin()
+		go s.clearPendingLogin(ctx)
 		return nil, false, nil
 	}
 
 	if time.Now().After(deadline) {
-		_ = cookies.SaveLoginState(cookies.LoginState{
+		account := getAccountRuntime(ctx)
+		_ = cookies.SaveLoginStateTo(account.LoginStatePath, cookies.LoginState{
 			Status: string(xiaohongshu.LoginStateUnknown),
 			Detail: "login session expired",
 		})
-		go s.clearPendingLogin()
+		go s.clearPendingLogin(ctx)
 		return buildLoginStatusResponse(string(xiaohongshu.LoginStateUnknown), "", "login session expired"), true, nil
 	}
 
@@ -741,7 +775,7 @@ func (s *XiaohongshuService) checkPendingLoginStatus(ctx context.Context) (*Logi
 	flow, err := action.InspectLoginFlow(statusCtx)
 	if err != nil {
 		if isPageTargetGoneError(err) {
-			recovered, recoverErr := s.recoverPendingLoginAfterPageLoss(session)
+			recovered, recoverErr := s.recoverPendingLoginAfterPageLoss(ctx, session)
 			if recoverErr != nil {
 				return nil, true, recoverErr
 			}
@@ -751,11 +785,11 @@ func (s *XiaohongshuService) checkPendingLoginStatus(ctx context.Context) (*Logi
 		}
 		return nil, true, err
 	}
-	state := flow.State
+	loginState := flow.State
 	detail := flow.Detail
-	logrus.Infof("pending login status: %s, requirement: %s, detail: %s", state, flow.Requirement, detail)
+	logrus.Infof("pending login status: %s, requirement: %s, detail: %s", loginState, flow.Requirement, detail)
 
-	if state == xiaohongshu.LoginStateWaitingVerification && detail == "auth cookies detected, waiting modal close" {
+	if loginState == xiaohongshu.LoginStateWaitingVerification && detail == "auth cookies detected, waiting modal close" {
 		session.mu.Lock()
 		if session.authSeenAt.IsZero() {
 			session.authSeenAt = time.Now()
@@ -771,7 +805,7 @@ func (s *XiaohongshuService) checkPendingLoginStatus(ctx context.Context) (*Logi
 				logrus.Warnf("confirm pending login failed: %v", confirmErr)
 			}
 			if confirmed {
-				state = xiaohongshu.LoginStateLoggedIn
+				loginState = xiaohongshu.LoginStateLoggedIn
 				detail = confirmDetail
 			} else if confirmDetail != "" {
 				detail = confirmDetail
@@ -779,23 +813,25 @@ func (s *XiaohongshuService) checkPendingLoginStatus(ctx context.Context) (*Logi
 		}
 	}
 
-	switch state {
+	switch loginState {
 	case xiaohongshu.LoginStateLoggedIn:
 		username := s.fetchUsernameFromPendingBrowser(session)
-		if err := saveCookies(page); err != nil {
+		if err := saveCookies(ctx, page); err != nil {
 			return nil, true, err
 		}
-		_ = cookies.SaveLoginState(cookies.LoginState{
+		account := getAccountRuntime(ctx)
+		_ = cookies.SaveLoginStateTo(account.LoginStatePath, cookies.LoginState{
 			Status:   string(xiaohongshu.LoginStateLoggedIn),
 			Username: username,
 		})
 		flow.State = xiaohongshu.LoginStateLoggedIn
 		flow.Requirement = xiaohongshu.LoginRequirementNone
 		response := buildLoginStatusResponseFromFlow(flow, username, timeout)
-		s.promotePendingLogin(session)
+		s.promotePendingLogin(ctx, session)
 		return response, true, nil
 	case xiaohongshu.LoginStateSecondaryRequired:
-		_ = cookies.SaveLoginState(cookies.LoginState{
+		account := getAccountRuntime(ctx)
+		_ = cookies.SaveLoginStateTo(account.LoginStatePath, cookies.LoginState{
 			Status: string(xiaohongshu.LoginStateSecondaryRequired),
 			Detail: detail,
 		})
@@ -816,9 +852,9 @@ func isPageTargetGoneError(err error) bool {
 		strings.Contains(message, "target closed")
 }
 
-func (s *XiaohongshuService) recoverPendingLoginAfterPageLoss(session *pendingLoginSession) (*LoginStatusResponse, error) {
+func (s *XiaohongshuService) recoverPendingLoginAfterPageLoss(ctx context.Context, session *pendingLoginSession) (*LoginStatusResponse, error) {
 	if session == nil || session.page == nil || session.browser == nil {
-		go s.clearPendingLogin()
+		go s.clearPendingLogin(ctx)
 		return buildLoginStatusResponse(string(xiaohongshu.LoginStateUnknown), "", "login page closed before confirmation"), nil
 	}
 
@@ -827,22 +863,23 @@ func (s *XiaohongshuService) recoverPendingLoginAfterPageLoss(session *pendingLo
 		return nil, err
 	}
 	if !hasAuth {
-		go s.clearPendingLogin()
+		go s.clearPendingLogin(ctx)
 		return buildLoginStatusResponse(string(xiaohongshu.LoginStateUnknown), "", "login page closed before auth cookies were ready"), nil
 	}
 
-	if err := saveCookies(session.page); err != nil {
+	if err := saveCookies(ctx, session.page); err != nil {
 		return nil, err
 	}
 
 	username := s.fetchUsernameFromPendingBrowser(session)
-	_ = cookies.SaveLoginState(cookies.LoginState{
+	account := getAccountRuntime(ctx)
+	_ = cookies.SaveLoginStateTo(account.LoginStatePath, cookies.LoginState{
 		Status:   string(xiaohongshu.LoginStateLoggedIn),
 		Username: username,
 	})
 
 	response := buildLoginStatusResponse(string(xiaohongshu.LoginStateLoggedIn), username, "login recovered after page redirect")
-	go s.clearPendingLogin()
+	go s.clearPendingLogin(ctx)
 	return response, nil
 }
 
@@ -892,11 +929,12 @@ func (s *XiaohongshuService) watchPendingLogin(ctx context.Context, session *pen
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			logrus.Errorf("login watcher panic: %v", recovered)
-			_ = cookies.SaveLoginState(cookies.LoginState{
+			account := getAccountRuntime(ctx)
+			_ = cookies.SaveLoginStateTo(account.LoginStatePath, cookies.LoginState{
 				Status: string(xiaohongshu.LoginStateUnknown),
 				Detail: fmt.Sprint(recovered),
 			})
-			s.clearPendingLogin()
+			s.clearPendingLogin(ctx)
 		}
 	}()
 
@@ -915,11 +953,12 @@ func (s *XiaohongshuService) watchPendingLogin(ctx context.Context, session *pen
 	for {
 		select {
 		case <-ctx.Done():
-			_ = cookies.SaveLoginState(cookies.LoginState{
+			account := getAccountRuntime(ctx)
+			_ = cookies.SaveLoginStateTo(account.LoginStatePath, cookies.LoginState{
 				Status: string(xiaohongshu.LoginStateUnknown),
 				Detail: "login session expired",
 			})
-			s.clearPendingLogin()
+			s.clearPendingLogin(ctx)
 			return
 		case <-ticker.C:
 			state, detail := action.DetectLoginState(ctx)
@@ -927,26 +966,29 @@ func (s *XiaohongshuService) watchPendingLogin(ctx context.Context, session *pen
 
 			switch state {
 			case xiaohongshu.LoginStateLoggedIn:
-				if err := saveCookies(page); err != nil {
+				if err := saveCookies(ctx, page); err != nil {
 					logrus.Errorf("保存登录 cookies 失败: %v", err)
-					_ = cookies.SaveLoginState(cookies.LoginState{
+					account := getAccountRuntime(ctx)
+					_ = cookies.SaveLoginStateTo(account.LoginStatePath, cookies.LoginState{
 						Status: string(xiaohongshu.LoginStateUnknown),
 						Detail: err.Error(),
 					})
-					s.clearPendingLogin()
+					s.clearPendingLogin(ctx)
 					return
 				}
-				_ = cookies.SaveLoginState(cookies.LoginState{
+				account := getAccountRuntime(ctx)
+				_ = cookies.SaveLoginStateTo(account.LoginStatePath, cookies.LoginState{
 					Status: string(xiaohongshu.LoginStateLoggedIn),
 				})
-				s.clearPendingLogin()
+				s.clearPendingLogin(ctx)
 				return
 			case xiaohongshu.LoginStateSecondaryRequired:
-				_ = cookies.SaveLoginState(cookies.LoginState{
+				account := getAccountRuntime(ctx)
+				_ = cookies.SaveLoginStateTo(account.LoginStatePath, cookies.LoginState{
 					Status: string(xiaohongshu.LoginStateSecondaryRequired),
 					Detail: detail,
 				})
-				s.clearPendingLogin()
+				s.clearPendingLogin(ctx)
 				return
 			}
 		}
@@ -1028,7 +1070,11 @@ func (s *XiaohongshuService) processImages(images []string) ([]string, error) {
 
 // publishContent 执行内容发布
 func (s *XiaohongshuService) publishContent(ctx context.Context, content xiaohongshu.PublishImageContent) error {
-	b := newBrowser()
+	account := getAccountRuntime(ctx)
+	unlock := lockAccount(account.ID)
+	defer unlock()
+
+	b := newBrowserWithRuntime(account)
 	defer b.Close()
 
 	page := b.NewPage()
@@ -1111,7 +1157,11 @@ func (s *XiaohongshuService) PublishVideo(ctx context.Context, req *PublishVideo
 
 // publishVideo 执行视频发布
 func (s *XiaohongshuService) publishVideo(ctx context.Context, content xiaohongshu.PublishVideoContent) error {
-	b := newIsolatedBrowser()
+	account := getAccountRuntime(ctx)
+	unlock := lockAccount(account.ID)
+	defer unlock()
+
+	b := newIsolatedBrowser(ctx)
 	defer b.Close()
 
 	page := b.NewPage()
@@ -1127,7 +1177,7 @@ func (s *XiaohongshuService) publishVideo(ctx context.Context, content xiaohongs
 
 // ListFeeds 获取Feeds列表
 func (s *XiaohongshuService) ListFeeds(ctx context.Context) (*FeedsListResponse, error) {
-	b := newBrowser()
+	b := newBrowserWithRuntime(getAccountRuntime(ctx))
 	defer b.Close()
 
 	page := b.NewPage()
@@ -1153,7 +1203,7 @@ func (s *XiaohongshuService) ListFeeds(ctx context.Context) (*FeedsListResponse,
 
 func (s *XiaohongshuService) SearchFeeds(ctx context.Context, keyword string, filters ...xiaohongshu.FilterOption) (*FeedsListResponse, error) {
 	var feeds []xiaohongshu.Feed
-	err := s.withAuthenticatedPage(func(page *rod.Page) error {
+	err := s.withAuthenticatedPageForContext(ctx, func(page *rod.Page) error {
 		action := xiaohongshu.NewSearchAction(page)
 		var searchErr error
 		feeds, searchErr = action.Search(ctx, keyword, filters...)
@@ -1161,7 +1211,8 @@ func (s *XiaohongshuService) SearchFeeds(ctx context.Context, keyword string, fi
 	})
 	if err != nil {
 		if err == xhsErrors.ErrSearchLoginRequired {
-			_ = cookies.SaveLoginState(cookies.LoginState{
+			account := getAccountRuntime(ctx)
+			_ = cookies.SaveLoginStateTo(account.LoginStatePath, cookies.LoginState{
 				Status: string(xiaohongshu.LoginStateUnknown),
 				Detail: err.Error(),
 			})
@@ -1184,7 +1235,7 @@ func (s *XiaohongshuService) GetFeedDetail(ctx context.Context, feedID, xsecToke
 
 // GetFeedDetailWithConfig 使用配置获取Feed详情
 func (s *XiaohongshuService) GetFeedDetailWithConfig(ctx context.Context, feedID, xsecToken string, loadAllComments bool, config xiaohongshu.CommentLoadConfig) (*FeedDetailResponse, error) {
-	b := newBrowser()
+	b := newBrowserWithRuntime(getAccountRuntime(ctx))
 	defer b.Close()
 
 	page := b.NewPage()
@@ -1209,7 +1260,7 @@ func (s *XiaohongshuService) GetFeedDetailWithConfig(ctx context.Context, feedID
 
 // UserProfile 获取用户信息
 func (s *XiaohongshuService) UserProfile(ctx context.Context, userID, xsecToken string) (*UserProfileResponse, error) {
-	b := newBrowser()
+	b := newBrowserWithRuntime(getAccountRuntime(ctx))
 	defer b.Close()
 
 	page := b.NewPage()
@@ -1233,7 +1284,7 @@ func (s *XiaohongshuService) UserProfile(ctx context.Context, userID, xsecToken 
 
 // PostCommentToFeed 发表评论到Feed
 func (s *XiaohongshuService) PostCommentToFeed(ctx context.Context, feedID, xsecToken, content string) (*PostCommentResponse, error) {
-	b := newBrowser()
+	b := newBrowserWithRuntime(getAccountRuntime(ctx))
 	defer b.Close()
 
 	page := b.NewPage()
@@ -1250,7 +1301,7 @@ func (s *XiaohongshuService) PostCommentToFeed(ctx context.Context, feedID, xsec
 
 // LikeFeed 点赞笔记
 func (s *XiaohongshuService) LikeFeed(ctx context.Context, feedID, xsecToken string) (*ActionResult, error) {
-	b := newBrowser()
+	b := newBrowserWithRuntime(getAccountRuntime(ctx))
 	defer b.Close()
 
 	page := b.NewPage()
@@ -1265,7 +1316,7 @@ func (s *XiaohongshuService) LikeFeed(ctx context.Context, feedID, xsecToken str
 
 // UnlikeFeed 取消点赞笔记
 func (s *XiaohongshuService) UnlikeFeed(ctx context.Context, feedID, xsecToken string) (*ActionResult, error) {
-	b := newBrowser()
+	b := newBrowserWithRuntime(getAccountRuntime(ctx))
 	defer b.Close()
 
 	page := b.NewPage()
@@ -1280,7 +1331,7 @@ func (s *XiaohongshuService) UnlikeFeed(ctx context.Context, feedID, xsecToken s
 
 // FavoriteFeed 收藏笔记
 func (s *XiaohongshuService) FavoriteFeed(ctx context.Context, feedID, xsecToken string) (*ActionResult, error) {
-	b := newBrowser()
+	b := newBrowserWithRuntime(getAccountRuntime(ctx))
 	defer b.Close()
 
 	page := b.NewPage()
@@ -1295,7 +1346,7 @@ func (s *XiaohongshuService) FavoriteFeed(ctx context.Context, feedID, xsecToken
 
 // UnfavoriteFeed 取消收藏笔记
 func (s *XiaohongshuService) UnfavoriteFeed(ctx context.Context, feedID, xsecToken string) (*ActionResult, error) {
-	b := newBrowser()
+	b := newBrowserWithRuntime(getAccountRuntime(ctx))
 	defer b.Close()
 
 	page := b.NewPage()
@@ -1310,7 +1361,7 @@ func (s *XiaohongshuService) UnfavoriteFeed(ctx context.Context, feedID, xsecTok
 
 // ReplyCommentToFeed 回复指定评论
 func (s *XiaohongshuService) ReplyCommentToFeed(ctx context.Context, feedID, xsecToken, commentID, userID, content string) (*ReplyCommentResponse, error) {
-	b := newBrowser()
+	b := newBrowserWithRuntime(getAccountRuntime(ctx))
 	defer b.Close()
 
 	page := b.NewPage()
@@ -1331,22 +1382,33 @@ func (s *XiaohongshuService) ReplyCommentToFeed(ctx context.Context, feedID, xse
 	}, nil
 }
 
-func newBrowser() *browser.Browser {
-	return browser.NewBrowser(configs.IsHeadless(), browser.WithBinPath(configs.GetBinPath()))
+func newBrowserWithRuntime(account AccountRuntime) *browser.Browser {
+	return browser.NewBrowser(
+		configs.IsHeadless(),
+		browser.WithBinPath(configs.GetBinPath()),
+		browser.WithUserDataDir(account.BrowserUserDataDir),
+		browser.WithCookiesPath(account.CookiesPath),
+	)
 }
 
-func newLoginBrowser() *browser.Browser {
-	return browser.NewBrowser(false, browser.WithBinPath(configs.GetBinPath()))
+func newLoginBrowserWithRuntime(account AccountRuntime) *browser.Browser {
+	return browser.NewBrowser(
+		false,
+		browser.WithBinPath(configs.GetBinPath()),
+		browser.WithUserDataDir(account.BrowserUserDataDir),
+		browser.WithCookiesPath(account.CookiesPath),
+	)
 }
 
-func newIsolatedBrowser() *browser.Browser {
-	userDataDir, err := browser.CloneUserDataDirToTemp()
+func newIsolatedBrowser(ctx context.Context) *browser.Browser {
+	account := getAccountRuntime(ctx)
+	userDataDir, err := browser.CloneUserDataDirToTempFrom(account.BrowserUserDataDir)
 	if err != nil {
 		logrus.Warnf("克隆浏览器 profile 失败，改用空临时 profile: %v", err)
 		userDataDir, err = os.MkdirTemp("", "xhs-browser-task-*")
 		if err != nil {
 			logrus.Warnf("创建临时浏览器 profile 失败，回退默认 profile: %v", err)
-			return newBrowser()
+			return newBrowserWithRuntime(account)
 		}
 	}
 
@@ -1354,10 +1416,11 @@ func newIsolatedBrowser() *browser.Browser {
 		configs.IsHeadless(),
 		browser.WithBinPath(configs.GetBinPath()),
 		browser.WithUserDataDir(userDataDir),
+		browser.WithCookiesPath(account.CookiesPath),
 	)
 }
 
-func saveCookies(page *rod.Page) error {
+func saveCookies(ctx context.Context, page *rod.Page) error {
 	cks, err := page.Browser().GetCookies()
 	if err != nil {
 		return err
@@ -1368,13 +1431,14 @@ func saveCookies(page *rod.Page) error {
 		return err
 	}
 
-	cookieLoader := cookies.NewLoadCookie(cookies.GetCookiesFilePath())
+	account := getAccountRuntime(ctx)
+	cookieLoader := cookies.NewLoadCookie(account.CookiesPath)
 	return cookieLoader.SaveCookies(data)
 }
 
 // withBrowserPage 执行需要浏览器页面的操作的通用函数
-func withBrowserPage(fn func(*rod.Page) error) error {
-	b := newIsolatedBrowser()
+func withBrowserPage(ctx context.Context, fn func(*rod.Page) error) error {
+	b := newIsolatedBrowser(ctx)
 	defer b.Close()
 
 	page := b.NewPage()
@@ -1384,14 +1448,19 @@ func withBrowserPage(fn func(*rod.Page) error) error {
 }
 
 func (s *XiaohongshuService) withAuthenticatedPage(fn func(*rod.Page) error) error {
-	loginSession.mu.Lock()
-	active := loginSession.active
-	activePage := loginSession.activePage
-	loginSession.mu.Unlock()
+	return s.withAuthenticatedPageForContext(context.Background(), fn)
+}
+
+func (s *XiaohongshuService) withAuthenticatedPageForContext(ctx context.Context, fn func(*rod.Page) error) error {
+	state := getLoginSessionState(ctx)
+	state.mu.Lock()
+	active := state.active
+	activePage := state.activePage
+	state.mu.Unlock()
 
 	if active != nil && activePage != nil {
-		loginSession.activePageMu.Lock()
-		defer loginSession.activePageMu.Unlock()
+		state.activePageMu.Lock()
+		defer state.activePageMu.Unlock()
 		return fn(activePage)
 	}
 
@@ -1401,7 +1470,7 @@ func (s *XiaohongshuService) withAuthenticatedPage(fn func(*rod.Page) error) err
 		return fn(page)
 	}
 
-	return withBrowserPage(fn)
+	return withBrowserPage(ctx, fn)
 }
 
 func (s *XiaohongshuService) confirmPendingLogin(current *xiaohongshu.LoginAction) (bool, string, error) {
@@ -1435,13 +1504,14 @@ func (s *XiaohongshuService) confirmPendingLogin(current *xiaohongshu.LoginActio
 	return false, "", nil
 }
 
-func (s *XiaohongshuService) clearActiveBrowser() {
-	loginSession.mu.Lock()
-	active := loginSession.active
-	activePage := loginSession.activePage
-	loginSession.active = nil
-	loginSession.activePage = nil
-	loginSession.mu.Unlock()
+func (s *XiaohongshuService) clearActiveBrowser(ctx context.Context) {
+	state := getLoginSessionState(ctx)
+	state.mu.Lock()
+	active := state.active
+	activePage := state.activePage
+	state.active = nil
+	state.activePage = nil
+	state.mu.Unlock()
 
 	if activePage != nil {
 		_ = activePage.Close()
@@ -1451,16 +1521,17 @@ func (s *XiaohongshuService) clearActiveBrowser() {
 	}
 }
 
-func (s *XiaohongshuService) promotePendingLogin(session *pendingLoginSession) {
-	loginSession.mu.Lock()
-	if loginSession.pending == session {
-		loginSession.pending = nil
+func (s *XiaohongshuService) promotePendingLogin(ctx context.Context, session *pendingLoginSession) {
+	state := getLoginSessionState(ctx)
+	state.mu.Lock()
+	if state.pending == session {
+		state.pending = nil
 	}
-	oldActive := loginSession.active
-	oldActivePage := loginSession.activePage
-	loginSession.active = session.browser
-	loginSession.activePage = session.page
-	loginSession.mu.Unlock()
+	oldActive := state.active
+	oldActivePage := state.activePage
+	state.active = session.browser
+	state.activePage = session.page
+	state.mu.Unlock()
 
 	if oldActivePage != nil && oldActivePage != session.page {
 		_ = oldActivePage.Close()
@@ -1481,7 +1552,7 @@ func (s *XiaohongshuService) GetMyProfile(ctx context.Context) (*UserProfileResp
 	var result *xiaohongshu.UserProfileResponse
 	var err error
 
-	err = s.withAuthenticatedPage(func(page *rod.Page) error {
+	err = s.withAuthenticatedPageForContext(ctx, func(page *rod.Page) error {
 		action := xiaohongshu.NewUserProfileAction(page)
 		result, err = action.GetMyProfileViaSidebar(ctx)
 		return err
