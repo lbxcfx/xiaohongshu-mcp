@@ -179,6 +179,9 @@ function createAuthContext(): TrpcContext {
     user: {
       id: 1,
       openId: "test-user-123",
+      xhsUserId: "test-red-123",
+      xhsNickname: "Test User",
+      avatar: null,
       email: "test@example.com",
       name: "Test User",
       loginMethod: "manus",

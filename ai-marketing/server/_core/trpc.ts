@@ -1,7 +1,7 @@
 import { NOT_ADMIN_ERR_MSG, UNAUTHED_ERR_MSG } from "@shared/const";
 import { initTRPC, TRPCError } from "@trpc/server";
 import superjson from "superjson";
-import type { TrpcContext } from "./context";
+import { isRedIdBoundUser, type TrpcContext } from "./context";
 import { runWithUserId } from "./userScope";
 
 const t = initTRPC.context<TrpcContext>().create({
@@ -11,14 +11,16 @@ const t = initTRPC.context<TrpcContext>().create({
 export const router = t.router;
 export const publicProcedure = t.procedure.use(
   t.middleware(async ({ ctx, next }) =>
-    runWithUserId(ctx.user?.id, () => next({ ctx }))
+    runWithUserId(isRedIdBoundUser(ctx.user) ? ctx.user.id : null, () =>
+      next({ ctx })
+    )
   )
 );
 
 const requireUser = t.middleware(async opts => {
   const { ctx, next } = opts;
 
-  if (!ctx.user) {
+  if (!isRedIdBoundUser(ctx.user)) {
     throw new TRPCError({ code: "UNAUTHORIZED", message: UNAUTHED_ERR_MSG });
   }
 
@@ -38,7 +40,7 @@ export const adminProcedure = t.procedure.use(
   t.middleware(async opts => {
     const { ctx, next } = opts;
 
-    if (!ctx.user || ctx.user.role !== "admin") {
+    if (!isRedIdBoundUser(ctx.user) || ctx.user.role !== "admin") {
       throw new TRPCError({ code: "FORBIDDEN", message: NOT_ADMIN_ERR_MSG });
     }
 

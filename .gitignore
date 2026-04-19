@@ -36,9 +36,12 @@ go.work.sum
 
 # Build artifacts
 xiaohongshu-mcp
+server.bin
+*.tar.gz
 
 # Test scripts
 test_*.sh
+cmd/search_test/
 
 # Cookies files (contain sensitive login information)
 cookies.json
@@ -54,4 +57,7 @@ login_state.json
 
 # Temporary local artifacts
 Program
+.data/
+qrcode.png
+xiaohongshu-mcp-2026.04.09.1645-7732044/
 CUserscfx33/

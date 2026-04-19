@@ -26,8 +26,11 @@ const redirectToLoginIfUnauthorized = (error: unknown) => {
   if (typeof window === "undefined") return;
 
   const isUnauthorized = error.message === UNAUTHED_ERR_MSG;
-
   if (!isUnauthorized) return;
+
+  // 已在登录页则不重定向，避免无限刷新循环
+  const loginPaths = ["/", "/xhs-login"];
+  if (loginPaths.includes(window.location.pathname)) return;
 
   window.location.href = "/";
 };

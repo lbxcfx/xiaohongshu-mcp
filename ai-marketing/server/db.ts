@@ -37,6 +37,34 @@ let _sqliteDb: DatabaseSync | null = null;
 
 type ProjectStatus = "active" | "archived";
 
+const USER_SCOPED_TABLES = [
+  "projects",
+  "positionings",
+  "topic_hub_items",
+  "topics",
+  "topic_plans",
+  "scripts",
+  "materials",
+  "platform_adaptations",
+  "material_publications",
+  "xhs_accounts",
+] as const;
+
+type SqliteUserRow = {
+  id: number;
+  openId: string;
+  xhsUserId: string | null;
+  xhsNickname: string | null;
+  name: string | null;
+  avatar: string | null;
+  email: string | null;
+  loginMethod: string | null;
+  role: "user" | "admin";
+  createdAt: string;
+  updatedAt: string;
+  lastSignedIn: string;
+};
+
 type SqliteProjectRow = {
   id: number;
   userId: number;
@@ -169,6 +197,36 @@ function getSqliteDb() {
   const dbPath = getSqliteDbPath();
   mkdirSync(dirname(dbPath), { recursive: true });
   _sqliteDb = new DatabaseSync(dbPath);
+  _sqliteDb.exec(`
+    CREATE TABLE IF NOT EXISTS users (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      openId TEXT NOT NULL UNIQUE,
+      xhsUserId TEXT,
+      xhsNickname TEXT,
+      name TEXT,
+      avatar TEXT,
+      email TEXT,
+      loginMethod TEXT,
+      role TEXT NOT NULL DEFAULT 'user',
+      createdAt TEXT NOT NULL,
+      updatedAt TEXT NOT NULL,
+      lastSignedIn TEXT NOT NULL
+    )
+  `);
+  const userColumns = (
+    _sqliteDb.prepare("PRAGMA table_info(users)").all() as Array<{
+      name: string;
+    }>
+  ).map(column => column.name);
+  for (const [column, type] of [
+    ["xhsUserId", "TEXT"],
+    ["xhsNickname", "TEXT"],
+    ["avatar", "TEXT"],
+  ] as const) {
+    if (!userColumns.includes(column)) {
+      _sqliteDb.exec(`ALTER TABLE users ADD COLUMN ${column} ${type}`);
+    }
+  }
   _sqliteDb.exec(`
     CREATE TABLE IF NOT EXISTS projects (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -376,7 +434,64 @@ function getSqliteDb() {
       updatedAt TEXT NOT NULL
     )
   `);
+  ensureSqliteXhsUserIdUniqueness(_sqliteDb);
   return _sqliteDb;
+}
+
+function ensureSqliteXhsUserIdUniqueness(sqlite: DatabaseSync) {
+  sqlite
+    .prepare(
+      "UPDATE users SET xhsUserId = NULL WHERE xhsUserId LIKE 'xhs-client-%'"
+    )
+    .run();
+
+  const duplicateGroups = sqlite
+    .prepare(
+      `SELECT xhsUserId, MIN(id) AS targetId
+       FROM users
+       WHERE xhsUserId IS NOT NULL
+       GROUP BY xhsUserId
+       HAVING COUNT(*) > 1`
+    )
+    .all() as Array<{ xhsUserId: string; targetId: number }>;
+
+  for (const group of duplicateGroups) {
+    const duplicateUsers = sqlite
+      .prepare("SELECT id FROM users WHERE xhsUserId = ? AND id <> ?")
+      .all(group.xhsUserId, group.targetId) as Array<{ id: number }>;
+    for (const duplicate of duplicateUsers) {
+      for (const table of USER_SCOPED_TABLES) {
+        sqlite
+          .prepare(`UPDATE ${table} SET userId = ? WHERE userId = ?`)
+          .run(group.targetId, duplicate.id);
+      }
+      sqlite
+        .prepare("UPDATE users SET xhsUserId = NULL WHERE id = ?")
+        .run(duplicate.id);
+    }
+  }
+
+  sqlite.exec(
+    "CREATE UNIQUE INDEX IF NOT EXISTS users_xhsUserId_unique ON users(xhsUserId) WHERE xhsUserId IS NOT NULL"
+  );
+}
+
+function mapSqliteUser(row: SqliteUserRow | undefined | null) {
+  if (!row) return undefined;
+  return {
+    id: Number(row.id),
+    openId: row.openId,
+    xhsUserId: row.xhsUserId,
+    xhsNickname: row.xhsNickname,
+    name: row.name,
+    avatar: row.avatar,
+    email: row.email,
+    loginMethod: row.loginMethod,
+    role: row.role,
+    createdAt: new Date(row.createdAt),
+    updatedAt: new Date(row.updatedAt),
+    lastSignedIn: new Date(row.lastSignedIn),
+  };
 }
 
 function mapSqliteProject(row: SqliteProjectRow | undefined | null) {
@@ -477,7 +592,56 @@ export async function upsertUser(user: InsertUser): Promise<void> {
   if (!user.openId) throw new Error("User openId is required for upsert");
   const db = await getDb();
   if (!db) {
-    console.warn("[Database] Cannot upsert user: database not available");
+    const sqlite = getSqliteDb();
+    const now = new Date().toISOString();
+    const existing = sqlite
+      .prepare("SELECT * FROM users WHERE openId = ? LIMIT 1")
+      .get(user.openId) as SqliteUserRow | undefined;
+    const role =
+      user.role ?? (user.openId === ENV.ownerOpenId ? "admin" : "user");
+    if (existing) {
+      sqlite
+        .prepare(
+          `UPDATE users
+           SET xhsUserId = ?, xhsNickname = ?, name = ?, avatar = ?, email = ?, loginMethod = ?, role = ?, updatedAt = ?, lastSignedIn = ?
+          WHERE openId = ?`
+        )
+        .run(
+          user.xhsUserId !== undefined ? user.xhsUserId : existing.xhsUserId,
+          user.xhsNickname !== undefined
+            ? user.xhsNickname
+            : existing.xhsNickname,
+          user.name !== undefined ? user.name : existing.name,
+          user.avatar !== undefined ? user.avatar : existing.avatar,
+          user.email !== undefined ? user.email : existing.email,
+          user.loginMethod !== undefined
+            ? user.loginMethod
+            : existing.loginMethod,
+          role,
+          now,
+          (user.lastSignedIn ?? new Date()).toISOString(),
+          user.openId
+        );
+      return;
+    }
+    sqlite
+      .prepare(
+        `INSERT INTO users (openId, xhsUserId, xhsNickname, name, avatar, email, loginMethod, role, createdAt, updatedAt, lastSignedIn)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        user.openId,
+        user.xhsUserId ?? null,
+        user.xhsNickname ?? null,
+        user.name ?? null,
+        user.avatar ?? null,
+        user.email ?? null,
+        user.loginMethod ?? null,
+        role,
+        now,
+        now,
+        (user.lastSignedIn ?? new Date()).toISOString()
+      );
     return;
   }
   try {
@@ -526,13 +690,80 @@ export async function upsertUser(user: InsertUser): Promise<void> {
 
 export async function getUserByOpenId(openId: string) {
   const db = await getDb();
-  if (!db) return undefined;
+  if (!db) {
+    const sqlite = getSqliteDb();
+    const row = sqlite
+      .prepare("SELECT * FROM users WHERE openId = ? LIMIT 1")
+      .get(openId) as SqliteUserRow | undefined;
+    return mapSqliteUser(row);
+  }
   const result = await db
     .select()
     .from(users)
     .where(eq(users.openId, openId))
     .limit(1);
   return result.length > 0 ? result[0] : undefined;
+}
+
+export async function getUserByXhsUserId(xhsUserId: string) {
+  const db = await getDb();
+  if (!db) {
+    const sqlite = getSqliteDb();
+    const row = sqlite
+      .prepare("SELECT * FROM users WHERE xhsUserId = ? LIMIT 1")
+      .get(xhsUserId) as SqliteUserRow | undefined;
+    return mapSqliteUser(row);
+  }
+  const result = await db
+    .select()
+    .from(users)
+    .where(eq(users.xhsUserId, xhsUserId))
+    .limit(1);
+  return result.length > 0 ? result[0] : undefined;
+}
+
+// 将 fromUserId 的所有数据迁移到 toUserId，用于多浏览器同一 redId 的账号合并
+export async function migrateUserData(
+  fromUserId: number,
+  toUserId: number
+): Promise<void> {
+  if (fromUserId === toUserId) return;
+  const db = await getDb();
+  if (!db) {
+    const sqlite = getSqliteDb();
+    for (const table of USER_SCOPED_TABLES) {
+      sqlite
+        .prepare(`UPDATE ${table} SET userId = ? WHERE userId = ?`)
+        .run(toUserId, fromUserId);
+    }
+    // 清空 fromUserId 用户的 xhsUserId，避免重复匹配
+    sqlite
+      .prepare("UPDATE users SET xhsUserId = NULL WHERE id = ?")
+      .run(fromUserId);
+    return;
+  }
+  const drizzleTables = [
+    projects,
+    positionings,
+    topicHubItems,
+    topics,
+    topicPlans,
+    scripts,
+    materials,
+    platformAdaptations,
+    materialPublications,
+    xhsAccounts,
+  ] as const;
+  for (const table of drizzleTables) {
+    await db
+      .update(table)
+      .set({ userId: toUserId } as Record<string, unknown>)
+      .where(eq((table as { userId: unknown }).userId as never, fromUserId));
+  }
+  await db
+    .update(users)
+    .set({ xhsUserId: null })
+    .where(eq(users.id, fromUserId));
 }
 
 // ─── XHS Accounts ─────────────────────────────────────────────────────────────

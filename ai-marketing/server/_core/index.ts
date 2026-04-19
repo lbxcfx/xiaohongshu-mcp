@@ -3,12 +3,19 @@ import express from "express";
 import { createServer } from "http";
 import net from "net";
 import path from "node:path";
-import { mkdirSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync } from "node:fs";
 import multer from "multer";
 import { createExpressMiddleware } from "@trpc/server/adapters/express";
 import { appRouter, ensureTopicHubVideoPipelineStarted } from "../routers";
-import { createContext, hashClientId } from "./context";
-import { getUserByOpenId, upsertUser, upsertXhsAccount } from "../db";
+import { createContext, hashClientId, isRealXhsUserId } from "./context";
+import {
+  getUserByOpenId,
+  getUserByXhsUserId,
+  getXhsAccounts,
+  migrateUserData,
+  upsertUser,
+  upsertXhsAccount,
+} from "../db";
 import { serveStatic, setupVite } from "./vite";
 import {
   deleteXhsCookies,
@@ -34,62 +41,295 @@ function accountRuntimePaths(accountKey: string) {
   };
 }
 
-async function getDefaultAccountKey(req: express.Request) {
+type DefaultAccount = {
+  userId: number;
+  openId: string;
+  accountKey: string;
+  redId?: string;
+};
+
+const loginIdentitySyncing = new Set<string>();
+const loginIdentitySyncedAt = new Map<string, number>();
+const PROFILE_SYNC_TIMEOUT_MS = 30_000;
+// clientId → redId，登录成功后写入，供 status 端点读取并返回给前端
+const redIdByClientId = new Map<string, string>();
+
+// 根据 redId 生成稳定的 accountKey（redId 全局唯一且不可重复）
+function redIdAccountKey(redId: string) {
+  return `xhs-${redId}`;
+}
+
+function runtimeRoot() {
+  return path.basename(process.cwd()) === "ai-marketing"
+    ? path.dirname(process.cwd())
+    : process.cwd();
+}
+
+function resolveRuntimePath(relativePath: string) {
+  return path.resolve(runtimeRoot(), relativePath);
+}
+
+function isDefaultXhsUsername(value?: string | null) {
+  const text = value?.trim();
+  return !text || text === "小红书用户";
+}
+
+async function findKnownNickname(userId: number, redId?: string | null) {
+  const accounts = await getXhsAccounts(userId);
+  return (
+    accounts.find(
+      account =>
+        account.xhsUserId === redId && !isDefaultXhsUsername(account.nickname)
+    )?.nickname ??
+    accounts.find(account => !isDefaultXhsUsername(account.nickname))
+      ?.nickname ??
+    null
+  );
+}
+
+async function withLocalXhsNickname(
+  account: DefaultAccount | null,
+  status: XhsLoginStatus
+) {
+  if (!account || !status.is_logged_in || !isDefaultXhsUsername(status.username)) {
+    return status;
+  }
+  const nickname = await findKnownNickname(account.userId, account.redId);
+  return nickname ? { ...status, username: nickname } : status;
+}
+
+function copyAccountRuntimeFiles(
+  fromAccountKey: string,
+  toAccountKey: string,
+  options: { overwrite?: boolean } = {}
+) {
+  const sourcePaths = accountRuntimePaths(fromAccountKey);
+  const targetPaths = accountRuntimePaths(toAccountKey);
+
+  try {
+    const sourceCookiesPath = resolveRuntimePath(sourcePaths.cookiesPath);
+    const targetCookiesPath = resolveRuntimePath(targetPaths.cookiesPath);
+    const sourceLoginStatePath = resolveRuntimePath(sourcePaths.loginStatePath);
+    const targetLoginStatePath = resolveRuntimePath(targetPaths.loginStatePath);
+
+    mkdirSync(path.dirname(targetCookiesPath), { recursive: true });
+    if (
+      existsSync(sourceCookiesPath) &&
+      (options.overwrite || !existsSync(targetCookiesPath))
+    ) {
+      copyFileSync(sourceCookiesPath, targetCookiesPath);
+    }
+    if (
+      existsSync(sourceLoginStatePath) &&
+      (options.overwrite || !existsSync(targetLoginStatePath))
+    ) {
+      mkdirSync(path.dirname(targetLoginStatePath), { recursive: true });
+      copyFileSync(sourceLoginStatePath, targetLoginStatePath);
+    }
+  } catch (copyError) {
+    console.warn("[XHS] copy account runtime files failed", copyError);
+  }
+}
+
+async function getDefaultAccountKey(
+  req: express.Request
+): Promise<DefaultAccount | null> {
   const clientId = headerValue(req.headers["x-xhs-client-id"]);
   if (!clientId || typeof clientId !== "string") return null;
 
-  let userId = hashClientId(clientId);
-  await upsertUser({
-    openId: clientId,
-    xhsUserId: clientId,
-    xhsNickname: "小红书用户",
-    name: "小红书用户",
-    loginMethod: "xhs",
-    lastSignedIn: new Date(),
-  });
-  const user = await getUserByOpenId(clientId);
-  userId = user?.id ?? userId;
+  const redIdHeader = headerValue(req.headers["x-xhs-red-id"]);
+  const redId =
+    typeof redIdHeader === "string" && isRealXhsUserId(redIdHeader)
+      ? redIdHeader
+      : isRealXhsUserId(clientId)
+        ? clientId
+        : null;
+
+  const existingByOpenId = await getUserByOpenId(clientId);
+  const existingByXhsUserId = redId ? await getUserByXhsUserId(redId) : null;
+  let user = existingByXhsUserId ?? existingByOpenId;
+  if (!user) {
+    await upsertUser({
+      openId: clientId,
+      xhsUserId: null,
+      xhsNickname: "小红书用户",
+      name: "小红书用户",
+      loginMethod: "xhs",
+      lastSignedIn: new Date(),
+    });
+    user = await getUserByOpenId(clientId);
+  }
+
+  const userId = user?.id ?? hashClientId(clientId);
+  const openId = user?.openId ?? clientId;
+
+  // 如果已经获得真实的 redId，直接使用 redId-based accountKey
+  const realRedId =
+    user && isRealXhsUserId(user.xhsUserId) ? user.xhsUserId : null;
+  if (realRedId) {
+    const accountKey = redIdAccountKey(realRedId);
+    const nickname = await findKnownNickname(userId, realRedId);
+    copyAccountRuntimeFiles(`u${userId}-default`, accountKey);
+    await upsertXhsAccount(userId, {
+      accountKey,
+      xhsUserId: realRedId,
+      nickname,
+      status: "logged_in",
+      ...accountRuntimePaths(accountKey),
+    });
+    return { userId, openId, accountKey, redId: realRedId };
+  }
+
+  // 尚未登录，使用临时 default accountKey
   const accountKey = `u${userId}-default`;
   await upsertXhsAccount(userId, {
     accountKey,
     status: "unknown",
     ...accountRuntimePaths(accountKey),
   });
-  return { userId, openId: clientId, accountKey };
+  return { userId, openId, accountKey };
 }
 
-async function syncLoginIdentity(req: express.Request, status: XhsLoginStatus) {
-  if (!status.is_logged_in) return;
+async function syncLoginIdentity(
+  account: DefaultAccount | null,
+  status: XhsLoginStatus
+) {
+  if (!account || !status.is_logged_in) return;
+  if (loginIdentitySyncing.has(account.accountKey)) return;
+  const lastSyncedAt = loginIdentitySyncedAt.get(account.accountKey) ?? 0;
+  if (Date.now() - lastSyncedAt < 5 * 60 * 1000) return;
 
-  const account = await getDefaultAccountKey(req);
-  if (!account) return;
+  loginIdentitySyncing.add(account.accountKey);
+  loginIdentitySyncedAt.set(account.accountKey, Date.now());
 
   let nickname = status.username || "小红书用户";
-  let xhsUserId = account.openId;
+  let xhsUserId: string | null = status.redId ?? account.redId ?? null;
 
   try {
-    const profile = await getXhsMyProfile(account.accountKey);
-    nickname = profile.userBasicInfo?.nickname || nickname;
-    xhsUserId = profile.userBasicInfo?.redId || xhsUserId;
+    const needsProfile =
+      !isRealXhsUserId(xhsUserId) || isDefaultXhsUsername(nickname);
+    if (needsProfile) {
+      // 带超时的 profile 拉取，避免阻塞 status 端点过长
+      const profilePromise = getXhsMyProfile(account.accountKey);
+      const profile = await Promise.race([
+        profilePromise,
+        new Promise<never>((_, reject) =>
+          setTimeout(
+            () => reject(new Error("getXhsMyProfile timeout")),
+            PROFILE_SYNC_TIMEOUT_MS
+          )
+        ),
+      ]);
+      nickname = profile.userBasicInfo?.nickname || nickname;
+      xhsUserId = profile.userBasicInfo?.redId || xhsUserId;
+    }
   } catch (error) {
     console.warn("[XHS] sync profile failed", error);
-  }
+  } finally {
+    let targetUserId = account.userId;
+    let targetOpenId = account.openId;
+    const realRedId = isRealXhsUserId(xhsUserId) ? xhsUserId : null;
+    if (realRedId) {
+      try {
+        const existingUser = await getUserByXhsUserId(realRedId);
+        if (existingUser && existingUser.id !== account.userId) {
+          await migrateUserData(account.userId, existingUser.id);
+          targetUserId = existingUser.id;
+          targetOpenId = existingUser.openId;
+          console.info(
+            `[XHS] merged userId=${account.userId} into userId=${existingUser.id} for redId=${realRedId}`
+          );
+        } else if (existingUser) {
+          targetUserId = existingUser.id;
+          targetOpenId = existingUser.openId;
+        }
+      } catch (mergeError) {
+        console.warn("[XHS] account merge failed", mergeError);
+      }
+    }
 
-  await upsertUser({
-    openId: account.openId,
-    xhsUserId,
-    xhsNickname: nickname,
-    name: nickname,
-    loginMethod: "xhs",
-    lastSignedIn: new Date(),
-  });
-  await upsertXhsAccount(account.userId, {
-    accountKey: account.accountKey,
-    xhsUserId,
-    nickname,
-    status: "logged_in",
-    ...accountRuntimePaths(account.accountKey),
-  });
+    if (isDefaultXhsUsername(nickname)) {
+      nickname = (await findKnownNickname(targetUserId, realRedId)) ?? nickname;
+    }
+
+    // 更新用户记录，写入真实 redId
+    await upsertUser({
+      openId: targetOpenId,
+      xhsUserId,
+      xhsNickname: nickname,
+      name: nickname,
+      loginMethod: "xhs",
+      lastSignedIn: new Date(),
+    });
+
+    // 更新临时 accountKey 记录
+    await upsertXhsAccount(targetUserId, {
+      accountKey: account.accountKey,
+      xhsUserId,
+      nickname,
+      status: "logged_in",
+      ...accountRuntimePaths(account.accountKey),
+    });
+
+    if (realRedId) {
+      try {
+        // 查找是否已有其他用户绑定了这个 redId（多浏览器同一账号场景）
+        const existingUser = await getUserByXhsUserId(realRedId);
+        if (existingUser && existingUser.id !== targetUserId) {
+          // 合并：把当前浏览器新建的数据迁移到历史用户
+          await migrateUserData(account.userId, existingUser.id);
+          console.info(
+            `[XHS] merged userId=${account.userId} into userId=${existingUser.id} for redId=${realRedId}`
+          );
+        }
+      } catch (mergeError) {
+        console.warn("[XHS] account merge failed", mergeError);
+      }
+
+      // 建立 redId-based 的 accountKey，复制 cookies
+      const redIdKey = redIdAccountKey(realRedId);
+      const redIdPaths = accountRuntimePaths(redIdKey);
+      try {
+        const targetCookiesPath = resolveRuntimePath(redIdPaths.cookiesPath);
+        const targetLoginStatePath = resolveRuntimePath(
+          redIdPaths.loginStatePath
+        );
+        mkdirSync(path.dirname(targetCookiesPath), { recursive: true });
+        const srcCookies = resolveRuntimePath(
+          accountRuntimePaths(account.accountKey).cookiesPath
+        );
+        if (existsSync(srcCookies)) {
+          copyFileSync(srcCookies, targetCookiesPath);
+        }
+        const srcLoginState = accountRuntimePaths(
+          account.accountKey
+        ).loginStatePath;
+        const sourceLoginState = resolveRuntimePath(srcLoginState);
+        if (existsSync(sourceLoginState)) {
+          mkdirSync(path.dirname(targetLoginStatePath), { recursive: true });
+          copyFileSync(sourceLoginState, targetLoginStatePath);
+        }
+      } catch (copyError) {
+        console.warn("[XHS] copy cookies to redId dir failed", copyError);
+      }
+
+      const targetUser =
+        (await getUserByXhsUserId(realRedId)) ??
+        (await getUserByOpenId(account.openId));
+      await upsertXhsAccount(targetUser?.id ?? targetUserId, {
+        accountKey: redIdKey,
+        xhsUserId: realRedId,
+        nickname,
+        status: "logged_in",
+        ...redIdPaths,
+      });
+
+      // 记录 redId，供 status 端点返回给前端
+      redIdByClientId.set(account.openId, realRedId);
+    }
+
+    loginIdentitySyncing.delete(account.accountKey);
+  }
 }
 
 function isPortAvailable(port: number): Promise<boolean> {
@@ -178,8 +418,12 @@ async function startServer() {
     try {
       const account = await getDefaultAccountKey(req);
       const data = await getXhsLoginStatus(account?.accountKey);
-      await syncLoginIdentity(req, data);
-      res.json({ success: true, data });
+      const status = await withLocalXhsNickname(account, data);
+      void syncLoginIdentity(account, status);
+      const redId = account
+        ? (status.redId ?? account.redId ?? redIdByClientId.get(account.openId))
+        : undefined;
+      res.json({ success: true, data: { ...status, redId } });
     } catch (error) {
       res.status(502).json({
         success: false,
@@ -203,8 +447,10 @@ async function startServer() {
     try {
       const account = await getDefaultAccountKey(req);
       const data = await startXhsLoginSession(account?.accountKey);
-      await syncLoginIdentity(req, data);
-      res.json({ success: true, data });
+      const status = await withLocalXhsNickname(account, data);
+      void syncLoginIdentity(account, status);
+      const redId = account ? (status.redId ?? account.redId) : undefined;
+      res.json({ success: true, data: { ...status, redId } });
     } catch (error) {
       res.status(502).json({
         success: false,

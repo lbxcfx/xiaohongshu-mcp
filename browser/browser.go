@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/go-rod/rod"
 	"github.com/go-rod/rod/lib/launcher"
@@ -262,18 +263,32 @@ func CleanupStaleBrowserProfile() error {
 
 func CleanupStaleBrowserProfilePath(userDataDir string) error {
 	logrus.Infof("cleanup stale browser profile: %s", userDataDir)
+	cleanDir := filepath.Clean(userDataDir)
+	absDir, err := filepath.Abs(cleanDir)
+	if err != nil {
+		absDir = cleanDir
+	}
 
 	if runtime.GOOS == "linux" {
-		cmd := exec.Command("pkill", "-f", "--", "--user-data-dir="+userDataDir)
+		cmd := exec.Command("pkill", "-f", "--", "--user-data-dir="+cleanDir)
 		if output, err := cmd.CombinedOutput(); err != nil {
 			// pkill 未匹配到进程时会返回 1，这里不视为错误。
 			if exitErr, ok := err.(*exec.ExitError); !ok || exitErr.ExitCode() != 1 {
 				logrus.Warnf("failed to kill stale browser profile process: %v, output: %s", err, strings.TrimSpace(string(output)))
 			}
 		}
+		if absDir != cleanDir {
+			cmd := exec.Command("pkill", "-f", "--", "--user-data-dir="+absDir)
+			if output, err := cmd.CombinedOutput(); err != nil {
+				if exitErr, ok := err.(*exec.ExitError); !ok || exitErr.ExitCode() != 1 {
+					logrus.Warnf("failed to kill stale browser profile process: %v, output: %s", err, strings.TrimSpace(string(output)))
+				}
+			}
+		}
+		time.Sleep(300 * time.Millisecond)
 	}
 
-	if err := ClearUserDataDir(); err != nil {
+	if err := ClearUserDataDirPath(cleanDir); err != nil {
 		logrus.Errorf("clear browser profile failed: %v", err)
 		return err
 	}

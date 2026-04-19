@@ -11,24 +11,18 @@ export function hashClientId(value: string) {
   return Math.max(2, hash % 2_000_000_000);
 }
 
-function userFromClientHeader(header: unknown): User | null {
-  const clientId = Array.isArray(header) ? header[0] : header;
-  if (!clientId || typeof clientId !== "string") return null;
-  const now = new Date();
-  return {
-    id: hashClientId(clientId),
-    openId: clientId,
-    xhsUserId: clientId,
-    xhsNickname: "小红书用户",
-    name: "小红书用户",
-    avatar: null,
-    email: null,
-    loginMethod: "xhs",
-    role: "user",
-    createdAt: now,
-    updatedAt: now,
-    lastSignedIn: now,
-  };
+function headerValue(header: unknown) {
+  return Array.isArray(header) ? header[0] : header;
+}
+
+export function isRealXhsUserId(value?: string | null): value is string {
+  return Boolean(value && !value.startsWith("xhs-client-"));
+}
+
+export function isRedIdBoundUser(
+  user?: User | null
+): user is User & { xhsUserId: string } {
+  return Boolean(user && isRealXhsUserId(user.xhsUserId));
 }
 
 export type TrpcContext = {
@@ -44,20 +38,15 @@ export async function createContext(
 
   try {
     user = await sdk.authenticateRequest(opts.req);
+    if (!isRedIdBoundUser(user)) {
+      user = null;
+    }
   } catch (error) {
-    // Authentication is optional for public procedures.
-    user = userFromClientHeader(opts.req.headers["x-xhs-client-id"]);
-    if (user) {
-      await db.upsertUser({
-        openId: user.openId,
-        xhsUserId: user.xhsUserId,
-        xhsNickname: user.xhsNickname,
-        name: user.name,
-        avatar: user.avatar,
-        loginMethod: "xhs",
-        lastSignedIn: new Date(),
-      });
-      user = (await db.getUserByOpenId(user.openId)) ?? user;
+    const redId =
+      headerValue(opts.req.headers["x-xhs-red-id"]) ??
+      headerValue(opts.req.headers["x-xhs-client-id"]);
+    if (typeof redId === "string" && isRealXhsUserId(redId)) {
+      user = (await db.getUserByXhsUserId(redId)) ?? null;
     }
   }
 

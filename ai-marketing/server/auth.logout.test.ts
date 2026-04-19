@@ -46,8 +46,8 @@ function createAuthContext(): {
   const user: AuthenticatedUser = {
     id: 1,
     openId: "sample-user",
-    xhsUserId: null,
-    xhsNickname: null,
+    xhsUserId: "sample-red-id",
+    xhsNickname: "Sample User",
     email: "sample@example.com",
     name: "Sample User",
     avatar: null,

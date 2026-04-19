@@ -416,6 +416,12 @@ func (a *LoginAction) DetectLoginState(ctx context.Context) (LoginState, string)
 	return LoginStateWaitingVerification, ""
 }
 
+func containsLoginSuccessText(text string) bool {
+	return strings.Contains(text, "\u767b\u5f55\u6210\u529f") ||
+		strings.Contains(text, "\u626b\u7801\u6210\u529f") ||
+		strings.Contains(text, "\u5373\u5c06\u8df3\u8f6c")
+}
+
 func (a *LoginAction) VerifySearchAccess(ctx context.Context, keyword string) (bool, string, error) {
 	pp := a.page.Context(ctx)
 	if err := pp.Navigate(makeSearchURL(keyword)); err != nil {
@@ -691,6 +697,12 @@ func (a *LoginAction) InspectLoginFlow(ctx context.Context) (*LoginFlowState, er
 		return flow, nil
 	}
 
+	if hasAuth && containsLoginSuccessText(text) {
+		flow.Requirement = LoginRequirementManual
+		flow.Detail = "auth cookies detected, waiting mobile confirmation"
+		return flow, nil
+	}
+
 	if hasAuth && !containsLoginPrompt(text) {
 		flow.Requirement = LoginRequirementManual
 		flow.Detail = "auth cookies detected, waiting modal close"
@@ -722,12 +734,8 @@ func (a *LoginAction) ConfirmLoggedIn(ctx context.Context) (bool, string, error)
 		return false, snippet(text, marker, 180), nil
 	}
 
-	if snapshot.URL != "" && !strings.Contains(snapshot.URL, "/login") && !containsLoginPrompt(text) {
-		return true, "left login page with auth cookies", nil
-	}
-
-	if snapshot.QRState != "visible" && !containsLoginPrompt(text) {
-		return true, "login prompt cleared with auth cookies", nil
+	if containsLoginSuccessText(text) {
+		return false, "auth cookies detected, waiting mobile confirmation", nil
 	}
 
 	return false, "auth cookies detected, waiting mobile confirmation", nil

@@ -18,6 +18,7 @@ export type XhsLoginStatus = {
   is_logged_in: boolean;
   needs_secondary_verification?: boolean;
   username?: string;
+  redId?: string;
   detail?: string;
   requirement?: "none" | "qrcode" | "phone_code" | "manual";
   qrcode_image?: string;

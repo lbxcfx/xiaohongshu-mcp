@@ -1,4 +1,5 @@
 import { getLoginUrl } from "@/const";
+import { clearXhsRedId } from "@/lib/xhsClientId";
 import { trpc } from "@/lib/trpc";
 import { TRPCClientError } from "@trpc/client";
 import { useCallback, useEffect, useMemo } from "react";
@@ -36,6 +37,7 @@ export function useAuth(options?: UseAuthOptions) {
       }
       throw error;
     } finally {
+      clearXhsRedId();
       utils.auth.me.setData(undefined, undefined);
       await utils.auth.me.invalidate();
     }

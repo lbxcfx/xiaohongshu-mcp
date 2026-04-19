@@ -12,7 +12,7 @@ import {
 export const users = mysqlTable("users", {
   id: int("id").autoincrement().primaryKey(),
   openId: varchar("openId", { length: 64 }).notNull().unique(),
-  xhsUserId: varchar("xhsUserId", { length: 128 }),
+  xhsUserId: varchar("xhsUserId", { length: 128 }).unique(),
   xhsNickname: varchar("xhsNickname", { length: 255 }),
   name: text("name"),
   avatar: text("avatar"),

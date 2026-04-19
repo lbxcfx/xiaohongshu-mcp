@@ -18,6 +18,7 @@ type Cookier interface {
 type LoginState struct {
 	Status    string    `json:"status"`
 	Username  string    `json:"username,omitempty"`
+	RedID     string    `json:"redId,omitempty"`
 	Detail    string    `json:"detail,omitempty"`
 	UpdatedAt time.Time `json:"updated_at"`
 }

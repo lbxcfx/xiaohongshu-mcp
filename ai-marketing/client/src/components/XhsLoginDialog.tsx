@@ -9,7 +9,7 @@ import {
 } from "@/components/ui/dialog";
 import { Loader2, RefreshCw, ShieldCheck, Smartphone } from "lucide-react";
 import { trpc } from "@/lib/trpc";
-import { withXhsClientHeader } from "@/lib/xhsClientId";
+import { setXhsRedId, withXhsClientHeader } from "@/lib/xhsClientId";
 
 type XhsLoginDialogProps = {
   open: boolean;
@@ -29,6 +29,7 @@ type LoginStatusResponse = {
   username?: string;
   detail?: string;
   session_timeout?: string;
+  redId?: string;
 };
 
 function resolveStatus(status: LoginStatusResponse | null): LoginStatus {
@@ -65,6 +66,9 @@ function getInstruction(
 ) {
   if (fallbackError) return fallbackError;
   if (!status) return "正在打开小红书官网登录页...";
+  if (status.status === "logged_in" && !status.redId) {
+    return "登录已确认，正在同步小红书账号信息...";
+  }
   if (status.status === "logged_in")
     return `已登录，${status.username || "小红书用户"}`;
   if (status.status === "secondary_required") {
@@ -80,9 +84,11 @@ export function XhsLoginDialog({
 }: XhsLoginDialogProps) {
   const utils = trpc.useUtils();
   const pollingRef = useRef<number | null>(null);
+  const statusInFlightRef = useRef(false);
   const successHandledRef = useRef(false);
   const onOpenChangeRef = useRef(onOpenChange);
   const onSuccessRef = useRef(onSuccess);
+  const utilsRef = useRef(utils);
 
   const [refreshSeed, setRefreshSeed] = useState(0);
   const [status, setStatus] = useState<LoginStatusResponse | null>(null);
@@ -93,6 +99,10 @@ export function XhsLoginDialog({
     onOpenChangeRef.current = onOpenChange;
     onSuccessRef.current = onSuccess;
   }, [onOpenChange, onSuccess]);
+
+  useEffect(() => {
+    utilsRef.current = utils;
+  }, [utils]);
 
   useEffect(() => {
     return () => {
@@ -132,27 +142,45 @@ export function XhsLoginDialog({
       stopPolling();
       onOpenChangeRef.current(false);
       onSuccessRef.current?.();
+      const currentUtils = utilsRef.current;
 
       void Promise.allSettled([
-        utils.auth.me.invalidate(),
-        utils.auth.status.invalidate(),
+        currentUtils.auth.me.invalidate(),
+        currentUtils.auth.status.invalidate(),
       ]).then(results => {
         const rejected = results.find(result => result.status === "rejected");
         if (rejected && rejected.status === "rejected") {
           console.warn("[XHS] refresh login cache failed", rejected.reason);
         }
       });
+
+      [8000, 22000, 35000].forEach(delay => {
+        window.setTimeout(() => {
+          const delayedUtils = utilsRef.current;
+          void Promise.allSettled([
+            delayedUtils.auth.me.invalidate(),
+            delayedUtils.auth.status.invalidate(),
+          ]);
+        }, delay);
+      });
     };
 
     const syncStatus = async () => {
+      if (statusInFlightRef.current) return;
+      statusInFlightRef.current = true;
       const nextStatus = await fetchJson<LoginStatusResponse>(
         "/api/xhs/login/status"
-      );
-      if (disposed) return;
-      setStatus(nextStatus);
+      ).finally(() => {
+        statusInFlightRef.current = false;
+      });
+      if (!disposed) {
+        setStatus(nextStatus);
 
-      if (resolveStatus(nextStatus) === "logged_in") {
-        completeLogin();
+        if (resolveStatus(nextStatus) === "logged_in" && nextStatus.redId) {
+          // 用 redId 替换 localStorage 临时 UUID，实现跨浏览器身份恢复
+          setXhsRedId(nextStatus.redId);
+          completeLogin();
+        }
       }
     };
 
@@ -185,7 +213,9 @@ export function XhsLoginDialog({
         );
         if (disposed) return;
         setStatus(nextStatus);
-        if (resolveStatus(nextStatus) === "logged_in") {
+        if (resolveStatus(nextStatus) === "logged_in" && nextStatus.redId) {
+          // 用 redId 替换 localStorage 临时 UUID，实现跨浏览器身份恢复
+          setXhsRedId(nextStatus.redId);
           completeLogin();
           return;
         }
@@ -209,7 +239,7 @@ export function XhsLoginDialog({
       disposed = true;
       stopPolling();
     };
-  }, [open, refreshSeed, utils]);
+  }, [open, refreshSeed]);
 
   const handleRefresh = () => {
     if (pollingRef.current) {

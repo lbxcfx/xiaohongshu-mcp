@@ -93,6 +93,7 @@ type LoginStatusResponse struct {
 	IsLoggedIn                 bool   `json:"is_logged_in"`
 	NeedsSecondaryVerification bool   `json:"needs_secondary_verification,omitempty"`
 	Username                   string `json:"username,omitempty"`
+	RedID                      string `json:"redId,omitempty"`
 	Detail                     string `json:"detail,omitempty"`
 	Requirement                string `json:"requirement,omitempty"`
 	QRCodeImage                string `json:"qrcode_image,omitempty"`
@@ -178,9 +179,9 @@ func createPendingLoginSession(ctx context.Context) *pendingLoginSession {
 	page := b.NewPage()
 	return &pendingLoginSession{
 		accountID: account.ID,
-		browser: b,
-		page:    page,
-		action:  xiaohongshu.NewLogin(page),
+		browser:   b,
+		page:      page,
+		action:    xiaohongshu.NewLogin(page),
 	}
 }
 
@@ -247,6 +248,12 @@ func buildLoginStatusResponse(status, username, detail string) *LoginStatusRespo
 	return response
 }
 
+func buildLoginStatusResponseFromState(state *cookies.LoginState) *LoginStatusResponse {
+	response := buildLoginStatusResponse(state.Status, state.Username, state.Detail)
+	response.RedID = strings.TrimSpace(state.RedID)
+	return response
+}
+
 func buildLoginStatusResponseFromFlow(flow *xiaohongshu.LoginFlowState, username, timeout string) *LoginStatusResponse {
 	if flow == nil {
 		return buildLoginStatusResponse(string(xiaohongshu.LoginStateUnknown), username, "")
@@ -287,6 +294,67 @@ func hasSavedAuthCookies(data []byte) bool {
 	return false
 }
 
+type xhsPageIdentity struct {
+	Username string
+	RedID    string
+}
+
+func fetchIdentityFromPage(ctx context.Context, page *rod.Page) xhsPageIdentity {
+	if identity := extractIdentityFromInitialState(ctx, page); identity.Username != "" || identity.RedID != "" {
+		return identity
+	}
+
+	return xhsPageIdentity{Username: fetchUsernameFromPage(ctx, page)}
+}
+
+func extractIdentityFromInitialState(ctx context.Context, page *rod.Page) xhsPageIdentity {
+	result, err := page.Context(ctx).Eval(`() => {
+		const unwrap = (value) => {
+			if (!value || typeof value !== 'object') return value;
+			if (value.value !== undefined) return value.value;
+			if (value._value !== undefined) return value._value;
+			return value;
+		};
+		const state = window.__INITIAL_STATE__;
+		const user = state && state.user;
+		const userInfo = unwrap(user && user.userInfo) || {};
+		const userPageData = unwrap(user && user.userPageData) || {};
+		const basicInfo = userPageData.basicInfo || userPageData.userBasicInfo || {};
+		const profileMatch = String(location.href || '').match(/\/user\/profile\/([^/?#]+)/);
+		return JSON.stringify({
+			username: userInfo.nickname || userInfo.nickName || basicInfo.nickname || basicInfo.nickName || '',
+			redId: userInfo.redId || basicInfo.redId || '',
+			userId: userInfo.userId || userInfo.user_id || basicInfo.userId || basicInfo.user_id || (profileMatch ? profileMatch[1] : ''),
+		});
+	}`)
+	if err != nil {
+		logrus.Debugf("从页面状态读取账号信息失败: %v", err)
+		return xhsPageIdentity{}
+	}
+
+	var payload struct {
+		Username string `json:"username"`
+		RedID    string `json:"redId"`
+		UserID   string `json:"userId"`
+	}
+	if err := json.Unmarshal([]byte(result.Value.String()), &payload); err != nil {
+		logrus.Debugf("解析页面账号信息失败: %v", err)
+		return xhsPageIdentity{}
+	}
+
+	identity := xhsPageIdentity{
+		Username: strings.TrimSpace(payload.Username),
+		RedID:    strings.TrimSpace(payload.RedID),
+	}
+	if identity.RedID == "" {
+		identity.RedID = strings.TrimSpace(payload.UserID)
+	}
+	if identity.Username != "" || identity.RedID != "" {
+		logrus.Infof("从页面状态读取账号信息成功: username=%s redId=%s", identity.Username, identity.RedID)
+	}
+	return identity
+}
+
 func fetchUsernameFromPage(ctx context.Context, page *rod.Page) string {
 	defer func() {
 		if recovered := recover(); recovered != nil {
@@ -295,17 +363,47 @@ func fetchUsernameFromPage(ctx context.Context, page *rod.Page) string {
 	}()
 
 	action := xiaohongshu.NewUserProfileAction(page)
-	profile, err := action.GetMyProfileViaSidebar(ctx)
-	if err != nil {
-		logrus.Warnf("获取当前账号昵称失败: %v", err)
-		return ""
+
+	// 增加重试机制，获取用户昵称最多尝试3次
+	for attempt := 1; attempt <= 3; attempt++ {
+		profile, err := action.GetMyProfileViaSidebar(ctx)
+		if err == nil {
+			username := profile.UserBasicInfo.Nickname
+			if username == "" {
+				username = profile.UserBasicInfo.RedId
+			}
+			if username != "" {
+				logrus.Infof("第 %d 次尝试成功获取用户昵称: %s", attempt, username)
+				return username
+			}
+			logrus.Warnf("第 %d 次尝试获取用户昵称为空", attempt)
+		} else {
+			logrus.Warnf("第 %d 次尝试获取用户昵称失败: %v", attempt, err)
+		}
+
+		if attempt < 3 {
+			select {
+			case <-ctx.Done():
+				return ""
+			case <-time.After(500 * time.Millisecond):
+			}
+		}
 	}
 
-	username := profile.UserBasicInfo.Nickname
-	if username == "" {
-		username = profile.UserBasicInfo.RedId
+	return ""
+}
+
+func (s *XiaohongshuService) lookupCurrentIdentity(ctx context.Context) (identity xhsPageIdentity) {
+	lookupCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	defer cancel()
+
+	if err := s.withAuthenticatedPageForContext(lookupCtx, func(page *rod.Page) error {
+		identity = fetchIdentityFromPage(lookupCtx, page)
+		return nil
+	}); err != nil {
+		logrus.Debugf("读取当前账号信息失败: %v", err)
 	}
-	return username
+	return identity
 }
 
 func (s *XiaohongshuService) getCurrentUsername(ctx context.Context) string {
@@ -402,10 +500,13 @@ func endUsernameLookup() {
 
 // DeleteCookies 删除 cookies 文件，用于登录重置
 func (s *XiaohongshuService) DeleteCookies(ctx context.Context) error {
+	account := getAccountRuntime(ctx)
+	unlock := lockAccount(account.ID)
+	defer unlock()
+
 	s.clearPendingLogin(ctx)
 	s.clearActiveBrowser(ctx)
 
-	account := getAccountRuntime(ctx)
 	cookiePath := account.CookiesPath
 	cookieLoader := cookies.NewLoadCookie(cookiePath)
 	if err := cookieLoader.DeleteCookies(); err != nil {
@@ -420,28 +521,31 @@ func (s *XiaohongshuService) DeleteCookies(ctx context.Context) error {
 // CheckLoginStatus 检查登录状态
 func (s *XiaohongshuService) CheckLoginStatus(ctx context.Context) (*LoginStatusResponse, error) {
 	account := getAccountRuntime(ctx)
-	if state, err := cookies.LoadLoginStateFrom(account.LoginStatePath); err == nil {
-		switch state.Status {
-		case string(xiaohongshu.LoginStateSecondaryRequired):
-			return buildLoginStatusResponse(state.Status, state.Username, state.Detail), nil
-		case string(xiaohongshu.LoginStateLoggedIn):
-			if state.Username == "" || isPlaceholderUsername(state.Username) {
-				username := s.getCurrentUsernameWithFallback(ctx)
-				if username != "" {
-					state.Username = username
-					_ = cookies.SaveLoginStateTo(account.LoginStatePath, *state)
-				}
-			}
-			return buildLoginStatusResponse(state.Status, state.Username, state.Detail), nil
-		case string(xiaohongshu.LoginStateWaitingVerification):
-			if state.Detail != "" {
-				return buildLoginStatusResponse(state.Status, state.Username, state.Detail), nil
-			}
-		}
-	}
 
 	if response, handled, err := s.checkPendingLoginStatus(ctx); handled {
 		return response, err
+	}
+
+	if state, err := cookies.LoadLoginStateFrom(account.LoginStatePath); err == nil {
+		switch state.Status {
+		case string(xiaohongshu.LoginStateSecondaryRequired):
+			return buildLoginStatusResponseFromState(state), nil
+		case string(xiaohongshu.LoginStateLoggedIn):
+			if state.RedID == "" {
+				if identity := s.lookupCurrentIdentity(ctx); identity.Username != "" || identity.RedID != "" {
+					if identity.Username != "" {
+						state.Username = identity.Username
+					}
+					state.RedID = identity.RedID
+					_ = cookies.SaveLoginStateTo(account.LoginStatePath, *state)
+				}
+			}
+			return buildLoginStatusResponseFromState(state), nil
+		case string(xiaohongshu.LoginStateWaitingVerification):
+			if state.Detail != "" {
+				return buildLoginStatusResponseFromState(state), nil
+			}
+		}
 	}
 
 	return buildLoginStatusResponse(string(xiaohongshu.LoginStateUnknown), "", ""), nil
@@ -470,6 +574,10 @@ func (s *XiaohongshuService) CheckSearchAccess(ctx context.Context, keyword stri
 
 // GetLoginQrcode 获取登录的扫码二维码
 func (s *XiaohongshuService) GetLoginQrcode(ctx context.Context) (*LoginQrcodeResponse, error) {
+	account := getAccountRuntime(ctx)
+	unlock := lockAccount(account.ID)
+	defer unlock()
+
 	logrus.Info("开始获取登录二维码")
 	state := getLoginSessionState(ctx)
 	state.mu.Lock()
@@ -494,7 +602,6 @@ func (s *XiaohongshuService) GetLoginQrcode(ctx context.Context) (*LoginQrcodeRe
 
 	s.clearPendingLogin(ctx)
 	s.clearActiveBrowser(ctx)
-	account := getAccountRuntime(ctx)
 	if err := browser.CleanupStaleBrowserProfilePath(account.BrowserUserDataDir); err != nil {
 		logrus.Errorf("清理浏览器 profile 失败: %v", err)
 		return nil, err
@@ -560,13 +667,14 @@ func (s *XiaohongshuService) GetLoginQrcode(ctx context.Context) (*LoginQrcodeRe
 	if !loggedIn {
 		s.setPendingLogin(ctx, session)
 	} else {
-		username := fetchUsernameFromPage(ctx, session.page)
+		identity := fetchIdentityFromPage(ctx, session.page)
 		if err := saveCookies(ctx, session.page); err != nil {
 			return nil, err
 		}
 		_ = cookies.SaveLoginStateTo(account.LoginStatePath, cookies.LoginState{
 			Status:   string(xiaohongshu.LoginStateLoggedIn),
-			Username: username,
+			Username: identity.Username,
+			RedID:    identity.RedID,
 		})
 	}
 
@@ -595,9 +703,16 @@ func (s *XiaohongshuService) StartPhoneLogin(ctx context.Context) (*PhoneLoginSt
 }
 
 func (s *XiaohongshuService) StartLoginSession(ctx context.Context) (*LoginStatusResponse, error) {
+	account := getAccountRuntime(ctx)
+	unlock := lockAccount(account.ID)
+	defer unlock()
+
+	if response, handled, err := s.checkPendingLoginStatus(ctx); handled {
+		return response, err
+	}
+
 	s.clearPendingLogin(ctx)
 	s.clearActiveBrowser(ctx)
-	account := getAccountRuntime(ctx)
 	if err := browser.CleanupStaleBrowserProfilePath(account.BrowserUserDataDir); err != nil {
 		return nil, err
 	}
@@ -789,22 +904,26 @@ func (s *XiaohongshuService) checkPendingLoginStatus(ctx context.Context) (*Logi
 	detail := flow.Detail
 	logrus.Infof("pending login status: %s, requirement: %s, detail: %s", loginState, flow.Requirement, detail)
 
-	if loginState == xiaohongshu.LoginStateWaitingVerification && detail == "auth cookies detected, waiting modal close" {
+	if loginState == xiaohongshu.LoginStateWaitingVerification &&
+		(detail == "auth cookies detected, waiting modal close" ||
+			detail == "auth cookies detected, waiting mobile confirmation") {
 		session.mu.Lock()
 		if session.authSeenAt.IsZero() {
 			session.authSeenAt = time.Now()
 			session.qrCodeImg = ""
-			logrus.Info("pending login qrcode marked as consumed")
+			logrus.Info("pending login qrcode marked as consumed, waiting for mobile authorization")
 		}
 		authSeenAt := session.authSeenAt
 		session.mu.Unlock()
 
-		if time.Since(authSeenAt) >= 3*time.Second {
+		// 等待用户在手机上完成授权（增加到10秒，给用户足够时间看到授权界面并点击）
+		if time.Since(authSeenAt) >= 10*time.Second {
 			confirmed, confirmDetail, confirmErr := s.confirmPendingLogin(action)
 			if confirmErr != nil {
 				logrus.Warnf("confirm pending login failed: %v", confirmErr)
 			}
 			if confirmed {
+				logrus.Info("mobile authorization confirmed, login completed")
 				loginState = xiaohongshu.LoginStateLoggedIn
 				detail = confirmDetail
 			} else if confirmDetail != "" {
@@ -815,18 +934,23 @@ func (s *XiaohongshuService) checkPendingLoginStatus(ctx context.Context) (*Logi
 
 	switch loginState {
 	case xiaohongshu.LoginStateLoggedIn:
-		username := s.fetchUsernameFromPendingBrowser(session)
 		if err := saveCookies(ctx, page); err != nil {
 			return nil, true, err
 		}
+		// 获取真实昵称，8s 超时，失败不影响登录流程
+		usernameCtx, usernameCancel := context.WithTimeout(ctx, 8*time.Second)
+		identity := fetchIdentityFromPage(usernameCtx, page)
+		usernameCancel()
 		account := getAccountRuntime(ctx)
 		_ = cookies.SaveLoginStateTo(account.LoginStatePath, cookies.LoginState{
 			Status:   string(xiaohongshu.LoginStateLoggedIn),
-			Username: username,
+			Username: identity.Username,
+			RedID:    identity.RedID,
 		})
 		flow.State = xiaohongshu.LoginStateLoggedIn
 		flow.Requirement = xiaohongshu.LoginRequirementNone
-		response := buildLoginStatusResponseFromFlow(flow, username, timeout)
+		response := buildLoginStatusResponseFromFlow(flow, identity.Username, timeout)
+		response.RedID = identity.RedID
 		s.promotePendingLogin(ctx, session)
 		return response, true, nil
 	case xiaohongshu.LoginStateSecondaryRequired:
@@ -867,18 +991,13 @@ func (s *XiaohongshuService) recoverPendingLoginAfterPageLoss(ctx context.Contex
 		return buildLoginStatusResponse(string(xiaohongshu.LoginStateUnknown), "", "login page closed before auth cookies were ready"), nil
 	}
 
-	if err := saveCookies(ctx, session.page); err != nil {
-		return nil, err
-	}
-
-	username := s.fetchUsernameFromPendingBrowser(session)
 	account := getAccountRuntime(ctx)
 	_ = cookies.SaveLoginStateTo(account.LoginStatePath, cookies.LoginState{
-		Status:   string(xiaohongshu.LoginStateLoggedIn),
-		Username: username,
+		Status: string(xiaohongshu.LoginStateWaitingVerification),
+		Detail: "login page closed before PC login confirmation",
 	})
 
-	response := buildLoginStatusResponse(string(xiaohongshu.LoginStateLoggedIn), username, "login recovered after page redirect")
+	response := buildLoginStatusResponse(string(xiaohongshu.LoginStateWaitingVerification), "", "login page closed before PC login confirmation")
 	go s.clearPendingLogin(ctx)
 	return response, nil
 }
@@ -976,9 +1095,12 @@ func (s *XiaohongshuService) watchPendingLogin(ctx context.Context, session *pen
 					s.clearPendingLogin(ctx)
 					return
 				}
+				identity := fetchIdentityFromPage(ctx, page)
 				account := getAccountRuntime(ctx)
 				_ = cookies.SaveLoginStateTo(account.LoginStatePath, cookies.LoginState{
-					Status: string(xiaohongshu.LoginStateLoggedIn),
+					Status:   string(xiaohongshu.LoginStateLoggedIn),
+					Username: identity.Username,
+					RedID:    identity.RedID,
 				})
 				s.clearPendingLogin(ctx)
 				return
@@ -1202,21 +1324,35 @@ func (s *XiaohongshuService) ListFeeds(ctx context.Context) (*FeedsListResponse,
 }
 
 func (s *XiaohongshuService) SearchFeeds(ctx context.Context, keyword string, filters ...xiaohongshu.FilterOption) (*FeedsListResponse, error) {
+	account := getAccountRuntime(ctx)
+	logrus.Infof("search feeds start: account=%s keyword=%q filters=%+v", account.ID, keyword, filters)
+	state, err := cookies.LoadLoginStateFrom(account.LoginStatePath)
+	if err != nil || state.Status != string(xiaohongshu.LoginStateLoggedIn) {
+		_ = cookies.SaveLoginStateTo(account.LoginStatePath, cookies.LoginState{
+			Status: string(xiaohongshu.LoginStateUnknown),
+			Detail: xhsErrors.ErrSearchLoginRequired.Error(),
+		})
+		return nil, xhsErrors.ErrSearchLoginRequired
+	}
+
+	searchCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
+	defer cancel()
+
 	var feeds []xiaohongshu.Feed
-	err := s.withAuthenticatedPageForContext(ctx, func(page *rod.Page) error {
+	err = s.withSearchPage(searchCtx, func(page *rod.Page) (err error) {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				logrus.Warnf("搜索小红书内容时页面操作失败: %v", recovered)
+				err = fmt.Errorf("搜索小红书内容失败: %v", recovered)
+			}
+		}()
 		action := xiaohongshu.NewSearchAction(page)
 		var searchErr error
-		feeds, searchErr = action.Search(ctx, keyword, filters...)
+		feeds, searchErr = action.Search(searchCtx, keyword, filters...)
 		return searchErr
 	})
 	if err != nil {
-		if err == xhsErrors.ErrSearchLoginRequired {
-			account := getAccountRuntime(ctx)
-			_ = cookies.SaveLoginStateTo(account.LoginStatePath, cookies.LoginState{
-				Status: string(xiaohongshu.LoginStateUnknown),
-				Detail: err.Error(),
-			})
-		}
+		logrus.Warnf("search feeds failed: account=%s keyword=%q error=%v", account.ID, keyword, err)
 		return nil, err
 	}
 
@@ -1224,6 +1360,7 @@ func (s *XiaohongshuService) SearchFeeds(ctx context.Context, keyword string, fi
 		Feeds: feeds,
 		Count: len(feeds),
 	}
+	logrus.Infof("search feeds completed: account=%s keyword=%q count=%d", account.ID, keyword, response.Count)
 
 	return response, nil
 }
@@ -1434,6 +1571,24 @@ func saveCookies(ctx context.Context, page *rod.Page) error {
 	account := getAccountRuntime(ctx)
 	cookieLoader := cookies.NewLoadCookie(account.CookiesPath)
 	return cookieLoader.SaveCookies(data)
+}
+
+// withSearchPage 搜索专用：优先用活跃浏览器新建页面（非 headless），避免复用登录页面导致 WaitStable 超时。
+// 活跃浏览器不存在时降级为隔离 headless 浏览器。
+func (s *XiaohongshuService) withSearchPage(ctx context.Context, fn func(*rod.Page) error) error {
+	state := getLoginSessionState(ctx)
+	state.mu.Lock()
+	active := state.active
+	state.mu.Unlock()
+
+	if active != nil {
+		// 新建页面，不复用登录页面
+		page := active.NewPage()
+		defer page.Close()
+		return fn(page)
+	}
+
+	return withBrowserPage(ctx, fn)
 }
 
 // withBrowserPage 执行需要浏览器页面的操作的通用函数

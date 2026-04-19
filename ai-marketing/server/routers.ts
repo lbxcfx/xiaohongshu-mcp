@@ -1,4 +1,5 @@
-import { COOKIE_NAME } from "@shared/const";
+import { COOKIE_NAME, UNAUTHED_ERR_MSG } from "@shared/const";
+import { TRPCError } from "@trpc/server";
 import { getSessionCookieOptions } from "./_core/cookies";
 import { systemRouter } from "./_core/systemRouter";
 import { publicProcedure, router } from "./_core/trpc";
@@ -59,8 +60,9 @@ import { createPixelleTask, queryPixelleTask } from "./_core/pixelle";
 import { callDataApi } from "./_core/dataApi";
 import { generateImage } from "./_core/imageGeneration";
 import { downloadWithLux } from "./_core/lux";
+import { copyFileSync, existsSync, mkdirSync } from "node:fs";
 import { mkdir, unlink, writeFile } from "node:fs/promises";
-import { extname, join, resolve } from "node:path";
+import { dirname, extname, join, resolve } from "node:path";
 import {
   deleteXhsCookies,
   getXhsLoginQrcode,
@@ -73,13 +75,52 @@ import {
   type XhsSearchFilters,
 } from "./_core/xhsApi";
 import { getActiveUserId } from "./_core/userScope";
+import { isRealXhsUserId, isRedIdBoundUser } from "./_core/context";
 
-function currentUserId(ctx: { user: { id: number } | null }) {
-  return ctx.user?.id ?? getActiveUserId();
+function currentUserId(ctx: {
+  user: { id: number; xhsUserId?: string | null } | null;
+}) {
+  if (!ctx.user || !isRealXhsUserId(ctx.user.xhsUserId)) {
+    throw new TRPCError({ code: "UNAUTHORIZED", message: UNAUTHED_ERR_MSG });
+  }
+  return ctx.user.id;
+}
+
+function currentXhsRedId(ctx: { user: { xhsUserId?: string | null } | null }) {
+  if (!isRealXhsUserId(ctx.user?.xhsUserId)) {
+    throw new TRPCError({ code: "UNAUTHORIZED", message: UNAUTHED_ERR_MSG });
+  }
+  return ctx.user.xhsUserId;
+}
+
+function isDefaultXhsUsername(value?: string | null) {
+  const text = value?.trim();
+  return !text || text === "小红书用户";
+}
+
+function withLocalXhsNickname(
+  status: XhsLoginStatus,
+  ctx: { user: { xhsNickname?: string | null; name?: string | null } | null },
+  accountNickname?: string | null
+) {
+  const nickname =
+    (isDefaultXhsUsername(ctx.user?.xhsNickname)
+      ? undefined
+      : ctx.user?.xhsNickname) ||
+    (isDefaultXhsUsername(ctx.user?.name) ? undefined : ctx.user?.name) ||
+    (isDefaultXhsUsername(accountNickname) ? undefined : accountNickname);
+  if (nickname && isDefaultXhsUsername(status.username)) {
+    return { ...status, username: nickname };
+  }
+  return status;
 }
 
 function accountKeyForUser(userId: number, accountId?: number | null) {
   return accountId ? `u${userId}-a${accountId}` : `u${userId}-default`;
+}
+
+function accountKeyForRedId(redId: string) {
+  return `xhs-${redId}`;
 }
 
 function accountRuntimePaths(accountKey: string) {
@@ -90,7 +131,71 @@ function accountRuntimePaths(accountKey: string) {
   };
 }
 
-async function ensureDefaultXhsAccount(userId: number) {
+async function findKnownNickname(userId: number, redId?: string | null) {
+  const accounts = await getXhsAccounts(userId);
+  return (
+    accounts.find(
+      account =>
+        account.xhsUserId === redId && !isDefaultXhsUsername(account.nickname)
+    )?.nickname ??
+    accounts.find(account => !isDefaultXhsUsername(account.nickname))
+      ?.nickname ??
+    null
+  );
+}
+
+function copyAccountRuntimeFiles(
+  fromAccountKey: string,
+  toAccountKey: string,
+  options: { overwrite?: boolean } = {}
+) {
+  const sourcePaths = accountRuntimePaths(fromAccountKey);
+  const targetPaths = accountRuntimePaths(toAccountKey);
+  const runtimeRoot = process.cwd().endsWith("ai-marketing")
+    ? resolve(process.cwd(), "..")
+    : process.cwd();
+  const resolveRuntimePath = (relativePath: string) =>
+    resolve(runtimeRoot, relativePath);
+
+  try {
+    const sourceCookiesPath = resolveRuntimePath(sourcePaths.cookiesPath);
+    const targetCookiesPath = resolveRuntimePath(targetPaths.cookiesPath);
+    const sourceLoginStatePath = resolveRuntimePath(sourcePaths.loginStatePath);
+    const targetLoginStatePath = resolveRuntimePath(targetPaths.loginStatePath);
+
+    mkdirSync(dirname(targetCookiesPath), { recursive: true });
+    if (
+      existsSync(sourceCookiesPath) &&
+      (options.overwrite || !existsSync(targetCookiesPath))
+    ) {
+      copyFileSync(sourceCookiesPath, targetCookiesPath);
+    }
+    if (
+      existsSync(sourceLoginStatePath) &&
+      (options.overwrite || !existsSync(targetLoginStatePath))
+    ) {
+      mkdirSync(dirname(targetLoginStatePath), { recursive: true });
+      copyFileSync(sourceLoginStatePath, targetLoginStatePath);
+    }
+  } catch (error) {
+    console.warn("[XHS] copy account runtime files failed", error);
+  }
+}
+
+async function ensureDefaultXhsAccount(userId: number, redId?: string | null) {
+  if (isRealXhsUserId(redId)) {
+    const accountKey = accountKeyForRedId(redId);
+    const nickname = await findKnownNickname(userId, redId);
+    copyAccountRuntimeFiles(accountKeyForUser(userId), accountKey);
+    return upsertXhsAccount(userId, {
+      accountKey,
+      xhsUserId: redId,
+      nickname,
+      status: "logged_in",
+      ...accountRuntimePaths(accountKey),
+    });
+  }
+
   const existing = await getDefaultXhsAccount(userId);
   if (existing) return existing;
 
@@ -102,12 +207,35 @@ async function ensureDefaultXhsAccount(userId: number) {
   });
 }
 
-async function getProjectXhsAccountKey(userId: number, projectId: number) {
+async function getProjectXhsAccountKey(
+  userId: number,
+  projectId: number,
+  redId?: string | null
+) {
   const project = await getProjectById(userId, projectId);
   if (!project) throw new Error("未找到项目");
+  const redIdAccount = isRealXhsUserId(redId)
+    ? await ensureDefaultXhsAccount(userId, redId)
+    : null;
   if (project.xhsAccountId) {
     const account = await getXhsAccountById(userId, project.xhsAccountId);
-    if (account) return account.accountKey;
+    if (account) {
+      if (redIdAccount && account.id !== redIdAccount.id) {
+        await updateProject(userId, {
+          id: projectId,
+          xhsAccountId: redIdAccount.id,
+        });
+        return redIdAccount.accountKey;
+      }
+      return account.accountKey;
+    }
+  }
+  if (redIdAccount) {
+    await updateProject(userId, {
+      id: projectId,
+      xhsAccountId: redIdAccount.id,
+    });
+    return redIdAccount.accountKey;
   }
   const account = await ensureDefaultXhsAccount(userId);
   return account?.accountKey ?? accountKeyForUser(userId);
@@ -530,11 +658,13 @@ async function publishMaterialToXhs(input: {
   title?: string;
   content?: string;
   tags?: string[];
+  redId?: string | null;
   visibility?: "公开可见" | "仅自己可见" | "仅互关好友可见";
 }) {
   const accountKey = await getProjectXhsAccountKey(
     input.userId,
-    input.projectId
+    input.projectId,
+    input.redId
   );
   const [allMaterials, allScripts] = await Promise.all([
     getMaterials(input.userId, input.projectId),
@@ -968,6 +1098,44 @@ function includesAnyKeyword(text: string, terms: string[]) {
   return terms.some(term => normalized.includes(term));
 }
 
+function normalizeKeywordText(value: string) {
+  return value
+    .toLowerCase()
+    .replace(/[\s\u3000,，、。.!！?？:：;；"'“”‘’()[\]【】{}<>《》_\-]+/g, "");
+}
+
+function extractAsciiTerms(terms: string[]) {
+  return terms
+    .flatMap(term => term.toLowerCase().match(/[a-z0-9]+/g) ?? [])
+    .filter(term => term.length >= 2);
+}
+
+function matchesKeywordRelevance(feed: XhsFeed, keywordTerms: string[]) {
+  if (keywordTerms.length === 0) return true;
+
+  const text = normalizeKeywordText(
+    [
+      feed.noteCard?.displayTitle,
+      feed.noteCard?.user?.nickname,
+      feed.noteCard?.user?.nickName,
+    ]
+      .filter(Boolean)
+      .join(" ")
+  );
+  const normalizedTerms = keywordTerms
+    .map(term => normalizeKeywordText(term))
+    .filter(Boolean);
+
+  if (normalizedTerms.some(term => text.includes(term))) return true;
+
+  const asciiTerms = extractAsciiTerms(keywordTerms);
+  if (asciiTerms.length > 0) {
+    return asciiTerms.some(term => text.includes(term));
+  }
+
+  return false;
+}
+
 function matchesAuthor(
   feed: XhsFeed,
   authorKeywords: string[],
@@ -1008,16 +1176,12 @@ function selectTopVideoFeeds(
   const limit = options?.limit ?? 3;
 
   return feeds
+    .filter(feed => feed.modelType === "note")
     .filter(
       feed => feed.noteCard?.type === "video" || Boolean(feed.noteCard?.video)
     )
-    .filter(feed =>
-      includesAnyKeyword(
-        feed.noteCard?.displayTitle?.trim() ?? "",
-        keywordTerms
-      )
-    )
     .filter(feed => matchesAuthor(feed, authorKeywords, authorMatchMode))
+    .filter(feed => matchesKeywordRelevance(feed, keywordTerms))
     .map(feed => {
       const likedCount = parseEngagementCount(
         feed.noteCard?.interactInfo?.likedCount
@@ -1428,10 +1592,10 @@ function getTopicHubQueueTimestamp(tags: Record<string, unknown>, key: string) {
   return Number.isFinite(timestamp) ? timestamp : 0;
 }
 
-async function listTopicHubVideoItemsForPipeline() {
-  const projects = await getProjects(getActiveUserId());
+async function listTopicHubVideoItemsForPipeline(userId: number) {
+  const projects = await getProjects(userId);
   const itemGroups = await Promise.all(
-    projects.map(project => getTopicHubItems(getActiveUserId(), project.id))
+    projects.map(project => getTopicHubItems(userId, project.id))
   );
 
   return itemGroups
@@ -1441,15 +1605,15 @@ async function listTopicHubVideoItemsForPipeline() {
     );
 }
 
-async function recoverTopicHubVideoPipelineState() {
-  const items = await listTopicHubVideoItemsForPipeline();
+async function recoverTopicHubVideoPipelineState(userId: number) {
+  const items = await listTopicHubVideoItemsForPipeline(userId);
   let recoveredCount = 0;
 
   for (const item of items) {
     const tags = (item.tags ?? {}) as Record<string, unknown>;
     if (String(tags.videoAnalysisStatus || "") !== "analyzing") continue;
 
-    await updateTopicHubItemTags(getActiveUserId(), {
+    await updateTopicHubItemTags(userId, {
       id: item.id,
       tags: {
         ...tags,
@@ -1472,7 +1636,8 @@ async function recoverTopicHubVideoPipelineState() {
 }
 
 async function runTopicHubDownloadTask(
-  item: Awaited<ReturnType<typeof listTopicHubVideoItemsForPipeline>>[number]
+  item: Awaited<ReturnType<typeof listTopicHubVideoItemsForPipeline>>[number],
+  userId: number
 ) {
   topicHubDownloadRunning.add(item.id);
 
@@ -1488,7 +1653,7 @@ async function runTopicHubDownloadTask(
     }
 
     if (previousStatus === "failed" && previousFailedAttempts >= 3) {
-      await updateTopicHubItemTags(getActiveUserId(), {
+      await updateTopicHubItemTags(userId, {
         id: item.id,
         tags: {
           ...tags,
@@ -1500,7 +1665,7 @@ async function runTopicHubDownloadTask(
       return;
     }
 
-    await updateTopicHubItemTags(getActiveUserId(), {
+    await updateTopicHubItemTags(userId, {
       id: item.id,
       tags: {
         ...tags,
@@ -1534,13 +1699,13 @@ async function runTopicHubDownloadTask(
       videoAnalysisStartedAt: undefined,
       videoAnalysisFinishedAt: undefined,
     };
-    await updateTopicHubItemTags(getActiveUserId(), {
+    await updateTopicHubItemTags(userId, {
       id: item.id,
       tags: nextTags,
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    await updateTopicHubItemTags(getActiveUserId(), {
+    await updateTopicHubItemTags(userId, {
       id: item.id,
       tags: {
         ...tags,
@@ -1553,12 +1718,13 @@ async function runTopicHubDownloadTask(
     console.warn("[TopicHub] background download video failed", error);
   } finally {
     topicHubDownloadRunning.delete(item.id);
-    void pumpTopicHubVideoPipeline();
+    void pumpTopicHubVideoPipeline(userId);
   }
 }
 
 async function runTopicHubAnalysisTask(
-  item: Awaited<ReturnType<typeof listTopicHubVideoItemsForPipeline>>[number]
+  item: Awaited<ReturnType<typeof listTopicHubVideoItemsForPipeline>>[number],
+  userId: number
 ) {
   topicHubAnalysisRunning.add(item.id);
 
@@ -1576,7 +1742,7 @@ async function runTopicHubAnalysisTask(
       videoAnalysisError: undefined,
       videoAnalysisStartedAt: new Date().toISOString(),
     };
-    await updateTopicHubItemTags(getActiveUserId(), {
+    await updateTopicHubItemTags(userId, {
       id: item.id,
       tags: analyzingTags,
     });
@@ -1588,7 +1754,7 @@ async function runTopicHubAnalysisTask(
       prompt: TOPIC_HUB_VIRAL_ANALYSIS_PROMPT_V2,
     });
 
-    await updateTopicHubItemTags(getActiveUserId(), {
+    await updateTopicHubItemTags(userId, {
       id: item.id,
       tags: {
         ...analyzingTags,
@@ -1600,7 +1766,7 @@ async function runTopicHubAnalysisTask(
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    await updateTopicHubItemTags(getActiveUserId(), {
+    await updateTopicHubItemTags(userId, {
       id: item.id,
       tags: {
         ...tags,
@@ -1612,16 +1778,22 @@ async function runTopicHubAnalysisTask(
     console.warn("[TopicHub] video analysis failed", error);
   } finally {
     topicHubAnalysisRunning.delete(item.id);
-    void pumpTopicHubVideoPipeline();
+    void pumpTopicHubVideoPipeline(userId);
   }
 }
 
-async function pumpTopicHubVideoPipeline() {
+async function pumpTopicHubVideoPipeline(userId?: number) {
   if (topicHubPipelineRunning) return;
+  let scopedUserId: number;
+  try {
+    scopedUserId = userId ?? getActiveUserId();
+  } catch {
+    return;
+  }
   topicHubPipelineRunning = true;
 
   try {
-    const items = await listTopicHubVideoItemsForPipeline();
+    const items = await listTopicHubVideoItemsForPipeline(scopedUserId);
 
     const downloadSlots =
       TOPIC_HUB_DOWNLOAD_CONCURRENCY - topicHubDownloadRunning.size;
@@ -1651,7 +1823,7 @@ async function pumpTopicHubVideoPipeline() {
         .slice(0, downloadSlots);
 
       for (const item of downloadCandidates) {
-        void runTopicHubDownloadTask(item);
+        void runTopicHubDownloadTask(item, scopedUserId);
       }
     }
 
@@ -1681,7 +1853,7 @@ async function pumpTopicHubVideoPipeline() {
         .slice(0, analysisSlots);
 
       for (const item of analysisCandidates) {
-        void runTopicHubAnalysisTask(item);
+        void runTopicHubAnalysisTask(item, scopedUserId);
       }
     }
   } catch (error) {
@@ -1695,13 +1867,6 @@ export function ensureTopicHubVideoPipelineStarted() {
   if (topicHubPipelineStarted) return;
 
   topicHubPipelineStarted = true;
-  void recoverTopicHubVideoPipelineState()
-    .catch(error => {
-      console.warn("[TopicHub] pipeline recovery failed", error);
-    })
-    .finally(() => {
-      void pumpTopicHubVideoPipeline();
-    });
 
   const timer = setInterval(() => {
     void pumpTopicHubVideoPipeline();
@@ -2235,30 +2400,53 @@ export const appRouter = router({
   auth: router({
     status: publicProcedure.query(async ({ ctx }): Promise<XhsLoginStatus> => {
       const userId = currentUserId(ctx);
-      const account = await ensureDefaultXhsAccount(userId);
+      const account = await ensureDefaultXhsAccount(
+        userId,
+        currentXhsRedId(ctx)
+      );
       try {
-        return await getXhsLoginStatus(account?.accountKey);
+        return withLocalXhsNickname(
+          await getXhsLoginStatus(account?.accountKey),
+          ctx,
+          account?.nickname
+        );
       } catch {
         return { status: "unknown", is_logged_in: false, username: undefined };
       }
     }),
     me: publicProcedure.query(async ({ ctx }): Promise<XhsLoginStatus> => {
-      const userId = currentUserId(ctx);
-      const account = await ensureDefaultXhsAccount(userId);
+      // 未登录用户直接返回，不抛异常（避免触发全局 UNAUTHORIZED 重定向循环）
+      if (!isRedIdBoundUser(ctx.user)) {
+        return { status: "unknown", is_logged_in: false };
+      }
+      const account = await ensureDefaultXhsAccount(
+        ctx.user.id,
+        ctx.user.xhsUserId
+      );
       try {
-        return await getXhsLoginStatus(account?.accountKey);
+        return withLocalXhsNickname(
+          await getXhsLoginStatus(account?.accountKey),
+          ctx,
+          account?.nickname
+        );
       } catch {
         return { status: "unknown", is_logged_in: false, username: undefined };
       }
     }),
     qrcode: publicProcedure.query(async ({ ctx }) => {
       const userId = currentUserId(ctx);
-      const account = await ensureDefaultXhsAccount(userId);
+      const account = await ensureDefaultXhsAccount(
+        userId,
+        currentXhsRedId(ctx)
+      );
       return getXhsLoginQrcode(account?.accountKey);
     }),
     logout: publicProcedure.mutation(async ({ ctx }) => {
       const userId = currentUserId(ctx);
-      const account = await ensureDefaultXhsAccount(userId);
+      const account = await ensureDefaultXhsAccount(
+        userId,
+        currentXhsRedId(ctx)
+      );
       try {
         await deleteXhsCookies(account?.accountKey);
       } catch (error) {
@@ -2288,7 +2476,10 @@ export const appRouter = router({
       )
       .mutation(async ({ ctx, input }) => {
         const userId = currentUserId(ctx);
-        const account = await ensureDefaultXhsAccount(userId);
+        const account = await ensureDefaultXhsAccount(
+          userId,
+          currentXhsRedId(ctx)
+        );
         return createProject(userId, {
           ...input,
           xhsAccountId: account?.id ?? null,
@@ -2654,9 +2845,10 @@ ${input.checklist ? `关键词清单：${input.checklist}` : ""}
             .optional(),
         })
       )
-      .mutation(async ({ input }) => {
+      .mutation(async ({ ctx, input }) => {
+        const userId = currentUserId(ctx);
         await logUsage(
-          getActiveUserId(),
+          userId,
           input.projectId,
           "topicHub",
           "searchXiaohongshu"
@@ -2673,8 +2865,9 @@ ${input.checklist ? `关键词清单：${input.checklist}` : ""}
             }
           : undefined;
         const accountKey = await getProjectXhsAccountKey(
-          getActiveUserId(),
-          input.projectId
+          userId,
+          input.projectId,
+          currentXhsRedId(ctx)
         );
         const result = await searchXhsFeeds(keyword, filters, accountKey);
 
@@ -2719,7 +2912,7 @@ ${input.checklist ? `关键词清单：${input.checklist}` : ""}
           }
 
           const noteUrl = `https://www.xiaohongshu.com/explore/${noteId}?xsec_token=${xsecToken}&xsec_source=pc_feed`;
-          const saved = await createTopicHubItem(getActiveUserId(), {
+          const saved = await createTopicHubItem(userId, {
             projectId: input.projectId,
             title: feed.noteCard?.displayTitle || "小红书视频",
             content: `行业关键词：${input.industry}${input.checklist ? ` | checklist：${input.checklist}` : ""}`,
@@ -2775,15 +2968,16 @@ ${input.checklist ? `关键词清单：${input.checklist}` : ""}
             .optional(),
         })
       )
-      .mutation(async ({ input }) => {
+      .mutation(async ({ ctx, input }) => {
+        const userId = currentUserId(ctx);
         await logUsage(
-          getActiveUserId(),
+          userId,
           input.projectId,
           "topicHub",
           "searchXiaohongshuMulti"
         );
 
-        await deleteTopicHubItemsByProject(getActiveUserId(), input.projectId);
+        await deleteTopicHubItemsByProject(userId, input.projectId);
 
         const keyword = (input.industry ?? "").trim();
         const profileLinks = parseXhsProfileLinks(input.checklist);
@@ -2819,8 +3013,9 @@ ${input.checklist ? `关键词清单：${input.checklist}` : ""}
 
         if (keyword) {
           const accountKey = await getProjectXhsAccountKey(
-            getActiveUserId(),
-            input.projectId
+            userId,
+            input.projectId,
+            currentXhsRedId(ctx)
           );
           const result = await searchXhsFeeds(keyword, filters, accountKey);
           let keywordFeeds = selectTopVideoFeeds(result.feeds || [], {
@@ -4634,12 +4829,16 @@ ${scriptContent}
     // 查询 XHS 登录状态
     loginStatus: publicProcedure.query(async ({ ctx }) => {
       const userId = currentUserId(ctx);
-      const account = await ensureDefaultXhsAccount(userId);
+      const account = await ensureDefaultXhsAccount(
+        userId,
+        currentXhsRedId(ctx)
+      );
       try {
         const data = await getXhsLoginStatus(account?.accountKey);
+        const status = withLocalXhsNickname(data, ctx, account?.nickname);
         return {
-          isLoggedIn: data.is_logged_in ?? false,
-          username: data.username ?? "",
+          isLoggedIn: status.is_logged_in ?? false,
+          username: status.username ?? "",
         };
       } catch {
         return { isLoggedIn: false, username: "" };
@@ -4700,7 +4899,11 @@ ${scriptContent}
       .mutation(async ({ ctx, input }) => {
         const userId = currentUserId(ctx);
         await logUsage(userId, input.projectId, "platform", "xhs_auto_publish");
-        return publishMaterialToXhs({ ...input, userId });
+        return publishMaterialToXhs({
+          ...input,
+          userId,
+          redId: currentXhsRedId(ctx),
+        });
       }),
 
     batchPublishAuto: publicProcedure
@@ -4731,6 +4934,7 @@ ${scriptContent}
           try {
             const result = await publishMaterialToXhs({
               userId,
+              redId: currentXhsRedId(ctx),
               projectId: input.projectId,
               materialId,
               visibility: input.visibility,
@@ -4765,7 +4969,8 @@ ${scriptContent}
         const userId = currentUserId(ctx);
         const accountKey = await getProjectXhsAccountKey(
           userId,
-          input.projectId
+          input.projectId,
+          currentXhsRedId(ctx)
         );
         await logUsage(userId, input.projectId, "platform", "xhs_publish");
 
